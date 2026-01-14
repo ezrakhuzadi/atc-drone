@@ -29,9 +29,9 @@ Build a local traffic management system for cooperative UAVs that:
 - [x] Create `atc-drone/` project folder structure
 - [x] Write telemetry injector script (`send_one_track.py`)
 - [x] Verify track appears in Blender's `GET /get_air_traffic/{session_id}` response
-- [ ] Configure and run Flight Spotlight
-- [ ] Connect Spotlight to local Blender instance
-- [ ] Verify simulated drone appears in Spotlight UI
+- [x] Configure and run Flight Spotlight
+- [x] Connect Spotlight to local Blender instance
+- [x] Verify simulated drone appears in Spotlight UI
 
 ---
 
