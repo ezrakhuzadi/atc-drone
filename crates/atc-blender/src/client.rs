@@ -12,7 +12,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 /// - Token format (must be header.payload.signature)
 /// - Issuer (must be a valid URL)
 /// - Scopes (must include flightblender.write)
-fn generate_dummy_jwt() -> String {
+pub(crate) fn generate_dummy_jwt() -> String {
     let header = serde_json::json!({"alg": "HS256", "typ": "JWT"});
     let now = Utc::now().timestamp();
     let payload = serde_json::json!({
@@ -33,9 +33,9 @@ fn generate_dummy_jwt() -> String {
 
 /// HTTP client for Flight Blender API.
 pub struct BlenderClient {
-    client: Client,
-    base_url: String,
-    session_id: String,
+    pub(crate) client: Client,
+    pub(crate) base_url: String,
+    pub(crate) session_id: String,
 }
 
 #[derive(Debug, Serialize)]

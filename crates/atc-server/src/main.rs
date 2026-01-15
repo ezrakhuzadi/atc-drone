@@ -31,7 +31,7 @@ async fn main() -> Result<()> {
     let state = Arc::new(AppState::new());
     
     // Start background loops
-    tokio::spawn(loops::conflict_loop::run_conflict_loop(state.clone()));
+    tokio::spawn(loops::conflict_loop::run_conflict_loop(state.clone(), config.clone()));
     tokio::spawn(loops::blender_sync_loop::run_blender_loop(state.clone(), config));
 
     // Build the app

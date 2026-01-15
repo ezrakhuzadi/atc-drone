@@ -7,3 +7,4 @@ pub mod sync_tracks;
 pub mod sync_geofences;
 
 pub use client::BlenderClient;
+pub use sync_geofences::{ConflictGeofence, conflict_to_geofence};
