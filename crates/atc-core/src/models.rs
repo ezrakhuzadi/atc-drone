@@ -39,10 +39,11 @@ pub struct DroneState {
     pub status: DroneStatus,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DroneStatus {
     /// Normal operation
+    #[default]
     Active,
     /// Executing HOLD command
     Holding,
@@ -50,12 +51,6 @@ pub enum DroneStatus {
     Lost,
     /// Landed/inactive
     Inactive,
-}
-
-impl Default for DroneStatus {
-    fn default() -> Self {
-        Self::Active
-    }
 }
 
 impl DroneState {

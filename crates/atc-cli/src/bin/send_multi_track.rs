@@ -4,7 +4,7 @@
 //! Responds to HOLD commands by stopping movement.
 
 use atc_cli::sim::{
-    create_converging_scenario, create_crossing_scenario, create_parallel_scenario, FlightPath,
+    create_converging_scenario, create_crossing_scenario, create_parallel_scenario,
 };
 use atc_core::models::CommandType;
 use atc_sdk::AtcClient;
@@ -25,21 +25,11 @@ enum ScenarioType {
 }
 
 /// Drone control state
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct DroneControl {
     is_holding: bool,
     hold_until: Option<time::Instant>,
     frozen_position: Option<(f64, f64, f64)>,
-}
-
-impl Default for DroneControl {
-    fn default() -> Self {
-        Self {
-            is_holding: false,
-            hold_until: None,
-            frozen_position: None,
-        }
-    }
 }
 
 /// Multi-drone simulator with conflict scenarios
@@ -165,7 +155,7 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 // Poll for commands every 2 updates
-                if update_count % 2 == 0 {
+                if update_count.is_multiple_of(2) {
                     match client.get_next_command().await {
                         Ok(Some(cmd)) => {
                             println!("  [CMD] {} received: {:?}", drone_id, cmd.command_type);

@@ -56,7 +56,7 @@ impl Default for TokenConfig {
 ///
 /// # Example
 /// ```
-/// use atc_drone::auth::generate_dummy_token;
+/// use atc_cli::auth::generate_dummy_token;
 ///
 /// let token = generate_dummy_token(None);
 /// println!("Token: {}", token);

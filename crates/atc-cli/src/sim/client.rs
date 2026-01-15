@@ -32,6 +32,7 @@ struct ObservationRequest {
 
 /// Response from Flight Blender API.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // Reserved for future response parsing
 pub struct BlenderResponse {
     #[serde(default)]
     pub message: Option<String>,

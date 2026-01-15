@@ -6,7 +6,7 @@ mod loops;
 mod config;
 
 use anyhow::Result;
-use axum::{routing::get, Router};
+use axum::routing::get;
 use std::net::SocketAddr;
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};

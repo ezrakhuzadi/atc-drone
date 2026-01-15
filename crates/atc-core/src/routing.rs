@@ -94,9 +94,9 @@ pub fn generate_random_route() -> Vec<Waypoint> {
 }
 
 fn random_point_near_irvine() -> Waypoint {
-    let mut rng = rand::thread_rng();
-    let lat_offset = rng.gen_range(-RADIUS_DEG..RADIUS_DEG);
-    let lon_offset = rng.gen_range(-RADIUS_DEG..RADIUS_DEG);
+    let mut rng = rand::rng();
+    let lat_offset = rng.random_range(-RADIUS_DEG..RADIUS_DEG);
+    let lon_offset = rng.random_range(-RADIUS_DEG..RADIUS_DEG);
     
     Waypoint {
         lat: IRVINE_LAT + lat_offset,

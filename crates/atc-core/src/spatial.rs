@@ -1,11 +1,12 @@
 //! Spatial math for conflict detection.
 
-use crate::models::{FlightPlan, Waypoint};
+use crate::models::FlightPlan;
 
 // Minimum separation distance in meters
 const MIN_SEPARATION_M: f64 = 50.0;
 // Minimum time separation in seconds (for traversing same point)
-const MIN_TIME_SEP_S: f64 = 60.0; 
+#[allow(dead_code)] // Reserved for future 4D conflict detection
+const _MIN_TIME_SEP_S: f64 = 60.0; 
 
 /// Check if two flight plans conflict.
 /// 

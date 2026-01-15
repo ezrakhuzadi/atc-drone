@@ -6,9 +6,7 @@ use axum::{
     },
     response::IntoResponse,
 };
-use futures::{sink::SinkExt, stream::StreamExt};
 use std::sync::Arc;
-use tokio::sync::broadcast;
 use crate::state::AppState;
 
 /// Handler for WebSocket connections.

@@ -118,7 +118,7 @@ impl AppState {
         let drone_id = command.drone_id.clone();
         self.commands
             .entry(drone_id)
-            .or_insert_with(VecDeque::new)
+            .or_default()
             .push_back(command);
     }
 
@@ -144,6 +144,7 @@ impl AppState {
     }
 
     /// Get and remove the next pending command for a drone.
+    #[allow(dead_code)] // Will be used by SDK clients polling for commands
     pub fn pop_command(&self, drone_id: &str) -> Option<Command> {
         self.commands
             .get_mut(drone_id)

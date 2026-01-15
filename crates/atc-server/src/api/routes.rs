@@ -34,6 +34,7 @@ pub fn create_router() -> Router<Arc<AppState>> {
 #[derive(Debug, Deserialize)]
 pub struct RegisterRequest {
     pub drone_id: Option<String>,
+    #[allow(dead_code)] // Reserved for future drone type handling
     pub drone_type: Option<String>,
 }
 
