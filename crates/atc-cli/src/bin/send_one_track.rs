@@ -1,24 +1,20 @@
-//! CLI tool to send simulated drone telemetry to Flight Blender.
+//! CLI tool to send simulated drone telemetry to ATC Server.
 //!
 //! Simulates a single drone flying in a circle.
 
-use atc_cli::auth::generate_dummy_token;
-use atc_cli::sim::{BlenderClient, CircularPath, FlightPath};
+use atc_cli::sim::{CircularPath, FlightPath};
+use atc_sdk::AtcClient;
 use clap::Parser;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time;
 
-/// Send drone telemetry to Flight Blender (single drone, circular path)
+/// Send drone telemetry to ATC Server (single drone, circular path)
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Args {
-    /// Flight Blender URL
-    #[arg(long, default_value = "http://localhost:8000")]
+    /// ATC Server URL
+    #[arg(long, default_value = "http://localhost:3000")]
     url: String,
-
-    /// Session UUID
-    #[arg(long, default_value = "00000000-0000-0000-0000-000000000001")]
-    session: String,
 
     /// Drone ICAO address/identifier
     #[arg(long, default_value = "DRONE001")]
@@ -49,13 +45,22 @@ struct Args {
     rate: f64,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    println!("Generating authentication token...");
-    let token = generate_dummy_token(None);
+    println!("Connecting to ATC Server at {}...", args.url);
+    let mut client = AtcClient::new(&args.url);
 
-    let client = BlenderClient::new(&args.url, &args.session, token);
+    // Register drone
+    match client.register(Some(&args.icao)).await {
+        Ok(resp) => println!("Registered drone: {}", resp.drone_id),
+        Err(e) => {
+            eprintln!("Failed to register: {}", e);
+            // If registration fails, we can't really proceed with SDK as it expects drone_id
+            return Err(e);
+        }
+    }
 
     let path = CircularPath::new(
         args.lat,
@@ -73,31 +78,36 @@ fn main() {
     println!("  Duration: {}s, Update rate: {}Hz", args.duration, args.rate);
     println!();
 
-    let start = Instant::now();
+    let start = time::Instant::now();
     let mut update_count = 0u32;
-    let update_interval = Duration::from_secs_f64(1.0 / args.rate);
+    let mut interval = time::interval(Duration::from_secs_f64(1.0 / args.rate));
 
-    while start.elapsed() < Duration::from_secs(args.duration) {
+    loop {
+        interval.tick().await; // Wait for next tick
+
         let elapsed = start.elapsed().as_secs_f64();
+        if elapsed > args.duration as f64 {
+            break;
+        }
+
         let (lat, lon, alt) = path.get_position(elapsed);
         let heading = path.get_heading(elapsed);
         let speed = path.get_speed_mps();
 
-        match client.send_observation(&args.icao, lat, lon, alt, heading, speed) {
-            Ok(status) => {
+        match client.send_position(lat, lon, alt, heading, speed).await {
+            Ok(_) => {
                 update_count += 1;
                 println!(
-                    "[{:3}] Sent position ({:.6}, {:.6}) -> Status: {}",
-                    update_count, lat, lon, status
+                    "[{:3}] Sent position ({:.6}, {:.6}) -> OK",
+                    update_count, lat, lon
                 );
             }
             Err(e) => {
-                eprintln!("Error sending observation: {}", e);
+                eprintln!("Error sending telemetry: {}", e);
             }
         }
-
-        thread::sleep(update_interval);
     }
 
     println!("\nSimulation complete. Sent {} position updates.", update_count);
+    Ok(())
 }

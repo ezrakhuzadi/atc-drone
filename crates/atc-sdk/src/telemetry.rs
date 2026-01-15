@@ -7,7 +7,8 @@ use chrono::Utc;
 
 impl AtcClient {
     /// Send telemetry to the ATC server.
-    pub async fn send_telemetry(
+    /// Send position update to the ATC server.
+    pub async fn send_position(
         &self,
         lat: f64,
         lon: f64,
@@ -18,8 +19,6 @@ impl AtcClient {
         let drone_id = self
             .drone_id()
             .ok_or_else(|| anyhow::anyhow!("Not registered"))?;
-
-        let url = format!("{}/v1/telemetry", self.base_url);
 
         let telemetry = Telemetry {
             drone_id: drone_id.to_string(),
@@ -34,12 +33,6 @@ impl AtcClient {
             timestamp: Utc::now(),
         };
 
-        self.client
-            .post(&url)
-            .json(&telemetry)
-            .send()
-            .await?;
-
-        Ok(())
+        self.send_telemetry(&telemetry).await
     }
 }

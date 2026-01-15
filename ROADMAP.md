@@ -16,22 +16,19 @@ Local traffic management system for cooperative UAVs using OpenUTM.
 │  │   └── rules      Safety thresholds, altitude bands       │
 │  │                                                           │
 │  ├── atc-blender/   Flight Blender API client               │
-│  │   ├── client     HTTP client for Blender                 │
-│  │   ├── sync_*     Track/geofence sync to Blender          │
+│  │   └── client     HTTP client with JWT auth               │
 │  │                                                           │
 │  ├── atc-server/    Always-on backend (Axum)                │
 │  │   ├── api/       REST + WebSocket endpoints              │
 │  │   ├── state/     In-memory store (DashMap)               │
-│  │   └── loops/     Background conflict detection           │
+│  │   └── loops/     Conflict detection, Blender sync        │
 │  │                                                           │
-│  └── atc-sdk/       Drone integration SDK                   │
-│      ├── client     Register + connect                      │
-│      ├── telemetry  Stream position updates                 │
-│      └── commands   Receive/ACK commands                    │
-│                                                              │
-│  src/bin/           Legacy CLIs (still work)                │
-│  deploy/            Docker config                            │
-│  docs/              Architecture docs                        │
+│  ├── atc-sdk/       Drone integration SDK                   │
+│  │   ├── client     Register + connect                      │
+│  │   └── telemetry  Stream position updates                 │
+│  │                                                           │
+│  └── atc-cli/       CLI tools & simulators                  │
+│      └── bin/       send_one_track, etc.                    │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -49,12 +46,13 @@ Local traffic management system for cooperative UAVs using OpenUTM.
 - [x] Write telemetry injector
 - [x] See drone in Spotlight UI
 
-### 🚧 Milestone C: Multi-drone + Conflict Detection
+### ✅ Milestone C: Real-time Backend
 - [x] Multi-drone simulator
 - [x] Conflict detection engine (10-30s lookahead)
 - [x] **Rewrote in Rust** 🦀
-- [/] **atc-server always-on backend**
-- [ ] WebSocket streaming to UI
+- [x] **atc-server always-on backend**
+- [x] WebSocket streaming (`/v1/stream`)
+- [x] Blender sync loop (1Hz)
 - [ ] Sync conflicts to Blender as geofences
 
 ### ⏳ Milestone D: Commands (Hold/Alt/Reroute)
@@ -100,4 +98,4 @@ cargo run --bin send_one_track -- --duration 60
 | POST | `/v1/telemetry` | Send position update |
 | GET | `/v1/drones` | List all drones |
 | GET | `/v1/conflicts` | Get active conflicts |
-| WS | `/v1/stream` | Real-time updates (TODO) |
+| WS | `/v1/stream` | Real-time WebSocket updates ✅ |

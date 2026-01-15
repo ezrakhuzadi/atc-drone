@@ -5,21 +5,26 @@ use atc_core::{Conflict, ConflictDetector};
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use tokio::sync::broadcast;
+
 /// Application state - thread-safe store for drones and conflicts.
 pub struct AppState {
     drones: DashMap<String, DroneState>,
     detector: std::sync::Mutex<ConflictDetector>,
     conflicts: DashMap<String, Conflict>,
     drone_counter: AtomicU32,
+    pub tx: broadcast::Sender<DroneState>, // For WS broadcasting
 }
 
 impl AppState {
     pub fn new() -> Self {
+        let (tx, _) = broadcast::channel(100);
         Self {
             drones: DashMap::new(),
             detector: std::sync::Mutex::new(ConflictDetector::default()),
             conflicts: DashMap::new(),
             drone_counter: AtomicU32::new(1),
+            tx,
         }
     }
 
@@ -36,12 +41,25 @@ impl AppState {
     /// Update drone state from telemetry.
     pub fn update_telemetry(&self, telemetry: Telemetry) {
         let drone_id = telemetry.drone_id.clone();
+        let mut updated_state = None;
 
         // Update or create drone state
         self.drones
             .entry(drone_id.clone())
-            .and_modify(|state| state.update(&telemetry))
-            .or_insert_with(|| DroneState::from_telemetry(&telemetry));
+            .and_modify(|state| {
+                state.update(&telemetry);
+                updated_state = Some(state.clone());
+            })
+            .or_insert_with(|| {
+                let state = DroneState::from_telemetry(&telemetry);
+                updated_state = Some(state.clone());
+                state
+            });
+
+        // Broadcast update via WebSocket
+        if let Some(state) = updated_state {
+            let _ = self.tx.send(state);
+        }
 
         // Update conflict detector
         if let Ok(mut detector) = self.detector.lock() {

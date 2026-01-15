@@ -7,3 +7,4 @@ pub mod telemetry;
 pub mod commands;
 
 pub use client::AtcClient;
+pub use atc_core::models::Telemetry;

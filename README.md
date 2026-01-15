@@ -1,103 +1,116 @@
-# ATC Drone System (Rust)
+# ATC Drone System
 
-Local traffic management system for cooperative UAVs using OpenUTM (Flight Blender + Flight Spotlight).
+Real-time drone traffic management system using OpenUTM (Flight Blender + Flight Spotlight).
 
 ## Overview
 
-This project provides the "ATC brain" that sits between drones and the OpenUTM stack:
-- **Telemetry injection** - Sends drone positions to Flight Blender
+The ATC-Drone system acts as the "brain" between drones and the OpenUTM stack:
+
+```mermaid
+graph LR
+    Drone[Drone/Simulator] --> SDK[atc-sdk]
+    SDK --> Server[atc-server]
+    Server --> Blender[Flight Blender]
+    Blender --> Spotlight[Flight Spotlight]
+```
+
+**Key Features:**
+- **Real-time telemetry** - Receives drone positions via SDK, syncs to Flight Blender
 - **Conflict detection** - Predicts collisions 10-30s ahead
-- **Multi-drone scenarios** - Crossing, parallel, and converging flight paths
+- **WebSocket streaming** - Live updates to UI clients
+- **Flight visualization** - Drones appear on Spotlight's 3D globe
 
 ## Project Structure
 
 ```
-atc-drone-rs/
-├── src/
-│   ├── lib.rs              # Library root
-│   ├── auth/mod.rs         # JWT token generation
-│   ├── conflict/mod.rs     # Conflict detection engine
-│   └── sim/                # Telemetry simulation
-│       ├── mod.rs
-│       ├── client.rs       # Flight Blender HTTP client
-│       ├── paths.rs        # Circular/Linear flight paths
-│       └── scenarios.rs    # Test scenarios
-└── src/bin/
-    ├── generate_token.rs   # JWT generator CLI
-    ├── send_one_track.rs   # Single drone simulator
-    └── send_multi_track.rs # Multi-drone scenarios
+atc-drone/
+├── crates/
+│   ├── atc-core/       # Pure logic (no networking)
+│   │   ├── conflict.rs   # Conflict detection engine
+│   │   ├── models.rs     # DroneState, Telemetry, Mission
+│   │   ├── routing.rs    # Route suggestions
+│   │   └── rules.rs      # Safety thresholds
+│   │
+│   ├── atc-server/     # Always-on backend (Axum)
+│   │   ├── api/          # REST + WebSocket endpoints
+│   │   ├── state/        # In-memory store (DashMap)
+│   │   └── loops/        # Conflict detection, Blender sync
+│   │
+│   ├── atc-sdk/        # Drone integration SDK
+│   │   ├── client.rs     # Register + connect
+│   │   └── telemetry.rs  # Stream position updates
+│   │
+│   ├── atc-blender/    # Flight Blender API client
+│   │   └── client.rs     # HTTP client with JWT auth
+│   │
+│   └── atc-cli/        # CLI tools & simulators
+│       └── bin/
+│           └── send_one_track.rs  # Single drone simulator
+├── Cargo.toml          # Workspace manifest
+└── ROADMAP.md          # Project milestones
 ```
 
 ## Quick Start
 
 ```bash
-# Build the project
-cargo build --release
+# 1. Start Flight Blender (port 8000) and Spotlight (port 5050)
 
-# Generate a token
-./target/release/generate_token
+# 2. Build and run the ATC Server
+cd /home/uci/Project/atc-drone
+cargo run -p atc-server
 
-# Run single drone simulator
-./target/release/send_one_track --duration 60 --rate 1
+# 3. In another terminal, run the drone simulator
+cargo run -p atc-cli --bin send_one_track -- --duration 120 --rate 2
 
-# Run multi-drone scenario (crossing paths)
-./target/release/send_multi_track --scenario crossing --duration 60
+# 4. Open Flight Spotlight
+#    http://localhost:5050/spotlight
+#    Click "Stream flights" centered on Irvine (33.68, -117.82)
 ```
 
-## CLI Options
+## API Endpoints (atc-server on port 3000)
 
-### generate_token
-```
---scopes    Space-separated scopes (default: "flightblender.read flightblender.write")
---audience  Token audience (default: "testflight.flightblender.com")
---expiry    Token expiry in hours (default: 24)
-```
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/v1/drones/register` | Register a drone |
+| POST | `/v1/telemetry` | Send position update |
+| GET | `/v1/drones` | List all drones |
+| GET | `/v1/conflicts` | Get active conflicts |
+| WS | `/v1/stream` | Real-time WebSocket updates |
 
-### send_one_track
-```
---url       Flight Blender URL (default: http://localhost:8000)
---session   Session UUID
---icao      Drone identifier (default: DRONE001)
---lat/--lon Center coordinates (default: Irvine, CA)
---radius    Circle radius in meters (default: 200)
---altitude  Flight altitude in meters (default: 50)
---duration  Duration in seconds (default: 60)
---rate      Update rate in Hz (default: 1.0)
-```
-
-### send_multi_track
-```
---scenario  Scenario type: crossing, parallel, converging
-            (other options same as send_one_track)
-```
-
-## Library Usage
+## SDK Usage (Rust)
 
 ```rust
-use atc_drone::{ConflictDetector, DronePosition, ConflictSeverity};
+use atc_sdk::{AtcClient, Telemetry};
 
-fn main() {
-    let mut detector = ConflictDetector::default();
+#[tokio::main]
+async fn main() {
+    let client = AtcClient::new("http://localhost:3000");
     
-    detector.update_position(DronePosition::new("DRONE001", 33.68, -117.82, 50.0));
-    detector.update_position(DronePosition::new("DRONE002", 33.68, -117.82, 55.0));
+    // Register drone
+    client.register("DRONE001", "quadcopter").await.unwrap();
     
-    for conflict in detector.detect_conflicts() {
-        println!("{:?}: {} vs {}", 
-            conflict.severity, 
-            conflict.drone1_id, 
-            conflict.drone2_id
-        );
-    }
+    // Send telemetry
+    let telemetry = Telemetry {
+        drone_id: "DRONE001".into(),
+        lat: 33.6846,
+        lon: -117.8265,
+        altitude_m: 50.0,
+        heading: 90.0,
+        speed_mps: 5.0,
+        timestamp: chrono::Utc::now(),
+    };
+    client.send_telemetry(telemetry).await.unwrap();
 }
 ```
 
-## Related Repos
+## Related Repositories
 
-- [flight-blender-irvine](https://github.com/ezrakhuzadi/flight-blender-irvine) - UTM Backend
-- [flight-spotlight-irvine](https://github.com/ezrakhuzadi/flight-spotlight-irvine) - 3D UI
+- **flight-blender-irvine** - UTM Backend (Flight Blender fork)
+- **flight-spotlight-irvine** - 3D Visualization UI (Flight Spotlight fork)
 
 ## Requirements
 
 - Rust 1.70+
-- Flight Blender running on localhost:8000 (for simulator tools)
+- Flight Blender running on localhost:8000
+- Flight Spotlight running on localhost:5050
+- Redis (for Spotlight background jobs)

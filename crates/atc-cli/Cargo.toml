@@ -27,6 +27,8 @@ clap.workspace = true
 chrono.workspace = true
 jsonwebtoken.workspace = true
 anyhow.workspace = true
+atc-sdk = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
 
 [lib]
 path = "src/lib.rs"

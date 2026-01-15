@@ -13,15 +13,12 @@ use crate::state::AppState;
 use atc_core::models::Telemetry;
 
 /// Create the API router.
-pub fn create_router() -> Router {
-    let state = Arc::new(AppState::new());
-
+pub fn create_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/v1/drones/register", post(register_drone))
         .route("/v1/telemetry", post(receive_telemetry))
         .route("/v1/drones", get(list_drones))
         .route("/v1/conflicts", get(list_conflicts))
-        .with_state(state)
 }
 
 // === Request/Response types ===

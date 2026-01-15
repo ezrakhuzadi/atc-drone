@@ -58,4 +58,22 @@ impl AtcClient {
     pub fn drone_id(&self) -> Option<&str> {
         self.drone_id.as_deref()
     }
+
+    /// Send telemetry update to the ATC server.
+    pub async fn send_telemetry(&self, telemetry: &atc_core::models::Telemetry) -> Result<()> {
+        let url = format!("{}/v1/telemetry", self.base_url);
+        
+        let response = self
+            .client
+            .post(&url)
+            .json(telemetry)
+            .send()
+            .await?;
+            
+        if !response.status().is_success() {
+            anyhow::bail!("Failed to send telemetry: {}", response.status());
+        }
+
+        Ok(())
+    }
 }
