@@ -31,6 +31,12 @@ pub async fn run_conflict_loop(state: Arc<AppState>, config: Config) {
     loop {
         ticker.tick().await;
 
+        // Check for timed-out drones first
+        let lost_drones = state.check_timeouts();
+        for drone_id in &lost_drones {
+            tracing::warn!("Drone {} marked LOST (no telemetry)", drone_id);
+        }
+
         let conflicts = state.get_conflicts();
         if conflicts.is_empty() {
             continue;
@@ -69,38 +75,36 @@ pub async fn run_conflict_loop(state: Arc<AppState>, config: Config) {
             geofences.push(gf);
 
             // === AUTO-HOLD COMMAND DISPATCH ===
-            // Issue HOLD commands for Critical or Warning conflicts
+            // Issue HOLD to the lower-priority drone (higher ID = newer = gives way)
+            // This follows standard ATC practice: established traffic has priority
             if matches!(conflict.severity, ConflictSeverity::Critical | ConflictSeverity::Warning) {
                 let now = Utc::now();
                 
-                // Issue HOLD to drone1 if cooldown passed
-                if state.can_issue_command(&conflict.drone1_id, COMMAND_COOLDOWN_SECS) {
+                // Determine which drone should give way
+                // Simple priority: lexicographically smaller ID has priority (registered first)
+                let give_way_drone = if conflict.drone1_id < conflict.drone2_id {
+                    &conflict.drone2_id  // drone2 gives way
+                } else {
+                    &conflict.drone1_id  // drone1 gives way
+                };
+                
+                // Issue HOLD only to the lower-priority drone
+                if state.can_issue_command(give_way_drone, COMMAND_COOLDOWN_SECS) {
                     let cmd = Command {
-                        command_id: format!("HOLD-{}-{}", &conflict.drone1_id, now.timestamp()),
-                        drone_id: conflict.drone1_id.clone(),
+                        command_id: format!("HOLD-{}-{}", give_way_drone, now.timestamp()),
+                        drone_id: give_way_drone.clone(),
                         command_type: CommandType::Hold { duration_secs: 15 },
                         issued_at: now,
                         expires_at: Some(now + ChronoDuration::seconds(30)),
                         acknowledged: false,
                     };
                     state.enqueue_command(cmd);
-                    state.mark_command_issued(&conflict.drone1_id);
-                    tracing::info!("Auto-issued HOLD to {} (conflict)", conflict.drone1_id);
-                }
-
-                // Issue HOLD to drone2 if cooldown passed
-                if state.can_issue_command(&conflict.drone2_id, COMMAND_COOLDOWN_SECS) {
-                    let cmd = Command {
-                        command_id: format!("HOLD-{}-{}", &conflict.drone2_id, now.timestamp()),
-                        drone_id: conflict.drone2_id.clone(),
-                        command_type: CommandType::Hold { duration_secs: 15 },
-                        issued_at: now,
-                        expires_at: Some(now + ChronoDuration::seconds(30)),
-                        acknowledged: false,
-                    };
-                    state.enqueue_command(cmd);
-                    state.mark_command_issued(&conflict.drone2_id);
-                    tracing::info!("Auto-issued HOLD to {} (conflict)", conflict.drone2_id);
+                    state.mark_command_issued(give_way_drone);
+                    tracing::info!(
+                        "Auto-issued HOLD to {} (gives way to {})", 
+                        give_way_drone,
+                        if give_way_drone == &conflict.drone1_id { &conflict.drone2_id } else { &conflict.drone1_id }
+                    );
                 }
             }
         }

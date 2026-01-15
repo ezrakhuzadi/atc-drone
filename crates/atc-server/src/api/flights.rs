@@ -78,19 +78,21 @@ pub async fn create_flight_plan(
         candidates.first().map(|c| c.waypoints.clone()).unwrap_or_default()
     });
 
+    // Estimate arrival time based on route distance
+    let departure = payload.departure_time.unwrap_or_else(Utc::now);
+    let arrival_time = estimate_arrival_time(&final_waypoints, departure);
+
     let plan = FlightPlan {
         flight_id: flight_id.clone(),
         drone_id: payload.drone_id,
         waypoints: final_waypoints,
         status: flight_status,
-        departure_time: payload.departure_time.unwrap_or_else(Utc::now),
-        arrival_time: None, // Could estimate based on speed/dist
+        departure_time: departure,
+        arrival_time,
         created_at: Utc::now(),
     };
     
     state.add_flight_plan(plan.clone());
-    
-    // In a real system, we might trigger strategic deconfliction here
     
     (StatusCode::CREATED, Json(plan))
 }
@@ -98,4 +100,41 @@ pub async fn create_flight_plan(
 pub async fn get_flight_plans(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let plans = state.get_flight_plans();
     Json(plans)
+}
+
+/// Estimate arrival time based on waypoint distances and assumed cruise speed.
+fn estimate_arrival_time(
+    waypoints: &[atc_core::models::Waypoint],
+    departure: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    if waypoints.len() < 2 {
+        return None;
+    }
+    
+    // Calculate total route distance
+    let mut total_distance_m = 0.0;
+    for i in 0..(waypoints.len() - 1) {
+        total_distance_m += haversine_distance(
+            waypoints[i].lat, waypoints[i].lon,
+            waypoints[i + 1].lat, waypoints[i + 1].lon,
+        );
+    }
+    
+    // Assume 10 m/s cruise speed (could use waypoint.speed_mps if provided)
+    const CRUISE_SPEED_MPS: f64 = 10.0;
+    let duration_secs = (total_distance_m / CRUISE_SPEED_MPS) as i64;
+    
+    Some(departure + chrono::Duration::seconds(duration_secs))
+}
+
+/// Haversine distance between two points in meters.
+fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    const R: f64 = 6_371_000.0;
+    let phi1 = lat1.to_radians();
+    let phi2 = lat2.to_radians();
+    let dphi = (lat2 - lat1).to_radians();
+    let dlambda = (lon2 - lon1).to_radians();
+    let a = (dphi / 2.0).sin().powi(2)
+        + phi1.cos() * phi2.cos() * (dlambda / 2.0).sin().powi(2);
+    2.0 * R * a.sqrt().atan2((1.0 - a).sqrt())
 }

@@ -20,14 +20,21 @@ impl AtcClient {
             .drone_id()
             .ok_or_else(|| anyhow::anyhow!("Not registered"))?;
 
+        // Calculate velocity components from heading and speed
+        // heading_deg: 0 = North, 90 = East (clockwise from North)
+        let heading_rad = heading_deg.to_radians();
+        let velocity_x = speed_mps * heading_rad.sin();  // East component
+        let velocity_y = speed_mps * heading_rad.cos();  // North component
+        let velocity_z = 0.0; // Assuming level flight (could add climb rate later)
+
         let telemetry = Telemetry {
             drone_id: drone_id.to_string(),
             lat,
             lon,
             altitude_m,
-            velocity_x: 0.0,
-            velocity_y: 0.0,
-            velocity_z: 0.0,
+            velocity_x,
+            velocity_y,
+            velocity_z,
             heading_deg,
             speed_mps,
             timestamp: Utc::now(),

@@ -1,6 +1,7 @@
 //! In-memory state store using DashMap.
 
 use atc_core::models::{Command, DroneState, FlightPlan, Telemetry};
+use atc_core::rules::SafetyRules;
 use atc_core::{Conflict, ConflictDetector};
 use dashmap::DashMap;
 use std::collections::VecDeque;
@@ -20,21 +21,45 @@ pub struct AppState {
     command_cooldowns: DashMap<String, std::time::Instant>,
     drone_counter: AtomicU32,
     pub tx: broadcast::Sender<DroneState>, // For WS broadcasting
+    /// Safety rules (for timeout checks, etc.)
+    rules: SafetyRules,
 }
 
 impl AppState {
+    /// Create new AppState with default safety rules.
     pub fn new() -> Self {
+        Self::with_rules(SafetyRules::default())
+    }
+
+    /// Create new AppState with custom safety rules.
+    pub fn with_rules(rules: SafetyRules) -> Self {
         let (tx, _) = broadcast::channel(100);
+        
+        // Create detector with configurable thresholds from rules
+        let detector = ConflictDetector::new(
+            rules.lookahead_seconds,
+            rules.min_horizontal_separation_m,
+            rules.min_vertical_separation_m,
+            rules.warning_multiplier,
+        );
+        
         Self {
             drones: DashMap::new(),
             flight_plans: DashMap::new(),
-            detector: std::sync::Mutex::new(ConflictDetector::default()),
+            detector: std::sync::Mutex::new(detector),
             conflicts: DashMap::new(),
             commands: DashMap::new(),
             command_cooldowns: DashMap::new(),
             drone_counter: AtomicU32::new(1),
             tx,
+            rules,
         }
+    }
+
+    /// Get the configured safety rules.
+    #[allow(dead_code)] // Available for API endpoints
+    pub fn rules(&self) -> &SafetyRules {
+        &self.rules
     }
 
     /// Get next drone ID number.
@@ -94,6 +119,40 @@ impl AppState {
     /// Get all drone states.
     pub fn get_all_drones(&self) -> Vec<DroneState> {
         self.drones.iter().map(|r| r.value().clone()).collect()
+    }
+
+    /// Check for drones that haven't reported in and mark them as Lost.
+    /// Returns the IDs of newly-lost drones.
+    pub fn check_timeouts(&self) -> Vec<String> {
+        use atc_core::models::DroneStatus;
+        use chrono::Utc;
+        
+        let timeout_secs = self.rules.drone_timeout_secs as i64;
+        let now = Utc::now();
+        let mut lost_drones = Vec::new();
+        
+        for mut entry in self.drones.iter_mut() {
+            let drone = entry.value_mut();
+            
+            // Skip if already marked lost or inactive
+            if matches!(drone.status, DroneStatus::Lost | DroneStatus::Inactive) {
+                continue;
+            }
+            
+            // Check if last update is older than timeout
+            let elapsed = (now - drone.last_update).num_seconds();
+            if elapsed > timeout_secs {
+                drone.status = DroneStatus::Lost;
+                lost_drones.push(drone.drone_id.clone());
+                
+                // Remove from conflict detector (stale data)
+                if let Ok(mut detector) = self.detector.lock() {
+                    detector.remove_drone(&drone.drone_id);
+                }
+            }
+        }
+        
+        lost_drones
     }
 
     /// Get current conflicts.
