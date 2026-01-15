@@ -1,12 +1,15 @@
 //! CLI tool for multi-drone simulation with conflict scenarios.
+//! 
+//! Uses AtcClient SDK to send telemetry through atc-server (not directly to Blender).
 
-use atc_cli::auth::generate_dummy_token;
 use atc_cli::sim::{
-    create_converging_scenario, create_crossing_scenario, create_parallel_scenario, BlenderClient,
+    create_converging_scenario, create_crossing_scenario, create_parallel_scenario, FlightPath,
 };
+use atc_sdk::AtcClient;
 use clap::{Parser, ValueEnum};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::collections::HashMap;
+use std::time::Duration;
+use tokio::time;
 
 /// Available test scenarios
 #[derive(Debug, Clone, ValueEnum)]
@@ -23,13 +26,9 @@ enum ScenarioType {
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Args {
-    /// Flight Blender URL
-    #[arg(long, default_value = "http://localhost:8000")]
+    /// ATC Server URL
+    #[arg(long, default_value = "http://localhost:3000")]
     url: String,
-
-    /// Session UUID
-    #[arg(long, default_value = "00000000-0000-0000-0000-000000000000")]
-    session: String,
 
     /// Scenario to simulate
     #[arg(long, value_enum, default_value = "crossing")]
@@ -52,13 +51,9 @@ struct Args {
     rate: f64,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-
-    println!("Generating authentication token...");
-    let token = generate_dummy_token(None);
-
-    let client = BlenderClient::new(&args.url, &args.session, &token);
 
     // Create scenario
     let scenario = match args.scenario {
@@ -68,45 +63,69 @@ fn main() {
     };
 
     println!("\nScenario: {}", scenario.name);
-    println!("Starting multi-drone simulation");
-    println!("  Drones: {}", scenario.drones.len());
+    println!("Connecting to ATC Server at {}...", args.url);
+    
+    // Create and register a client for each drone
+    let mut clients: HashMap<String, AtcClient> = HashMap::new();
+    
+    for (drone_id, _) in &scenario.drones {
+        let mut client = AtcClient::new(&args.url);
+        match client.register(Some(drone_id)).await {
+            Ok(resp) => {
+                println!("  Registered: {}", resp.drone_id);
+                clients.insert(drone_id.clone(), client);
+            }
+            Err(e) => {
+                eprintln!("  Failed to register {}: {}", drone_id, e);
+            }
+        }
+    }
+
+    if clients.is_empty() {
+        anyhow::bail!("No drones registered successfully");
+    }
+
+    println!("\nStarting multi-drone simulation");
+    println!("  Drones: {}", clients.len());
     println!("  Duration: {}s, Update rate: {}Hz\n", args.duration, args.rate);
 
-    for (drone_id, _) in &scenario.drones {
-        println!("  - {}", drone_id);
-    }
-    println!();
-
-    let start = Instant::now();
+    let start = time::Instant::now();
     let mut update_count = 0u32;
-    let update_interval = Duration::from_secs_f64(1.0 / args.rate);
+    let mut interval = time::interval(Duration::from_secs_f64(1.0 / args.rate));
 
-    while start.elapsed() < Duration::from_secs(args.duration) {
+    loop {
+        interval.tick().await;
+
         let elapsed = start.elapsed().as_secs_f64();
+        if elapsed > args.duration as f64 {
+            break;
+        }
+
         update_count += 1;
 
         // Update all drones
         for (drone_id, path) in &scenario.drones {
-            let (lat, lon, alt) = path.get_position(elapsed);
-            let heading = path.get_heading(elapsed);
-            let speed = path.get_speed_mps();
+            if let Some(client) = clients.get(drone_id) {
+                let (lat, lon, alt) = path.get_position(elapsed);
+                let heading = path.get_heading(elapsed);
+                let speed = path.get_speed_mps();
 
-            match client.send_observation(drone_id, lat, lon, alt, heading, speed) {
-                Ok(status) => {
-                    println!(
-                        "[{:3}] {}: ({:.6}, {:.6}) -> {}",
-                        update_count, drone_id, lat, lon, status
-                    );
-                }
-                Err(e) => {
-                    eprintln!("[{}] Error: {}", drone_id, e);
+                match client.send_position(lat, lon, alt, heading, speed).await {
+                    Ok(_) => {
+                        println!(
+                            "[{:3}] {}: ({:.6}, {:.6}) -> OK",
+                            update_count, drone_id, lat, lon
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("[{}] Error: {}", drone_id, e);
+                    }
                 }
             }
         }
-
-        thread::sleep(update_interval);
     }
 
-    let total_updates = update_count as usize * scenario.drones.len();
+    let total_updates = update_count as usize * clients.len();
     println!("\nSimulation complete. Sent {} total updates.", total_updates);
+    Ok(())
 }

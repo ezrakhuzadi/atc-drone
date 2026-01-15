@@ -76,4 +76,25 @@ impl AtcClient {
 
         Ok(())
     }
+    /// Create a flight plan for the drone.
+    pub async fn create_flight_plan(&self, request: &atc_core::models::FlightPlanRequest) -> Result<atc_core::models::FlightPlan> {
+        let url = format!("{}/v1/flights/plan", self.base_url);
+        
+        // Ensure the request has the correct drone_id
+        let mut req = request.clone();
+        if let Some(drone_id) = &self.drone_id {
+            req.drone_id = drone_id.clone();
+        }
+
+        let response: atc_core::models::FlightPlan = self
+            .client
+            .post(&url)
+            .json(&req)
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        Ok(response)
+    }
 }

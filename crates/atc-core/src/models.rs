@@ -91,15 +91,31 @@ impl DroneState {
     }
 }
 
-/// A mission (flight plan) for a drone.
+/// A flight plan submitted by an operator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Mission {
-    pub mission_id: String,
+pub struct FlightPlan {
+    pub flight_id: String,
     pub drone_id: String,
     pub waypoints: Vec<Waypoint>,
-    pub status: MissionStatus,
+    pub status: FlightStatus,
+    /// Scheduled departure time
+    pub departure_time: DateTime<Utc>,
+    /// Estimated arrival time
+    pub arrival_time: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlightPlanRequest {
+    pub drone_id: String,
+    /// If provided, specific waypoints are used. If not, a route is generated.
+    pub waypoints: Option<Vec<Waypoint>>,
+    /// Alternatively, provide origin/destination for auto-generation
+    pub origin: Option<Waypoint>,
+    pub destination: Option<Waypoint>,
+    pub departure_time: Option<DateTime<Utc>>,
+}
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Waypoint {
@@ -111,10 +127,18 @@ pub struct Waypoint {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum MissionStatus {
+pub enum FlightStatus {
+    /// Received but not yet approved
     Pending,
+    /// Approved by ATC, ready for takeoff
+    Approved,
+    /// Currently flying
     Active,
+    /// Flight completed successfully
     Completed,
+    /// Rejected by ATC (conflict, etc.)
+    Rejected,
+    /// Cancelled by operator
     Cancelled,
 }
 

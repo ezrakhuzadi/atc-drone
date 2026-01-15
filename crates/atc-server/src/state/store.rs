@@ -1,6 +1,6 @@
 //! In-memory state store using DashMap.
 
-use atc_core::models::{DroneState, Telemetry};
+use atc_core::models::{DroneState, FlightPlan, Telemetry};
 use atc_core::{Conflict, ConflictDetector};
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -10,6 +10,7 @@ use tokio::sync::broadcast;
 /// Application state - thread-safe store for drones and conflicts.
 pub struct AppState {
     drones: DashMap<String, DroneState>,
+    pub flight_plans: DashMap<String, FlightPlan>,
     detector: std::sync::Mutex<ConflictDetector>,
     conflicts: DashMap<String, Conflict>,
     drone_counter: AtomicU32,
@@ -21,6 +22,7 @@ impl AppState {
         let (tx, _) = broadcast::channel(100);
         Self {
             drones: DashMap::new(),
+            flight_plans: DashMap::new(),
             detector: std::sync::Mutex::new(ConflictDetector::default()),
             conflicts: DashMap::new(),
             drone_counter: AtomicU32::new(1),
@@ -90,5 +92,15 @@ impl AppState {
     /// Get current conflicts.
     pub fn get_conflicts(&self) -> Vec<Conflict> {
         self.conflicts.iter().map(|r| r.value().clone()).collect()
+    }
+    
+    /// Get all flight plans
+    pub fn get_flight_plans(&self) -> Vec<FlightPlan> {
+        self.flight_plans.iter().map(|r| r.value().clone()).collect()
+    }
+    
+    /// Add or update a flight plan
+    pub fn add_flight_plan(&self, plan: FlightPlan) {
+        self.flight_plans.insert(plan.flight_id.clone(), plan);
     }
 }

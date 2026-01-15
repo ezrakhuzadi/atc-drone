@@ -1,9 +1,14 @@
-//! Simple route suggestion logic ("Waze options").
-//!
-//! Given a start and end point, generates route alternatives.
+//! Simple route suggestion logic.
 
 use crate::models::Waypoint;
 use serde::{Deserialize, Serialize};
+use rand::Rng;
+
+const IRVINE_LAT: f64 = 33.6846;
+const IRVINE_LON: f64 = -117.8265;
+const RADIUS_DEG: f64 = 0.02; // approx 2km
+const DEFAULT_ALT: f64 = 50.0;
+const DEFAULT_SPEED: f64 = 10.0;
 
 /// A suggested route option.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,7 +49,7 @@ pub fn generate_route_options(
                 end.clone(),
             ],
             estimated_duration_secs: duration_secs,
-            conflict_risk: ConflictRisk::Medium, // To be calculated
+            conflict_risk: ConflictRisk::Medium,
         },
         // Option 2: Higher altitude
         RouteOption {
@@ -77,6 +82,28 @@ pub fn generate_route_options(
             conflict_risk: ConflictRisk::Low,
         },
     ]
+}
+
+/// Generate a random route with a start and end point near Irvine.
+pub fn generate_random_route() -> Vec<Waypoint> {
+    let start = random_point_near_irvine();
+    let end = random_point_near_irvine();
+    
+    // Simple 2-point route
+    vec![start, end]
+}
+
+fn random_point_near_irvine() -> Waypoint {
+    let mut rng = rand::thread_rng();
+    let lat_offset = rng.gen_range(-RADIUS_DEG..RADIUS_DEG);
+    let lon_offset = rng.gen_range(-RADIUS_DEG..RADIUS_DEG);
+    
+    Waypoint {
+        lat: IRVINE_LAT + lat_offset,
+        lon: IRVINE_LON + lon_offset,
+        altitude_m: DEFAULT_ALT,
+        speed_mps: Some(DEFAULT_SPEED),
+    }
 }
 
 /// Calculate distance between two points in meters (Haversine formula).
