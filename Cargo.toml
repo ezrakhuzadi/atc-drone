@@ -1,0 +1,47 @@
+[package]
+name = "atc-drone-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Local traffic management system for cooperative UAVs"
+authors = ["Ezra Khuzadi"]
+license = "MIT"
+
+[lib]
+name = "atc_drone"
+path = "src/lib.rs"
+
+[[bin]]
+name = "generate_token"
+path = "src/bin/generate_token.rs"
+
+[[bin]]
+name = "send_one_track"
+path = "src/bin/send_one_track.rs"
+
+[[bin]]
+name = "send_multi_track"
+path = "src/bin/send_multi_track.rs"
+
+[dependencies]
+# JWT encoding
+jsonwebtoken = "9"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
