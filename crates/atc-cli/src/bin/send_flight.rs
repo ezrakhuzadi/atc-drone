@@ -95,14 +95,19 @@ async fn main() -> Result<()> {
         let lon = start_wp.lon + (end_wp.lon - start_wp.lon) * fraction;
         let alt = start_wp.altitude_m + (end_wp.altitude_m - start_wp.altitude_m) * fraction;
         
+        // Calculate velocity components from heading and speed
+        let heading_rad = heading.to_radians();
+        let velocity_x = speed * heading_rad.sin();  // East
+        let velocity_y = speed * heading_rad.cos();  // North
+        
         let telemetry = Telemetry {
             drone_id: client.drone_id().unwrap().to_string(),
             lat,
             lon,
             altitude_m: alt,
-            velocity_x: 0.0,
-            velocity_y: 0.0,
-            velocity_z: 0.0,
+            velocity_x,
+            velocity_y,
+            velocity_z: 0.0, // Level flight
             heading_deg: heading,
             speed_mps: speed,
             timestamp: Utc::now(),
