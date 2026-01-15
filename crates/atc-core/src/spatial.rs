@@ -1,16 +1,18 @@
-//! Spatial math for conflict detection.
+//! Spatial math for conflict detection and distance calculations.
 
 use crate::models::FlightPlan;
 
 // Minimum separation distance in meters
 const MIN_SEPARATION_M: f64 = 50.0;
-// Minimum time separation in seconds (for traversing same point)
-#[allow(dead_code)] // Reserved for future 4D conflict detection
-const _MIN_TIME_SEP_S: f64 = 60.0; 
+// Minimum vertical separation in meters
+const MIN_VERTICAL_SEP_M: f64 = 30.0;
 
 /// Check if two flight plans conflict.
 /// 
-/// Returns true if valid conflict found.
+/// Uses line segment distance checks between consecutive waypoints
+/// to detect potential conflicts along flight paths.
+/// 
+/// Returns true if conflict found.
 pub fn check_plan_conflict(new_plan: &FlightPlan, existing_plan: &FlightPlan) -> bool {
     // 1. Check time overlap window
     let start1 = new_plan.departure_time;
@@ -19,22 +21,49 @@ pub fn check_plan_conflict(new_plan: &FlightPlan, existing_plan: &FlightPlan) ->
     let start2 = existing_plan.departure_time;
     let end2 = existing_plan.waypoints.last().map(|_| start2 + chrono::Duration::seconds(600)).unwrap_or(start2);
     
-    // Simple bounding box check on time
+    // No time overlap = no conflict
     if end1 < start2 || start1 > end2 {
         return false;
     }
     
-    // 2. Check path segments
-    // Simplification: Check waypoint proximity for now.
-    // Proper implementation requires Line Segment distance in 3D + Time interpolation.
+    // 2. Check path segments for proximity
+    // Check each segment of new plan against each segment of existing plan
+    let new_wps = &new_plan.waypoints;
+    let existing_wps = &existing_plan.waypoints;
     
-    for wp1 in &new_plan.waypoints {
-        for wp2 in &existing_plan.waypoints {
+    // Check segment-to-segment proximity
+    for i in 0..new_wps.len().saturating_sub(1) {
+        for j in 0..existing_wps.len().saturating_sub(1) {
+            // Get segments
+            let (a1, a2) = (&new_wps[i], &new_wps[i + 1]);
+            let (b1, b2) = (&existing_wps[j], &existing_wps[j + 1]);
+            
+            // Check if segments are close enough horizontally
+            let min_dist = segment_to_segment_distance(
+                a1.lat, a1.lon, a2.lat, a2.lon,
+                b1.lat, b1.lon, b2.lat, b2.lon,
+            );
+            
+            // Check altitude overlap
+            let alt_overlap = altitude_ranges_overlap(
+                a1.altitude_m, a2.altitude_m,
+                b1.altitude_m, b2.altitude_m,
+                MIN_VERTICAL_SEP_M,
+            );
+            
+            if min_dist < MIN_SEPARATION_M && alt_overlap {
+                return true;
+            }
+        }
+    }
+    
+    // Also check waypoint proximity as fallback
+    for wp1 in new_wps {
+        for wp2 in existing_wps {
             let dist = haversine_distance(wp1.lat, wp1.lon, wp2.lat, wp2.lon);
             let alt_diff = (wp1.altitude_m - wp2.altitude_m).abs();
             
-            if dist < MIN_SEPARATION_M && alt_diff < MIN_SEPARATION_M {
-                // Conflict!
+            if dist < MIN_SEPARATION_M && alt_diff < MIN_VERTICAL_SEP_M {
                 return true;
             }
         }
@@ -43,8 +72,57 @@ pub fn check_plan_conflict(new_plan: &FlightPlan, existing_plan: &FlightPlan) ->
     false
 }
 
-fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    const R: f64 = 6_371_000.0;
+/// Check if two altitude ranges overlap (with separation buffer).
+fn altitude_ranges_overlap(a_min: f64, a_max: f64, b_min: f64, b_max: f64, sep: f64) -> bool {
+    let a_lo = a_min.min(a_max) - sep;
+    let a_hi = a_min.max(a_max) + sep;
+    let b_lo = b_min.min(b_max);
+    let b_hi = b_min.max(b_max);
+    
+    a_lo <= b_hi && b_lo <= a_hi
+}
+
+/// Approximate minimum distance between two line segments in meters.
+/// Uses sampling approach for simplicity.
+#[allow(clippy::too_many_arguments)]
+fn segment_to_segment_distance(
+    a1_lat: f64, a1_lon: f64, a2_lat: f64, a2_lon: f64,
+    b1_lat: f64, b1_lon: f64, b2_lat: f64, b2_lon: f64,
+) -> f64 {
+    let mut min_dist = f64::MAX;
+    
+    // Sample 5 points along each segment
+    for i in 0..=4 {
+        let t = i as f64 / 4.0;
+        let a_lat = a1_lat + t * (a2_lat - a1_lat);
+        let a_lon = a1_lon + t * (a2_lon - a1_lon);
+        
+        for j in 0..=4 {
+            let s = j as f64 / 4.0;
+            let b_lat = b1_lat + s * (b2_lat - b1_lat);
+            let b_lon = b1_lon + s * (b2_lon - b1_lon);
+            
+            let dist = haversine_distance(a_lat, a_lon, b_lat, b_lon);
+            min_dist = min_dist.min(dist);
+        }
+    }
+    
+    min_dist
+}
+
+/// Calculate distance between two points in meters using Haversine formula.
+/// 
+/// This is the standard formula for calculating great-circle distance
+/// between two points on a sphere given their latitudes and longitudes.
+/// 
+/// # Arguments
+/// * `lat1`, `lon1` - First point coordinates in decimal degrees
+/// * `lat2`, `lon2` - Second point coordinates in decimal degrees
+/// 
+/// # Returns
+/// Distance in meters
+pub fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    const R: f64 = 6_371_000.0; // Earth radius in meters
     let phi1 = lat1.to_radians();
     let phi2 = lat2.to_radians();
     let dphi = (lat2 - lat1).to_radians();
@@ -53,3 +131,22 @@ fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
         + phi1.cos() * phi2.cos() * (dlambda / 2.0).sin().powi(2);
     2.0 * R * a.sqrt().atan2((1.0 - a).sqrt())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_haversine_known_distance() {
+        // ~111km between these points (1 degree latitude)
+        let dist = haversine_distance(0.0, 0.0, 1.0, 0.0);
+        assert!((dist - 111_194.0).abs() < 100.0);
+    }
+
+    #[test]
+    fn test_haversine_same_point() {
+        let dist = haversine_distance(33.6846, -117.8265, 33.6846, -117.8265);
+        assert!(dist < 0.001);
+    }
+}
+
