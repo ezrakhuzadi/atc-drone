@@ -1,0 +1,27 @@
+[package]
+name = "atc-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Always-on ATC backend server with REST + WebSocket APIs"
+
+[[bin]]
+name = "atc-server"
+path = "src/main.rs"
+
+[dependencies]
+atc-core.workspace = true
+atc-blender.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+dashmap.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true

@@ -1,6 +1,6 @@
 //! CLI tool to generate a dummy JWT token for Flight Blender API access.
 
-use atc_drone::auth::{generate_dummy_token, TokenConfig};
+use atc_cli::auth::{generate_dummy_token, TokenConfig};
 use clap::Parser;
 
 /// Generate a dummy JWT token for Flight Blender API access

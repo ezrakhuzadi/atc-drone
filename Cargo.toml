@@ -1,47 +1,46 @@
-[package]
-name = "atc-drone-rs"
-version = "0.1.0"
+[workspace]
+resolver = "2"
+members = [
+    "crates/atc-core",
+    "crates/atc-blender", 
+    "crates/atc-server",
+    "crates/atc-sdk",
+    "crates/atc-cli",
+]
+
+[workspace.package]
+version = "0.2.0"
 edition = "2021"
-description = "Local traffic management system for cooperative UAVs"
 authors = ["Ezra Khuzadi"]
 license = "MIT"
 
-[lib]
-name = "atc_drone"
-path = "src/lib.rs"
-
-[[bin]]
-name = "generate_token"
-path = "src/bin/generate_token.rs"
-
-[[bin]]
-name = "send_one_track"
-path = "src/bin/send_one_track.rs"
-
-[[bin]]
-name = "send_multi_track"
-path = "src/bin/send_multi_track.rs"
-
-[dependencies]
-# JWT encoding
-jsonwebtoken = "9"
-
-# HTTP client
-reqwest = { version = "0.12", features = ["blocking", "json"] }
-
-# Serialization
+[workspace.dependencies]
+# Shared dependencies across workspace
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-# CLI argument parsing
-clap = { version = "4", features = ["derive"] }
-
-# Time handling
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
 
-# Error handling
-thiserror = "2"
-anyhow = "1"
+# HTTP/WebSocket
+axum = { version = "0.7", features = ["ws"] }
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
 
-[dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# State management
+dashmap = "6"
+
+# Auth
+jsonwebtoken = "9"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Internal crates
+atc-core = { path = "crates/atc-core" }
+atc-blender = { path = "crates/atc-blender" }
+atc-sdk = { path = "crates/atc-sdk" }

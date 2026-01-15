@@ -1,0 +1,32 @@
+[package]
+name = "atc-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "CLI tools for ATC drone system"
+
+[[bin]]
+name = "generate_token"
+path = "src/bin/generate_token.rs"
+
+[[bin]]
+name = "send_one_track"
+path = "src/bin/send_one_track.rs"
+
+[[bin]]
+name = "send_multi_track"
+path = "src/bin/send_multi_track.rs"
+
+[dependencies]
+atc-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
+clap.workspace = true
+chrono.workspace = true
+jsonwebtoken.workspace = true
+anyhow.workspace = true
+
+[lib]
+path = "src/lib.rs"

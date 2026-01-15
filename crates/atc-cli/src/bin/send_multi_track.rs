@@ -1,7 +1,7 @@
 //! CLI tool for multi-drone simulation with conflict scenarios.
 
-use atc_drone::auth::generate_dummy_token;
-use atc_drone::sim::{
+use atc_cli::auth::generate_dummy_token;
+use atc_cli::sim::{
     create_converging_scenario, create_crossing_scenario, create_parallel_scenario, BlenderClient,
 };
 use clap::{Parser, ValueEnum};

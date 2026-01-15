@@ -2,8 +2,8 @@
 //!
 //! Simulates a single drone flying in a circle.
 
-use atc_drone::auth::generate_dummy_token;
-use atc_drone::sim::{BlenderClient, CircularPath, FlightPath};
+use atc_cli::auth::generate_dummy_token;
+use atc_cli::sim::{BlenderClient, CircularPath, FlightPath};
 use clap::Parser;
 use std::thread;
 use std::time::{Duration, Instant};
