@@ -22,6 +22,11 @@ pub struct RegisterResponse {
     pub session_token: String,
 }
 
+#[derive(Debug, Serialize)]
+struct AckRequest {
+    command_id: String,
+}
+
 impl AtcClient {
     /// Create a new ATC client.
     pub fn new(base_url: impl Into<String>) -> Self {
@@ -76,6 +81,7 @@ impl AtcClient {
 
         Ok(())
     }
+
     /// Create a flight plan for the drone.
     pub async fn create_flight_plan(&self, request: &atc_core::models::FlightPlanRequest) -> Result<atc_core::models::FlightPlan> {
         let url = format!("{}/v1/flights/plan", self.base_url);
@@ -97,4 +103,44 @@ impl AtcClient {
 
         Ok(response)
     }
+
+    // ========== COMMAND HANDLING ==========
+
+    /// Poll for the next pending command for this drone.
+    /// Returns None if no command is pending.
+    pub async fn get_next_command(&self) -> Result<Option<atc_core::models::Command>> {
+        let drone_id = self.drone_id.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Drone not registered"))?;
+        
+        let url = format!("{}/v1/commands/next?drone_id={}", self.base_url, drone_id);
+        
+        let response: Option<atc_core::models::Command> = self
+            .client
+            .get(&url)
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        Ok(response)
+    }
+
+    /// Acknowledge a command by ID (marks it as executed).
+    pub async fn ack_command(&self, command_id: &str) -> Result<()> {
+        let url = format!("{}/v1/commands/ack", self.base_url);
+        
+        let response = self
+            .client
+            .post(&url)
+            .json(&AckRequest { command_id: command_id.to_string() })
+            .send()
+            .await?;
+            
+        if !response.status().is_success() {
+            anyhow::bail!("Failed to ack command: {}", response.status());
+        }
+
+        Ok(())
+    }
 }
+

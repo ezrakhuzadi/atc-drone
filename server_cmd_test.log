@@ -1,0 +1,166 @@
+warning: unused import: `Waypoint`
+ --> crates/atc-core/src/spatial.rs:3:33
+  |
+3 | use crate::models::{FlightPlan, Waypoint};
+  |                                 ^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: use of deprecated function `rand::thread_rng`: Renamed to `rng`
+  --> crates/atc-core/src/routing.rs:97:25
+   |
+97 |     let mut rng = rand::thread_rng();
+   |                         ^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated method `rand::Rng::gen_range`: Renamed to `random_range`
+  --> crates/atc-core/src/routing.rs:98:26
+   |
+98 |     let lat_offset = rng.gen_range(-RADIUS_DEG..RADIUS_DEG);
+   |                          ^^^^^^^^^
+
+warning: use of deprecated method `rand::Rng::gen_range`: Renamed to `random_range`
+  --> crates/atc-core/src/routing.rs:99:26
+   |
+99 |     let lon_offset = rng.gen_range(-RADIUS_DEG..RADIUS_DEG);
+   |                          ^^^^^^^^^
+
+warning: constant `MIN_TIME_SEP_S` is never used
+ --> crates/atc-core/src/spatial.rs:8:7
+  |
+8 | const MIN_TIME_SEP_S: f64 = 60.0; 
+  |       ^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `atc-core` (lib) generated 5 warnings (run `cargo fix --lib -p atc-core` to apply 1 suggestion)
+warning: unused import: `Deserialize`
+ --> crates/atc-blender/src/client.rs:6:13
+  |
+6 | use serde::{Deserialize, Serialize};
+  |             ^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `atc-blender` (lib) generated 1 warning (run `cargo fix --lib -p atc-blender` to apply 1 suggestion)
+warning: unused import: `stream::StreamExt`
+ --> crates/atc-server/src/api/ws.rs:9:30
+  |
+9 | use futures::{sink::SinkExt, stream::StreamExt};
+  |                              ^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `tokio::sync::broadcast`
+  --> crates/atc-server/src/api/ws.rs:11:5
+   |
+11 | use tokio::sync::broadcast;
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `Router`
+ --> crates/atc-server/src/main.rs:9:26
+  |
+9 | use axum::{routing::get, Router};
+  |                          ^^^^^^
+
+warning: unused import: `sink::SinkExt`
+ --> crates/atc-server/src/api/ws.rs:9:15
+  |
+9 | use futures::{sink::SinkExt, stream::StreamExt};
+  |               ^^^^^^^^^^^^^
+
+warning: field `drone_type` is never read
+  --> crates/atc-server/src/api/routes.rs:37:9
+   |
+35 | pub struct RegisterRequest {
+   |            --------------- field in this struct
+36 |     pub drone_id: Option<String>,
+37 |     pub drone_type: Option<String>,
+   |         ^^^^^^^^^^
+   |
+   = note: `RegisterRequest` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `pop_command` is never used
+   --> crates/atc-server/src/state/store.rs:147:12
+    |
+ 25 | impl AppState {
+    | ------------- method in this implementation
+...
+147 |     pub fn pop_command(&self, drone_id: &str) -> Option<Command> {
+    |            ^^^^^^^^^^^
+
+warning: `atc-server` (bin "atc-server") generated 6 warnings (run `cargo fix --bin "atc-server" -p atc-server` to apply 3 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.12s
+     Running `target/debug/atc-server`
+[2m2026-01-15T21:10:04.043462Z[0m [32m INFO[0m [2matc_server[0m[2m:[0m Starting ATC Server...
+[2m2026-01-15T21:10:04.044042Z[0m [32m INFO[0m [2matc_server[0m[2m:[0m Listening on 0.0.0.0:3000
+[2m2026-01-15T21:10:11.076496Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:12.076754Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:13.076333Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:14.077577Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:15.075877Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:16.076719Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:17.076679Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:18.076479Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:19.075393Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:20.045460Z[0m [33m WARN[0m [2matc_server::loops::conflict_loop[0m[2m:[0m Detected 1 conflict(s)
+[2m2026-01-15T21:10:20.045542Z[0m [33m WARN[0m [2matc_server::loops::conflict_loop[0m[2m:[0m   [Warning] DRONE002 <-> DRONE004 @ 411m -> Geofence CONFLICT_002_004
+[2m2026-01-15T21:10:20.045603Z[0m [32m INFO[0m [2matc_server::loops::conflict_loop[0m[2m:[0m Auto-issued HOLD to DRONE002 (conflict)
+[2m2026-01-15T21:10:20.045627Z[0m [32m INFO[0m [2matc_server::loops::conflict_loop[0m[2m:[0m Auto-issued HOLD to DRONE004 (conflict)
+[2m2026-01-15T21:10:20.049532Z[0m [34mDEBUG[0m [2matc_server::loops::conflict_loop[0m[2m:[0m Synced 1 conflict geofences to Blender
+[2m2026-01-15T21:10:20.076774Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:21.045626Z[0m [33m WARN[0m [2matc_server::loops::conflict_loop[0m[2m:[0m Detected 1 conflict(s)
+[2m2026-01-15T21:10:21.045712Z[0m [33m WARN[0m [2matc_server::loops::conflict_loop[0m[2m:[0m   [Warning] DRONE002 <-> DRONE004 @ 395m -> Geofence CONFLICT_002_004
+[2m2026-01-15T21:10:21.049008Z[0m [34mDEBUG[0m [2matc_server::loops::conflict_loop[0m[2m:[0m Synced 1 conflict geofences to Blender
+[2m2026-01-15T21:10:21.075629Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:21.589155Z[0m [32m INFO[0m [2matc_server::api::commands[0m[2m:[0m Command HOLD-DRONE002-1768511420 acknowledged
+[2m2026-01-15T21:10:21.591957Z[0m [32m INFO[0m [2matc_server::api::commands[0m[2m:[0m Command HOLD-DRONE004-1768511420 acknowledged
+[2m2026-01-15T21:10:22.045459Z[0m [33m WARN[0m [2matc_server::loops::conflict_loop[0m[2m:[0m Detected 5 conflict(s)
+[2m2026-01-15T21:10:22.045543Z[0m [33m WARN[0m [2matc_server::loops::conflict_loop[0m[2m:[0m   [Warning] DRONE002 <-> DRONE004 @ 379m -> Geofence CONFLICT_002_004
+[2m2026-01-15T21:10:22.045568Z[0m [33m WARN[0m [2matc_server::loops::conflict_loop[0m[2m:[0m   [Warning] DRONE002 <-> DRONE001 @ 310m -> Geofence CONFLICT_002_001
+[2m2026-01-15T21:10:22.045619Z[0m [32m INFO[0m [2matc_server::loops::conflict_loop[0m[2m:[0m Auto-issued HOLD to DRONE001 (conflict)
+[2m2026-01-15T21:10:22.045658Z[0m [33m WARN[0m [2matc_server::loops::conflict_loop[0m[2m:[0m   [Warning] DRONE004 <-> DRONE003 @ 310m -> Geofence CONFLICT_004_003
+[2m2026-01-15T21:10:22.045702Z[0m [32m INFO[0m [2matc_server::loops::conflict_loop[0m[2m:[0m Auto-issued HOLD to DRONE003 (conflict)
+[2m2026-01-15T21:10:22.045728Z[0m [33m WARN[0m [2matc_server::loops::conflict_loop[0m[2m:[0m   [Warning] DRONE002 <-> DRONE003 @ 310m -> Geofence CONFLICT_002_003
+[2m2026-01-15T21:10:22.045759Z[0m [33m WARN[0m [2matc_server::loops::conflict_loop[0m[2m:[0m   [Warning] DRONE004 <-> DRONE001 @ 310m -> Geofence CONFLICT_004_001
+[2m2026-01-15T21:10:22.059920Z[0m [34mDEBUG[0m [2matc_server::loops::conflict_loop[0m[2m:[0m Synced 5 conflict geofences to Blender
+[2m2026-01-15T21:10:22.075165Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:23.076718Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:23.587461Z[0m [32m INFO[0m [2matc_server::api::commands[0m[2m:[0m Command HOLD-DRONE001-1768511422 acknowledged
+[2m2026-01-15T21:10:23.589815Z[0m [32m INFO[0m [2matc_server::api::commands[0m[2m:[0m Command HOLD-DRONE003-1768511422 acknowledged
+[2m2026-01-15T21:10:24.075034Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:25.076060Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:26.077669Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:27.076700Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:28.076817Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:29.076783Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:30.076175Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:31.075824Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:32.076032Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:33.077269Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:34.076307Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:35.077132Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:36.081339Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:37.075666Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:38.076265Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:39.076333Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:40.077150Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:41.075657Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:42.076350Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:43.075174Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:44.076655Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:45.075726Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:46.076678Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:47.076016Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:48.076168Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:49.075955Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:50.076250Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:51.076090Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:52.075336Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:53.076030Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:54.077027Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:55.077988Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:56.077614Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender
+[2m2026-01-15T21:10:57.076727Z[0m [34mDEBUG[0m [2matc_server::loops::blender_sync_loop[0m[2m:[0m Synced 4 drones to Blender

@@ -9,7 +9,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::api::flights;
+use crate::api::{commands, flights};
 use crate::state::AppState;
 use atc_core::models::Telemetry;
 
@@ -22,6 +22,11 @@ pub fn create_router() -> Router<Arc<AppState>> {
         .route("/v1/conflicts", get(list_conflicts))
         .route("/v1/flights/plan", post(flights::create_flight_plan))
         .route("/v1/flights", get(flights::get_flight_plans))
+        // Command dispatch routes
+        .route("/v1/commands", post(commands::issue_command))
+        .route("/v1/commands", get(commands::get_all_commands))
+        .route("/v1/commands/next", get(commands::get_next_command))
+        .route("/v1/commands/ack", post(commands::ack_command))
 }
 
 // === Request/Response types ===

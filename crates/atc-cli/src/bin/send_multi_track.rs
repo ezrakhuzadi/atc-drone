@@ -1,10 +1,12 @@
 //! CLI tool for multi-drone simulation with conflict scenarios.
 //! 
 //! Uses AtcClient SDK to send telemetry through atc-server (not directly to Blender).
+//! Responds to HOLD commands by stopping movement.
 
 use atc_cli::sim::{
     create_converging_scenario, create_crossing_scenario, create_parallel_scenario, FlightPath,
 };
+use atc_core::models::CommandType;
 use atc_sdk::AtcClient;
 use clap::{Parser, ValueEnum};
 use std::collections::HashMap;
@@ -20,6 +22,24 @@ enum ScenarioType {
     Parallel,
     /// Multiple drones converging on a point
     Converging,
+}
+
+/// Drone control state
+#[derive(Debug, Clone)]
+struct DroneControl {
+    is_holding: bool,
+    hold_until: Option<time::Instant>,
+    frozen_position: Option<(f64, f64, f64)>,
+}
+
+impl Default for DroneControl {
+    fn default() -> Self {
+        Self {
+            is_holding: false,
+            hold_until: None,
+            frozen_position: None,
+        }
+    }
 }
 
 /// Multi-drone simulator with conflict scenarios
@@ -67,6 +87,7 @@ async fn main() -> anyhow::Result<()> {
     
     // Create and register a client for each drone
     let mut clients: HashMap<String, AtcClient> = HashMap::new();
+    let mut controls: HashMap<String, DroneControl> = HashMap::new();
     
     for (drone_id, _) in &scenario.drones {
         let mut client = AtcClient::new(&args.url);
@@ -74,6 +95,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(resp) => {
                 println!("  Registered: {}", resp.drone_id);
                 clients.insert(drone_id.clone(), client);
+                controls.insert(drone_id.clone(), DroneControl::default());
             }
             Err(e) => {
                 eprintln!("  Failed to register {}: {}", drone_id, e);
@@ -85,7 +107,7 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("No drones registered successfully");
     }
 
-    println!("\nStarting multi-drone simulation");
+    println!("\nStarting multi-drone simulation (with command handling)");
     println!("  Drones: {}", clients.len());
     println!("  Duration: {}s, Update rate: {}Hz\n", args.duration, args.rate);
 
@@ -106,19 +128,75 @@ async fn main() -> anyhow::Result<()> {
         // Update all drones
         for (drone_id, path) in &scenario.drones {
             if let Some(client) = clients.get(drone_id) {
-                let (lat, lon, alt) = path.get_position(elapsed);
-                let heading = path.get_heading(elapsed);
-                let speed = path.get_speed_mps();
+                let control = controls.get_mut(drone_id).unwrap();
+                
+                // Check if HOLD has expired
+                if let Some(until) = control.hold_until {
+                    if time::Instant::now() >= until {
+                        control.is_holding = false;
+                        control.hold_until = None;
+                        control.frozen_position = None;
+                        println!("[{:3}] {} HOLD expired, resuming", update_count, drone_id);
+                    }
+                }
 
+                // Get position (frozen if holding)
+                let (lat, lon, alt) = if control.is_holding {
+                    control.frozen_position.unwrap_or_else(|| path.get_position(elapsed))
+                } else {
+                    path.get_position(elapsed)
+                };
+                
+                let heading = path.get_heading(elapsed);
+                let speed = if control.is_holding { 0.0 } else { path.get_speed_mps() };
+
+                // Send telemetry
                 match client.send_position(lat, lon, alt, heading, speed).await {
                     Ok(_) => {
+                        let status = if control.is_holding { "HOLD" } else { "OK" };
                         println!(
-                            "[{:3}] {}: ({:.6}, {:.6}) -> OK",
-                            update_count, drone_id, lat, lon
+                            "[{:3}] {}: ({:.6}, {:.6}) -> {}",
+                            update_count, drone_id, lat, lon, status
                         );
                     }
                     Err(e) => {
                         eprintln!("[{}] Error: {}", drone_id, e);
+                    }
+                }
+
+                // Poll for commands every 2 updates
+                if update_count % 2 == 0 {
+                    match client.get_next_command().await {
+                        Ok(Some(cmd)) => {
+                            println!("  [CMD] {} received: {:?}", drone_id, cmd.command_type);
+                            
+                            match cmd.command_type {
+                                CommandType::Hold { duration_secs } => {
+                                    control.is_holding = true;
+                                    control.hold_until = Some(time::Instant::now() + Duration::from_secs(duration_secs as u64));
+                                    control.frozen_position = Some((lat, lon, alt));
+                                    println!("  [CMD] {} executing HOLD for {}s", drone_id, duration_secs);
+                                }
+                                CommandType::Resume => {
+                                    control.is_holding = false;
+                                    control.hold_until = None;
+                                    control.frozen_position = None;
+                                    println!("  [CMD] {} resuming flight", drone_id);
+                                }
+                                _ => {
+                                    println!("  [CMD] {} ignoring command type", drone_id);
+                                }
+                            }
+                            
+                            // Acknowledge the command
+                            if let Err(e) = client.ack_command(&cmd.command_id).await {
+                                eprintln!("  Failed to ack command: {}", e);
+                            }
+                        }
+                        Ok(None) => {} // No command pending
+                        Err(e) => {
+                            eprintln!("  [CMD] Error polling: {}", e);
+                        }
                     }
                 }
             }
@@ -129,3 +207,4 @@ async fn main() -> anyhow::Result<()> {
     println!("\nSimulation complete. Sent {} total updates.", total_updates);
     Ok(())
 }
+

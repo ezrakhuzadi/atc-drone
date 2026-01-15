@@ -1,8 +1,9 @@
 //! In-memory state store using DashMap.
 
-use atc_core::models::{DroneState, FlightPlan, Telemetry};
+use atc_core::models::{Command, DroneState, FlightPlan, Telemetry};
 use atc_core::{Conflict, ConflictDetector};
 use dashmap::DashMap;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use tokio::sync::broadcast;
@@ -13,6 +14,10 @@ pub struct AppState {
     pub flight_plans: DashMap<String, FlightPlan>,
     detector: std::sync::Mutex<ConflictDetector>,
     conflicts: DashMap<String, Conflict>,
+    /// Command queues per drone (FIFO)
+    commands: DashMap<String, VecDeque<Command>>,
+    /// Track recently issued commands to prevent spam
+    command_cooldowns: DashMap<String, std::time::Instant>,
     drone_counter: AtomicU32,
     pub tx: broadcast::Sender<DroneState>, // For WS broadcasting
 }
@@ -25,6 +30,8 @@ impl AppState {
             flight_plans: DashMap::new(),
             detector: std::sync::Mutex::new(ConflictDetector::default()),
             conflicts: DashMap::new(),
+            commands: DashMap::new(),
+            command_cooldowns: DashMap::new(),
             drone_counter: AtomicU32::new(1),
             tx,
         }
@@ -36,7 +43,7 @@ impl AppState {
     }
 
     /// Register a new drone.
-    pub fn register_drone(&self, drone_id: &str) {
+    pub fn register_drone(&self, _drone_id: &str) {
         // Pre-register with no position
     }
 
@@ -103,4 +110,64 @@ impl AppState {
     pub fn add_flight_plan(&self, plan: FlightPlan) {
         self.flight_plans.insert(plan.flight_id.clone(), plan);
     }
+
+    // ========== COMMAND MANAGEMENT ==========
+
+    /// Enqueue a command for a drone.
+    pub fn enqueue_command(&self, command: Command) {
+        let drone_id = command.drone_id.clone();
+        self.commands
+            .entry(drone_id)
+            .or_insert_with(VecDeque::new)
+            .push_back(command);
+    }
+
+    /// Check if a command was recently issued (cooldown check).
+    pub fn can_issue_command(&self, drone_id: &str, cooldown_secs: u64) -> bool {
+        if let Some(last_time) = self.command_cooldowns.get(drone_id) {
+            last_time.elapsed().as_secs() >= cooldown_secs
+        } else {
+            true
+        }
+    }
+
+    /// Mark that a command was just issued (start cooldown).
+    pub fn mark_command_issued(&self, drone_id: &str) {
+        self.command_cooldowns.insert(drone_id.to_string(), std::time::Instant::now());
+    }
+
+    /// Get the next pending command for a drone (does not remove it).
+    pub fn peek_command(&self, drone_id: &str) -> Option<Command> {
+        self.commands
+            .get(drone_id)
+            .and_then(|queue| queue.front().cloned())
+    }
+
+    /// Get and remove the next pending command for a drone.
+    pub fn pop_command(&self, drone_id: &str) -> Option<Command> {
+        self.commands
+            .get_mut(drone_id)
+            .and_then(|mut queue| queue.pop_front())
+    }
+
+    /// Acknowledge a command by ID (removes it from queue).
+    pub fn ack_command(&self, command_id: &str) -> bool {
+        for mut entry in self.commands.iter_mut() {
+            let queue = entry.value_mut();
+            if let Some(pos) = queue.iter().position(|c| c.command_id == command_id) {
+                queue.remove(pos);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Get all pending commands (for debugging/UI).
+    pub fn get_all_pending_commands(&self) -> Vec<Command> {
+        self.commands
+            .iter()
+            .flat_map(|entry| entry.value().iter().cloned().collect::<Vec<_>>())
+            .collect()
+    }
 }
+

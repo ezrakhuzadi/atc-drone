@@ -1,0 +1,181 @@
+warning: unused import: `Waypoint`
+ --> crates/atc-core/src/spatial.rs:3:33
+  |
+3 | use crate::models::{FlightPlan, Waypoint};
+  |                                 ^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: use of deprecated function `rand::thread_rng`: Renamed to `rng`
+  --> crates/atc-core/src/routing.rs:97:25
+   |
+97 |     let mut rng = rand::thread_rng();
+   |                         ^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated method `rand::Rng::gen_range`: Renamed to `random_range`
+  --> crates/atc-core/src/routing.rs:98:26
+   |
+98 |     let lat_offset = rng.gen_range(-RADIUS_DEG.....
+   |                          ^^^^^^^^^
+
+warning: use of deprecated method `rand::Rng::gen_range`: Renamed to `random_range`
+  --> crates/atc-core/src/routing.rs:99:26
+   |
+99 |     let lon_offset = rng.gen_range(-RADIUS_DEG.....
+   |                          ^^^^^^^^^
+
+warning: constant `MIN_TIME_SEP_S` is never used
+ --> crates/atc-core/src/spatial.rs:8:7
+  |
+8 | const MIN_TIME_SEP_S: f64 = 60.0; 
+  |       ^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `atc-core` (lib) generated 5 warnings (run `cargo fix --lib -p atc-core` to apply 1 suggestion)
+   Compiling atc-sdk v0.2.0 (/home/uci/Project/atc-drone/crates/atc-sdk)
+   Compiling atc-cli v0.2.0 (/home/uci/Project/atc-drone/crates/atc-cli)
+warning: struct `BlenderResponse` is never constructed
+  --> crates/atc-cli/src/sim/client.rs:35:12
+   |
+35 | pub struct BlenderResponse {
+   |            ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `atc-cli` (lib) generated 1 warning
+warning: unused import: `FlightPath`
+ --> crates/atc-cli/src/bin/send_multi_track.rs:7:85
+  |
+7 |     create_converging_scenario, create_crossing_scenario, create_parallel_scenario, FlightPath,
+  |                                                                                     ^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `atc-cli` (bin "send_multi_track") generated 1 warning
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.44s
+     Running `target/debug/send_multi_track --scenario converging --duration 25`
+
+Scenario: converging
+Connecting to ATC Server at http://localhost:3000...
+  Registered: DRONE001
+  Registered: DRONE002
+  Registered: DRONE003
+  Registered: DRONE004
+
+Starting multi-drone simulation (with command handling)
+  Drones: 4
+  Duration: 25s, Update rate: 1Hz
+
+[  1] DRONE001: (33.687600, -117.826500) -> OK
+[  1] DRONE002: (33.684600, -117.823500) -> OK
+[  1] DRONE003: (33.681600, -117.826500) -> OK
+[  1] DRONE004: (33.684600, -117.829500) -> OK
+[  2] DRONE001: (33.687528, -117.826500) -> OK
+[  2] DRONE002: (33.684600, -117.823587) -> OK
+[  2] DRONE003: (33.681672, -117.826500) -> OK
+[  2] DRONE004: (33.684600, -117.829413) -> OK
+[  3] DRONE001: (33.687456, -117.826500) -> OK
+[  3] DRONE002: (33.684600, -117.823673) -> OK
+[  3] DRONE003: (33.681744, -117.826500) -> OK
+[  3] DRONE004: (33.684600, -117.829327) -> OK
+[  4] DRONE001: (33.687384, -117.826500) -> OK
+[  4] DRONE002: (33.684600, -117.823759) -> OK
+[  4] DRONE003: (33.681816, -117.826500) -> OK
+[  4] DRONE004: (33.684600, -117.829241) -> OK
+[  5] DRONE001: (33.687312, -117.826500) -> OK
+[  5] DRONE002: (33.684600, -117.823846) -> OK
+[  5] DRONE003: (33.681888, -117.826500) -> OK
+[  5] DRONE004: (33.684600, -117.829154) -> OK
+[  6] DRONE001: (33.687240, -117.826500) -> OK
+[  6] DRONE002: (33.684600, -117.823932) -> OK
+[  6] DRONE003: (33.681960, -117.826500) -> OK
+[  6] DRONE004: (33.684600, -117.829068) -> OK
+[  7] DRONE001: (33.687168, -117.826500) -> OK
+[  7] DRONE002: (33.684600, -117.824019) -> OK
+[  7] DRONE003: (33.682032, -117.826500) -> OK
+[  7] DRONE004: (33.684600, -117.828981) -> OK
+[  8] DRONE001: (33.687096, -117.826500) -> OK
+[  8] DRONE002: (33.684600, -117.824105) -> OK
+[  8] DRONE003: (33.682104, -117.826500) -> OK
+[  8] DRONE004: (33.684600, -117.828895) -> OK
+[  9] DRONE001: (33.687024, -117.826500) -> OK
+[  9] DRONE002: (33.684600, -117.824192) -> OK
+[  9] DRONE003: (33.682176, -117.826500) -> OK
+[  9] DRONE004: (33.684600, -117.828808) -> OK
+[ 10] DRONE001: (33.686952, -117.826500) -> OK
+[ 10] DRONE002: (33.684600, -117.824278) -> OK
+[ 10] DRONE003: (33.682248, -117.826500) -> OK
+[ 10] DRONE004: (33.684600, -117.828722) -> OK
+[ 11] DRONE001: (33.686880, -117.826500) -> OK
+[ 11] DRONE002: (33.684600, -117.824365) -> OK
+[ 11] DRONE003: (33.682320, -117.826500) -> OK
+[ 11] DRONE004: (33.684600, -117.828635) -> OK
+[ 12] DRONE001: (33.686808, -117.826500) -> OK
+[ 12] DRONE002: (33.684600, -117.824451) -> OK
+  [CMD] DRONE002 received: Hold { duration_secs: 15 }
+  [CMD] DRONE002 executing HOLD for 15s
+[ 12] DRONE003: (33.682392, -117.826500) -> OK
+[ 12] DRONE004: (33.684600, -117.828549) -> OK
+  [CMD] DRONE004 received: Hold { duration_secs: 15 }
+  [CMD] DRONE004 executing HOLD for 15s
+[ 13] DRONE001: (33.686737, -117.826500) -> OK
+[ 13] DRONE002: (33.684600, -117.824451) -> HOLD
+[ 13] DRONE003: (33.682463, -117.826500) -> OK
+[ 13] DRONE004: (33.684600, -117.828549) -> HOLD
+[ 14] DRONE001: (33.686665, -117.826500) -> OK
+  [CMD] DRONE001 received: Hold { duration_secs: 15 }
+  [CMD] DRONE001 executing HOLD for 15s
+[ 14] DRONE002: (33.684600, -117.824451) -> HOLD
+[ 14] DRONE003: (33.682535, -117.826500) -> OK
+  [CMD] DRONE003 received: Hold { duration_secs: 15 }
+  [CMD] DRONE003 executing HOLD for 15s
+[ 14] DRONE004: (33.684600, -117.828549) -> HOLD
+[ 15] DRONE001: (33.686665, -117.826500) -> HOLD
+[ 15] DRONE002: (33.684600, -117.824451) -> HOLD
+[ 15] DRONE003: (33.682535, -117.826500) -> HOLD
+[ 15] DRONE004: (33.684600, -117.828549) -> HOLD
+[ 16] DRONE001: (33.686665, -117.826500) -> HOLD
+[ 16] DRONE002: (33.684600, -117.824451) -> HOLD
+[ 16] DRONE003: (33.682535, -117.826500) -> HOLD
+[ 16] DRONE004: (33.684600, -117.828549) -> HOLD
+[ 17] DRONE001: (33.686665, -117.826500) -> HOLD
+[ 17] DRONE002: (33.684600, -117.824451) -> HOLD
+[ 17] DRONE003: (33.682535, -117.826500) -> HOLD
+[ 17] DRONE004: (33.684600, -117.828549) -> HOLD
+[ 18] DRONE001: (33.686665, -117.826500) -> HOLD
+[ 18] DRONE002: (33.684600, -117.824451) -> HOLD
+[ 18] DRONE003: (33.682535, -117.826500) -> HOLD
+[ 18] DRONE004: (33.684600, -117.828549) -> HOLD
+[ 19] DRONE001: (33.686665, -117.826500) -> HOLD
+[ 19] DRONE002: (33.684600, -117.824451) -> HOLD
+[ 19] DRONE003: (33.682535, -117.826500) -> HOLD
+[ 19] DRONE004: (33.684600, -117.828549) -> HOLD
+[ 20] DRONE001: (33.686665, -117.826500) -> HOLD
+[ 20] DRONE002: (33.684600, -117.824451) -> HOLD
+[ 20] DRONE003: (33.682535, -117.826500) -> HOLD
+[ 20] DRONE004: (33.684600, -117.828549) -> HOLD
+[ 21] DRONE001: (33.686665, -117.826500) -> HOLD
+[ 21] DRONE002: (33.684600, -117.824451) -> HOLD
+[ 21] DRONE003: (33.682535, -117.826500) -> HOLD
+[ 21] DRONE004: (33.684600, -117.828549) -> HOLD
+[ 22] DRONE001: (33.686665, -117.826500) -> HOLD
+[ 22] DRONE002: (33.684600, -117.824451) -> HOLD
+[ 22] DRONE003: (33.682535, -117.826500) -> HOLD
+[ 22] DRONE004: (33.684600, -117.828549) -> HOLD
+[ 23] DRONE001: (33.686665, -117.826500) -> HOLD
+[ 23] DRONE002: (33.684600, -117.824451) -> HOLD
+[ 23] DRONE003: (33.682535, -117.826500) -> HOLD
+[ 23] DRONE004: (33.684600, -117.828549) -> HOLD
+[ 24] DRONE001: (33.686665, -117.826500) -> HOLD
+[ 24] DRONE002: (33.684600, -117.824451) -> HOLD
+[ 24] DRONE003: (33.682535, -117.826500) -> HOLD
+[ 24] DRONE004: (33.684600, -117.828549) -> HOLD
+[ 25] DRONE001: (33.686665, -117.826500) -> HOLD
+[ 25] DRONE002: (33.684600, -117.824451) -> HOLD
+[ 25] DRONE003: (33.682535, -117.826500) -> HOLD
+[ 25] DRONE004: (33.684600, -117.828549) -> HOLD
+
+Simulation complete. Sent 100 total updates.
