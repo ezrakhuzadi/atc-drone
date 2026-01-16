@@ -30,6 +30,8 @@ struct DroneControl {
     reroute_waypoints: Vec<Waypoint>,
     reroute_index: usize,
     reroute_start_time: Option<time::Instant>,
+    // Altitude change support
+    altitude_offset_m: f64,
 }
 
 /// Multi-drone simulator with conflict scenarios
@@ -173,10 +175,10 @@ async fn main() -> anyhow::Result<()> {
                     (pos.0, pos.1, pos.2, path.get_heading(elapsed), path.get_speed_mps())
                 } else if control.is_holding {
                     let pos = control.frozen_position.unwrap_or_else(|| path.get_position(elapsed));
-                    (pos.0, pos.1, pos.2, path.get_heading(elapsed), 0.0)
+                    (pos.0, pos.1, pos.2 + control.altitude_offset_m, path.get_heading(elapsed), 0.0)
                 } else {
                     let pos = path.get_position(elapsed);
-                    (pos.0, pos.1, pos.2, path.get_heading(elapsed), path.get_speed_mps())
+                    (pos.0, pos.1, pos.2 + control.altitude_offset_m, path.get_heading(elapsed), path.get_speed_mps())
                 };
 
                 // Send telemetry
@@ -186,6 +188,8 @@ async fn main() -> anyhow::Result<()> {
                             format!("REROUTE[{}]", control.reroute_index) 
                         } else if control.is_holding { 
                             "HOLD".to_string() 
+                        } else if control.altitude_offset_m.abs() > 0.1 {
+                            format!("ALT{:+.0}m", control.altitude_offset_m)
                         } else { 
                             "OK".to_string() 
                         };
@@ -236,10 +240,12 @@ async fn main() -> anyhow::Result<()> {
                                     );
                                 }
                                 CommandType::AltitudeChange { target_altitude_m } => {
-                                    // For now, just report - actual altitude change happens via reroute
+                                    // Compute offset from current path altitude
+                                    let current_alt = path.get_position(elapsed).2;
+                                    control.altitude_offset_m = target_altitude_m - current_alt;
                                     println!(
-                                        "  [CMD] {} ALTITUDE_CHANGE to {}m (will implement via waypoints)", 
-                                        drone_id, target_altitude_m
+                                        "  [CMD] {} ALTITUDE_CHANGE to {}m (offset: {:+.0}m)", 
+                                        drone_id, target_altitude_m, control.altitude_offset_m
                                     );
                                 }
                             }
