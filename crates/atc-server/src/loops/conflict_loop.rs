@@ -19,7 +19,8 @@ use atc_core::{
 };
 
 /// Cooldown in seconds before issuing another command to the same drone.
-const COMMAND_COOLDOWN_SECS: u64 = 10;
+/// Set to 30s to cover typical reroute duration (~25s).
+const COMMAND_COOLDOWN_SECS: u64 = 30;
 
 /// Start the conflict detection loop.
 pub async fn run_conflict_loop(state: Arc<AppState>, config: Config) {
@@ -94,6 +95,36 @@ pub async fn run_conflict_loop(state: Arc<AppState>, config: Config) {
                 // Only issue if we can find both drones and cooldown has passed
                 if state.can_issue_command(give_way_id, COMMAND_COOLDOWN_SECS) {
                     if let (Some(gw), Some(pri)) = (give_way_drone, priority_drone) {
+                        // === HOLD-AWARE LOGIC ===
+                        // If the priority drone is holding/rerouting, check if it's actually blocking
+                        let priority_id = if give_way_id == &conflict.drone1_id { 
+                            &conflict.drone2_id 
+                        } else { 
+                            &conflict.drone1_id 
+                        };
+                        
+                        if state.has_active_command(priority_id) {
+                            // Priority drone is on HOLD/REROUTE - check if it's in our path
+                            // Use heading to predict: will give_way drone fly past the held drone?
+                            let heading_rad = gw.heading_deg.to_radians();
+                            
+                            // Project give_way drone's position 30 seconds ahead
+                            let future_lat = gw.lat + heading_rad.cos() * 0.003; // ~300m
+                            let future_lon = gw.lon + heading_rad.sin() * 0.003;
+                            
+                            // Check if priority drone is between current and future position
+                            let lat_between = (pri.lat > gw.lat.min(future_lat)) && (pri.lat < gw.lat.max(future_lat));
+                            let lon_between = (pri.lon > gw.lon.min(future_lon)) && (pri.lon < gw.lon.max(future_lon));
+                            
+                            if !lat_between && !lon_between {
+                                // Priority drone is NOT in our path - skip reroute
+                                tracing::info!(
+                                    "Skipping reroute for {} - {} is holding but not blocking path",
+                                    give_way_id, priority_id
+                                );
+                                continue;
+                            }
+                        }
                         // Create conflict point waypoint (midpoint between drones)
                         let conflict_point = Waypoint {
                             lat: (gw.lat + pri.lat) / 2.0,

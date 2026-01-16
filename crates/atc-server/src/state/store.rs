@@ -205,6 +205,20 @@ impl AppState {
             .and_then(|queue| queue.front().cloned())
     }
 
+    /// Check if drone has an active HOLD or REROUTE command (is in controlled state).
+    pub fn has_active_command(&self, drone_id: &str) -> bool {
+        if let Some(queue) = self.commands.get(drone_id) {
+            queue.iter().any(|cmd| {
+                matches!(cmd.command_type, 
+                    atc_core::models::CommandType::Hold { .. } | 
+                    atc_core::models::CommandType::Reroute { .. }
+                )
+            })
+        } else {
+            false
+        }
+    }
+
     /// Get and remove the next pending command for a drone.
     #[allow(dead_code)] // Will be used by SDK clients polling for commands
     pub fn pop_command(&self, drone_id: &str) -> Option<Command> {
