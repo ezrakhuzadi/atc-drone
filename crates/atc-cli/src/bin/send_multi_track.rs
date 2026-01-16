@@ -1,12 +1,7 @@
-//! CLI tool for multi-drone simulation with conflict scenarios.
-//! 
-//! Uses AtcClient SDK to send telemetry through atc-server (not directly to Blender).
-//! Responds to HOLD commands by stopping movement.
-
 use atc_cli::sim::{
     create_converging_scenario, create_crossing_scenario, create_parallel_scenario,
 };
-use atc_core::models::CommandType;
+use atc_core::models::{CommandType, Waypoint};
 use atc_sdk::AtcClient;
 use clap::{Parser, ValueEnum};
 use std::collections::HashMap;
@@ -30,6 +25,11 @@ struct DroneControl {
     is_holding: bool,
     hold_until: Option<time::Instant>,
     frozen_position: Option<(f64, f64, f64)>,
+    // Reroute support
+    is_rerouting: bool,
+    reroute_waypoints: Vec<Waypoint>,
+    reroute_index: usize,
+    reroute_start_time: Option<time::Instant>,
 }
 
 /// Multi-drone simulator with conflict scenarios
@@ -130,20 +130,65 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                // Get position (frozen if holding)
-                let (lat, lon, alt) = if control.is_holding {
-                    control.frozen_position.unwrap_or_else(|| path.get_position(elapsed))
+                // Get position based on state: rerouting > holding > normal path
+                let (lat, lon, alt, heading, speed) = if control.is_rerouting && control.reroute_index < control.reroute_waypoints.len() {
+                    // Copy waypoint data to avoid borrow issues
+                    let wp_lat = control.reroute_waypoints[control.reroute_index].lat;
+                    let wp_lon = control.reroute_waypoints[control.reroute_index].lon;
+                    let wp_alt = control.reroute_waypoints[control.reroute_index].altitude_m;
+                    let wp_speed = control.reroute_waypoints[control.reroute_index].speed_mps.unwrap_or(10.0);
+                    let wp_count = control.reroute_waypoints.len();
+                    
+                    let elapsed_reroute = control.reroute_start_time
+                        .map(|t| t.elapsed().as_secs_f64())
+                        .unwrap_or(0.0);
+                    
+                    // Check if time to advance to next waypoint (5 sec per waypoint or close enough)
+                    if elapsed_reroute > 5.0 {
+                        control.reroute_index += 1;
+                        control.reroute_start_time = Some(time::Instant::now());
+                        
+                        if control.reroute_index >= wp_count {
+                            // Reroute complete
+                            control.is_rerouting = false;
+                            control.reroute_waypoints.clear();
+                            control.reroute_index = 0;
+                            println!("[{:3}] {} REROUTE complete, resuming normal path", update_count, drone_id);
+                        }
+                    }
+                    
+                    // Calculate heading toward waypoint
+                    let curr_pos = path.get_position(elapsed);
+                    let delta_lat = wp_lat - curr_pos.0;
+                    let delta_lon = wp_lon - curr_pos.1;
+                    let hdg = delta_lon.atan2(delta_lat).to_degrees();
+                    
+                    (wp_lat, wp_lon, wp_alt, hdg, wp_speed)
+                } else if control.is_rerouting {
+                    // Reroute index out of bounds - complete reroute
+                    control.is_rerouting = false;
+                    control.reroute_waypoints.clear();
+                    control.reroute_index = 0;
+                    let pos = path.get_position(elapsed);
+                    (pos.0, pos.1, pos.2, path.get_heading(elapsed), path.get_speed_mps())
+                } else if control.is_holding {
+                    let pos = control.frozen_position.unwrap_or_else(|| path.get_position(elapsed));
+                    (pos.0, pos.1, pos.2, path.get_heading(elapsed), 0.0)
                 } else {
-                    path.get_position(elapsed)
+                    let pos = path.get_position(elapsed);
+                    (pos.0, pos.1, pos.2, path.get_heading(elapsed), path.get_speed_mps())
                 };
-                
-                let heading = path.get_heading(elapsed);
-                let speed = if control.is_holding { 0.0 } else { path.get_speed_mps() };
 
                 // Send telemetry
                 match client.send_position(lat, lon, alt, heading, speed).await {
                     Ok(_) => {
-                        let status = if control.is_holding { "HOLD" } else { "OK" };
+                        let status = if control.is_rerouting { 
+                            format!("REROUTE[{}]", control.reroute_index) 
+                        } else if control.is_holding { 
+                            "HOLD".to_string() 
+                        } else { 
+                            "OK".to_string() 
+                        };
                         println!(
                             "[{:3}] {}: ({:.6}, {:.6}) -> {}",
                             update_count, drone_id, lat, lon, status
@@ -163,18 +208,39 @@ async fn main() -> anyhow::Result<()> {
                             match cmd.command_type {
                                 CommandType::Hold { duration_secs } => {
                                     control.is_holding = true;
+                                    control.is_rerouting = false; // Cancel any reroute
                                     control.hold_until = Some(time::Instant::now() + Duration::from_secs(duration_secs as u64));
                                     control.frozen_position = Some((lat, lon, alt));
                                     println!("  [CMD] {} executing HOLD for {}s", drone_id, duration_secs);
                                 }
                                 CommandType::Resume => {
                                     control.is_holding = false;
+                                    control.is_rerouting = false;
                                     control.hold_until = None;
                                     control.frozen_position = None;
+                                    control.reroute_waypoints.clear();
+                                    control.reroute_index = 0;
                                     println!("  [CMD] {} resuming flight", drone_id);
                                 }
-                                _ => {
-                                    println!("  [CMD] {} ignoring command type", drone_id);
+                                CommandType::Reroute { waypoints, reason } => {
+                                    control.is_rerouting = true;
+                                    control.is_holding = false;
+                                    control.reroute_waypoints = waypoints.clone();
+                                    control.reroute_index = 0;
+                                    control.reroute_start_time = Some(time::Instant::now());
+                                    println!(
+                                        "  [CMD] {} executing REROUTE with {} waypoints ({})", 
+                                        drone_id, 
+                                        waypoints.len(),
+                                        reason.as_deref().unwrap_or("no reason")
+                                    );
+                                }
+                                CommandType::AltitudeChange { target_altitude_m } => {
+                                    // For now, just report - actual altitude change happens via reroute
+                                    println!(
+                                        "  [CMD] {} ALTITUDE_CHANGE to {}m (will implement via waypoints)", 
+                                        drone_id, target_altitude_m
+                                    );
                                 }
                             }
                             
