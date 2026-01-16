@@ -97,6 +97,8 @@ struct DemoState {
     // Hold state
     is_holding: bool,
     hold_until: Option<time::Instant>,
+    // Altitude offset from ALTITUDE_CHANGE commands
+    altitude_offset_m: f64,
 }
 
 impl DemoState {
@@ -128,6 +130,7 @@ impl DemoState {
             reroute_segment_start_pos: (0.0, 0.0, 0.0),
             is_holding: false,
             hold_until: None,
+            altitude_offset_m: 0.0,
         }
     }
 
@@ -338,10 +341,15 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             
-            // Override altitude if rerouting
+            // Calculate altitude with offset applied during cruise
             let alt = if drone.is_rerouting && drone.reroute_index < drone.reroute_waypoints.len() {
-                drone.reroute_waypoints[drone.reroute_index].2
+                // During reroute: use waypoint altitude + any additional offset
+                drone.reroute_waypoints[drone.reroute_index].2 + drone.altitude_offset_m
+            } else if drone.phase == FlightPhase::Cruise {
+                // Normal cruise: apply offset to cruise altitude
+                drone.current_alt + drone.altitude_offset_m
             } else {
+                // Takeoff/landing: use phase altitude (no offset during transitions)
                 drone.current_alt
             };
 
@@ -385,6 +393,7 @@ async fn main() -> anyhow::Result<()> {
                     CommandType::Resume => {
                         drone.is_holding = false;
                         drone.is_rerouting = false;
+                        drone.altitude_offset_m = 0.0; // Reset altitude modifications
                         println!("  [CMD] {} RESUME\n", drone.drone_id);
                     }
                     CommandType::Reroute { waypoints, reason } => {
@@ -400,7 +409,10 @@ async fn main() -> anyhow::Result<()> {
                         println!("        Reason: {}\n", reason.as_deref().unwrap_or("none"));
                     }
                     CommandType::AltitudeChange { target_altitude_m } => {
-                        println!("  [CMD] {} ALT_CHANGE → {}m\n", drone.drone_id, target_altitude_m);
+                        // Calculate offset from current cruise altitude
+                        drone.altitude_offset_m = target_altitude_m - CRUISE_ALTITUDE_M;
+                        println!("  [CMD] {} ALT_CHANGE → {}m (offset: {:+.0}m)\n", 
+                            drone.drone_id, target_altitude_m, drone.altitude_offset_m);
                     }
                 }
 
