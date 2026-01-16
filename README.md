@@ -1,176 +1,143 @@
-# ATC Drone System
+# ATC-Drone
 
-Real-time drone traffic management system using OpenUTM (Flight Blender + Flight Spotlight).
+**Autonomous Traffic Control for Unmanned Aircraft Systems**
 
-## Overview
+A Rust-based strategic conflict detection and resolution system for drone traffic management. This project serves as the "brain" of a micro-UTM (Unmanned Traffic Management) system, providing real-time conflict detection, automatic avoidance routing, and command dispatch to drones.
 
-The ATC-Drone system acts as the "brain" between drones and the OpenUTM stack:
+## Architecture
 
-```mermaid
-graph LR
-    Drone[Drone/Simulator] --> SDK[atc-sdk]
-    SDK --> Server[atc-server]
-    Server --> Blender[Flight Blender]
-    Blender --> Spotlight[Flight Spotlight]
-    Server --> WS[WebSocket Clients]
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│   Drone/Sim     │────▶│   ATC Server    │────▶│ Flight Blender  │
+│   (atc-sdk)     │◀────│   (atc-server)  │     │   (optional)    │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+                               │
+                               ▼
+                        ┌─────────────────┐
+                        │ Flight Spotlight│
+                        │   (Web UI)      │
+                        └─────────────────┘
 ```
 
-**Key Features:**
-- **Real-time telemetry** - Receives drone positions via SDK, syncs to Flight Blender
-- **Conflict detection** - Predicts collisions 10-30s ahead using CPA algorithm
-- **Command dispatch** - HOLD, ALTITUDE_CHANGE, REROUTE commands
-- **Flight plan approval** - Pre-flight deconfliction with route options
-- **WebSocket streaming** - Live updates to UI clients
-- **Flight visualization** - Drones appear on Spotlight's 3D globe
+## Crates
+
+| Crate | Description |
+|-------|-------------|
+| **atc-core** | Pure logic layer - conflict detection, routing algorithms, spatial math (ENU coordinates, haversine distance). No networking dependencies. |
+| **atc-server** | Axum-based HTTP/WebSocket server. Runs conflict detection loop, command dispatch, telemetry ingestion, and geofence management. |
+| **atc-sdk** | Client library for drones. Handles registration, telemetry reporting, command polling, and acknowledgement. |
+| **atc-blender** | Integration client for Flight Blender (OpenUTM). Syncs telemetry and geofences to external UTM systems. |
+| **atc-cli** | CLI tools and simulators for testing. Includes the `demo_scenario` binary for showcasing the full conflict resolution workflow. |
+
+## Features
+
+### Conflict Detection
+- **3D Euclidean distance** with configurable lookahead (default 20s)
+- **Closest Point of Approach (CPA)** prediction using velocity extrapolation
+- **Severity classification**: Info → Warning → Critical based on separation
+- **ENU coordinate system** with proper cos(lat) scaling for accurate distance calculations
+
+### Automatic Resolution
+- **Avoidance routing**: Vertical (climb), Lateral (offset), or Combined strategies
+- **Meter-based waypoint generation** (100m lateral offset, 30m vertical)
+- **Priority-based deconfliction**: Lower-priority drone yields
+- **Hold-aware logic**: Prevents cascading reroutes when priority drone is already maneuvering
+
+### Command System
+- **Command types**: Reroute, Hold, Resume, Land, AltitudeChange
+- **Expiration handling**: Commands auto-expire after configurable duration
+- **Lifecycle tracking**: Prevents duplicate commands via cooldown periods
+- **Distance-based blocking check**: Uses segment-to-segment distance (not bounding box)
+
+### Geofencing
+- **Polygon geofences** with altitude bounds (floor/ceiling)
+- **Validation**: Auto-closes polygons, enforces lower < upper altitude
+- **Route conflict checking**: API endpoint to verify flight plans against active geofences
+- **Types**: Advisory, NoFly, Restricted
+
+### Simulation
+- **Realistic drone lifecycle**: Preflight → Takeoff → Cruise → Landing → Landed
+- **Dynamic rerouting**: Drones follow avoidance waypoints when commanded
+- **Distance-based phase transitions**: No teleportation bugs
 
 ## Quick Start
 
+### Prerequisites
+- Rust 1.75+ (2021 edition)
+- [Flight Spotlight](https://github.com/openskies-sh/flight-spotlight) (optional, for visualization)
+- [Flight Blender](https://github.com/openskies-sh/flight-blender) (optional, for UTM integration)
+
+### Build
 ```bash
-# 1. Start Flight Blender + Spotlight (Docker)
-cd /home/uci/Project/flight-blender-irvine && docker-compose up -d
-cd /home/uci/Project/flight-spotlight-irvine && docker-compose up -d
-
-# 2. Build and run the ATC Server
-cd /home/uci/Project/atc-drone
-cargo run --bin atc-server
-
-# 3. Run the multi-drone simulator (crossing scenario)
-cargo run --bin send_multi_track -- --scenario crossing --duration 120
-
-# 4. Open Flight Spotlight
-#    http://localhost:5050/spotlight
-#    Click "Stream flights" centered on Irvine (33.68, -117.82)
+cargo build --workspace
 ```
 
-## Project Structure
+### Run the Demo
 
-```
-atc-drone/
-├── crates/
-│   ├── atc-core/       # Pure logic (no networking)
-│   │   ├── conflict.rs   # Conflict detection engine (CPA)
-│   │   ├── models.rs     # DroneState, Telemetry, Command, FlightPlan
-│   │   ├── routing.rs    # Route suggestions
-│   │   ├── spatial.rs    # Haversine distance, plan conflict check
-│   │   └── rules.rs      # Safety thresholds (configurable)
-│   │
-│   ├── atc-server/     # Always-on backend (Axum)
-│   │   ├── api/          # REST + WebSocket endpoints
-│   │   │   ├── routes.rs   # Drone registration, telemetry
-│   │   │   ├── commands.rs # Command dispatch API
-│   │   │   └── flights.rs  # Flight plan submission
-│   │   ├── state/        # In-memory store (DashMap)
-│   │   └── loops/        # Conflict detection, Blender sync
-│   │
-│   ├── atc-sdk/        # Drone integration SDK
-│   │   ├── client.rs     # Register, telemetry, commands
-│   │   └── telemetry.rs  # Position updates with velocity calc
-│   │
-│   ├── atc-blender/    # Flight Blender API client
-│   │   ├── client.rs     # HTTP client with JWT auth
-│   │   └── sync_geofences.rs  # Conflict → Geofence push
-│   │
-│   └── atc-cli/        # CLI tools & simulators
-│       └── bin/
-│           ├── send_one_track.rs    # Single drone (circular)
-│           ├── send_multi_track.rs  # Multi-drone scenarios
-│           └── send_flight.rs       # Flight plan workflow
-└── Cargo.toml          # Workspace manifest
+**Terminal 1: Start the ATC Server**
+```bash
+cargo run -p atc-server
 ```
 
-## API Endpoints (atc-server on port 3000)
+**Terminal 2: Run the Demo Scenario**
+```bash
+cargo run -p atc-cli --bin demo_scenario
+```
 
-### Drones & Telemetry
+This launches two simulated drones on a collision course. The system will:
+1. Detect the conflict (~10s before intersection)
+2. Issue a REROUTE command to the lower-priority drone
+3. The drone climbs to 80m, flies over the conflict zone, and descends
+4. Both drones land at their destinations
+
+### API Endpoints
+
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/v1/drones/register` | Register a drone |
-| POST | `/v1/telemetry` | Send position update |
-| GET | `/v1/drones` | List all drones |
+| POST | `/v1/telemetry` | Submit drone telemetry |
+| GET | `/v1/drones` | List all registered drones |
 | GET | `/v1/conflicts` | Get active conflicts |
-| WS | `/v1/stream` | Real-time WebSocket updates |
+| POST | `/v1/geofences` | Create a geofence |
+| GET | `/v1/geofences` | List all geofences |
+| POST | `/v1/geofences/check-route` | Check if a route conflicts with geofences |
+| POST | `/v1/commands` | Issue a command to a drone |
+| GET | `/v1/commands/next?drone_id=X` | Poll for pending commands |
+| POST | `/v1/commands/{id}/ack` | Acknowledge command receipt |
+| POST | `/v1/admin/reset` | Reset all server state (for demos) |
+| GET | `/ws` | WebSocket for real-time updates |
 
-### Commands
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/v1/commands` | Issue command (HOLD, ALTITUDE_CHANGE, REROUTE) |
-| GET | `/v1/commands/next?drone_id=` | Poll for next command |
-| POST | `/v1/commands/ack` | Acknowledge command execution |
-| GET | `/v1/commands` | List all pending commands |
+## Configuration
 
-### Flight Plans
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/v1/flights/plan` | Submit flight plan for approval |
-| GET | `/v1/flights` | List all flight plans |
+Environment variables:
+- `ATC_HOST` - Server bind address (default: `0.0.0.0`)
+- `ATC_PORT` - Server port (default: `3000`)
+- `BLENDER_URL` - Flight Blender URL (optional)
+- `BLENDER_TOKEN` - Flight Blender auth token (optional)
 
-## SDK Usage (Rust)
+## Project Status
 
-```rust
-use atc_sdk::AtcClient;
+**MVP Complete** ✅
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let mut client = AtcClient::new("http://localhost:3000");
-    
-    // Register drone (auto-generates ID if None)
-    let resp = client.register(Some("DRONE001")).await?;
-    println!("Registered: {}", resp.drone_id);
-    
-    // Send position update
-    client.send_position(33.6846, -117.8265, 50.0, 90.0, 10.0).await?;
-    
-    // Poll for commands
-    if let Some(cmd) = client.get_next_command().await? {
-        println!("Received: {:?}", cmd.command_type);
-        client.ack_command(&cmd.command_id).await?;
-    }
-    
-    Ok(())
-}
-```
+- [x] Telemetry ingestion and state management
+- [x] Conflict detection with CPA prediction
+- [x] Automatic reroute generation
+- [x] Command dispatch and acknowledgement
+- [x] Geofence CRUD and route checking
+- [x] ENU coordinate math (no more degree-as-meters bugs)
+- [x] Command expiration and cooldown
+- [x] Distance-based phase transitions in simulation
+- [x] WebSocket real-time updates
 
-## Simulators
+### Roadmap
+- [ ] Persistence layer (SQLite/PostgreSQL)
+- [ ] Time-aware strategic planning (4D flight plans)
+- [ ] MAVLink bridge for real drone integration
+- [ ] WebSocket command push (replace polling)
 
-### Single Drone (Circular Path)
-```bash
-cargo run --bin send_one_track -- --icao DRONE001 --duration 60
-```
+## License
 
-### Multi-Drone Scenarios
-```bash
-# Crossing paths (conflict detection demo)
-cargo run --bin send_multi_track -- --scenario crossing
+MIT
 
-# Parallel paths (no conflict)
-cargo run --bin send_multi_track -- --scenario parallel
+## Author
 
-# 4 drones converging (high conflict)
-cargo run --bin send_multi_track -- --scenario converging
-```
-
-### Flight Plan Workflow
-```bash
-cargo run --bin send_flight  # Request plan → Fly route → Complete
-```
-
-## Services
-
-| Service | Port | Description |
-|---------|------|-------------|
-| ATC Server | 3000 | Main backend |
-| Flight Blender | 8000 | UTM backend (Docker) |
-| Flight Spotlight | 5050 | 3D visualization (Docker) |
-| Redis | 6379 | Spotlight cache |
-| Tile38 | 9851 | Geo queries |
-
-## Requirements
-
-- Rust 1.70+
-- Docker & Docker Compose (for Blender/Spotlight)
-- Flight Blender running on localhost:8000
-- Flight Spotlight running on localhost:5050
-
-## Related Repositories
-
-- **flight-blender-irvine** - UTM Backend (Flight Blender fork)
-- **flight-spotlight-irvine** - 3D Visualization UI (Flight Spotlight fork)
+Ezra Khuzadi
