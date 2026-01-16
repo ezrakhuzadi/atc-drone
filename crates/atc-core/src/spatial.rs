@@ -132,6 +132,82 @@ pub fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     2.0 * R * a.sqrt().atan2((1.0 - a).sqrt())
 }
 
+// ==== ENU (East-North-Up) Coordinate Conversion ====
+// These functions convert between meters and degrees using proper latitude scaling.
+
+/// Meters per degree of latitude (constant at all latitudes).
+pub const METERS_PER_DEG_LAT: f64 = 111_320.0;
+
+/// Meters per degree of longitude at a given latitude.
+/// Longitude degrees shrink as you move toward the poles.
+pub fn meters_per_deg_lon(lat_deg: f64) -> f64 {
+    METERS_PER_DEG_LAT * lat_deg.to_radians().cos()
+}
+
+/// Convert a north/south offset in meters to degrees latitude.
+pub fn meters_to_lat(meters: f64) -> f64 {
+    meters / METERS_PER_DEG_LAT
+}
+
+/// Convert an east/west offset in meters to degrees longitude.
+/// Requires the reference latitude for proper scaling.
+pub fn meters_to_lon(meters: f64, ref_lat_deg: f64) -> f64 {
+    meters / meters_per_deg_lon(ref_lat_deg)
+}
+
+/// Convert degrees latitude to meters.
+pub fn lat_to_meters(deg: f64) -> f64 {
+    deg * METERS_PER_DEG_LAT
+}
+
+/// Convert degrees longitude to meters at a given latitude.
+pub fn lon_to_meters(deg: f64, ref_lat_deg: f64) -> f64 {
+    deg * meters_per_deg_lon(ref_lat_deg)
+}
+
+/// Offset a position by meters in the north and east directions.
+/// 
+/// # Arguments
+/// * `lat`, `lon` - Reference position in degrees
+/// * `north_m` - Offset in meters (positive = north)
+/// * `east_m` - Offset in meters (positive = east)
+/// 
+/// # Returns
+/// (new_lat, new_lon) in degrees
+pub fn offset_position(lat: f64, lon: f64, north_m: f64, east_m: f64) -> (f64, f64) {
+    let new_lat = lat + meters_to_lat(north_m);
+    let new_lon = lon + meters_to_lon(east_m, lat);
+    (new_lat, new_lon)
+}
+
+/// Calculate bearing from point 1 to point 2 in radians.
+/// Returns bearing in radians, 0 = north, π/2 = east.
+pub fn bearing(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let phi1 = lat1.to_radians();
+    let phi2 = lat2.to_radians();
+    let delta_lambda = (lon2 - lon1).to_radians();
+    
+    let x = delta_lambda.sin() * phi2.cos();
+    let y = phi1.cos() * phi2.sin() - phi1.sin() * phi2.cos() * delta_lambda.cos();
+    
+    x.atan2(y)
+}
+
+/// Offset a position by distance and bearing.
+/// 
+/// # Arguments
+/// * `lat`, `lon` - Starting position in degrees
+/// * `distance_m` - Distance in meters
+/// * `bearing_rad` - Bearing in radians (0 = north, π/2 = east)
+/// 
+/// # Returns
+/// (new_lat, new_lon) in degrees
+pub fn offset_by_bearing(lat: f64, lon: f64, distance_m: f64, bearing_rad: f64) -> (f64, f64) {
+    let north_m = distance_m * bearing_rad.cos();
+    let east_m = distance_m * bearing_rad.sin();
+    offset_position(lat, lon, north_m, east_m)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

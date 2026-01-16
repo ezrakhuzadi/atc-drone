@@ -18,7 +18,7 @@ use atc_core::{Geofence, CreateGeofenceRequest};
 pub async fn create_geofence(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateGeofenceRequest>,
-) -> (StatusCode, Json<Geofence>) {
+) -> Result<(StatusCode, Json<Geofence>), (StatusCode, Json<serde_json::Value>)> {
     let geofence = Geofence {
         id: Uuid::new_v4().to_string(),
         name: req.name,
@@ -30,10 +30,22 @@ pub async fn create_geofence(
         created_at: Utc::now(),
     };
     
+    // Validate geofence before saving
+    let errors = geofence.validate();
+    if !errors.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Invalid geofence",
+                "validation_errors": errors
+            }))
+        ));
+    }
+    
     state.add_geofence(geofence.clone());
     tracing::info!("Created geofence '{}' ({})", geofence.name, geofence.id);
     
-    (StatusCode::CREATED, Json(geofence))
+    Ok((StatusCode::CREATED, Json(geofence)))
 }
 
 /// List all geofences.
@@ -96,5 +108,56 @@ pub async fn check_point(
     Json(PointCheckResponse {
         inside_geofence: !matching.is_empty(),
         geofence_ids: matching,
+    })
+}
+
+/// Check if a route conflicts with any active geofences.
+#[derive(serde::Deserialize)]
+pub struct RouteCheckRequest {
+    pub waypoints: Vec<atc_core::Waypoint>,
+}
+
+#[derive(serde::Serialize)]
+pub struct RouteCheckResponse {
+    pub conflicts: bool,
+    pub conflicting_geofences: Vec<GeofenceConflict>,
+}
+
+#[derive(serde::Serialize)]
+pub struct GeofenceConflict {
+    pub geofence_id: String,
+    pub geofence_name: String,
+    pub segment_index: usize,
+}
+
+pub async fn check_route(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RouteCheckRequest>,
+) -> Json<RouteCheckResponse> {
+    let geofences = state.get_geofences();
+    let mut conflicts = Vec::new();
+    
+    // Check each segment of the route against all active geofences
+    for i in 0..req.waypoints.len().saturating_sub(1) {
+        let wp1 = &req.waypoints[i];
+        let wp2 = &req.waypoints[i + 1];
+        
+        for geofence in geofences.iter().filter(|g| g.active) {
+            if geofence.intersects_segment(
+                wp1.lat, wp1.lon, wp1.altitude_m,
+                wp2.lat, wp2.lon, wp2.altitude_m,
+            ) {
+                conflicts.push(GeofenceConflict {
+                    geofence_id: geofence.id.clone(),
+                    geofence_name: geofence.name.clone(),
+                    segment_index: i,
+                });
+            }
+        }
+    }
+    
+    Json(RouteCheckResponse {
+        conflicts: !conflicts.is_empty(),
+        conflicting_geofences: conflicts,
     })
 }

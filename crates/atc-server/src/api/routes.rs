@@ -33,6 +33,9 @@ pub fn create_router() -> Router<Arc<AppState>> {
         .route("/v1/geofences/:id", get(geofences::get_geofence))
         .route("/v1/geofences/:id", delete(geofences::delete_geofence))
         .route("/v1/geofences/check", get(geofences::check_point))
+        .route("/v1/geofences/check-route", post(geofences::check_route))
+        // Admin routes
+        .route("/v1/admin/reset", post(admin_reset))
 }
 
 // === Request/Response types ===
@@ -90,3 +93,14 @@ async fn list_conflicts(
 ) -> Json<Vec<atc_core::Conflict>> {
     Json(state.get_conflicts())
 }
+
+// === Admin Handlers ===
+
+/// Reset all state for demo purposes.
+async fn admin_reset(
+    State(state): State<Arc<AppState>>,
+) -> StatusCode {
+    state.clear_all();
+    StatusCode::OK
+}
+

@@ -106,11 +106,15 @@ pub async fn run_conflict_loop(state: Arc<AppState>, config: Config) {
                         if state.has_active_command(priority_id) {
                             // Priority drone is on HOLD/REROUTE - check if it's in our path
                             // Use heading to predict: will give_way drone fly past the held drone?
+                            use atc_core::spatial::offset_by_bearing;
                             let heading_rad = gw.heading_deg.to_radians();
                             
-                            // Project give_way drone's position 30 seconds ahead
-                            let future_lat = gw.lat + heading_rad.cos() * 0.003; // ~300m
-                            let future_lon = gw.lon + heading_rad.sin() * 0.003;
+                            // Project give_way drone's position 30 seconds ahead (~300m at 10m/s)
+                            let (future_lat, future_lon) = offset_by_bearing(
+                                gw.lat, gw.lon, 
+                                gw.speed_mps * 30.0,  // distance = speed * time
+                                heading_rad
+                            );
                             
                             // Check if priority drone is between current and future position
                             let lat_between = (pri.lat > gw.lat.min(future_lat)) && (pri.lat < gw.lat.max(future_lat));
@@ -125,11 +129,11 @@ pub async fn run_conflict_loop(state: Arc<AppState>, config: Config) {
                                 continue;
                             }
                         }
-                        // Create conflict point waypoint (midpoint between drones)
+                        // Create conflict point waypoint using predicted CPA (not current midpoint)
                         let conflict_point = Waypoint {
-                            lat: (gw.lat + pri.lat) / 2.0,
-                            lon: (gw.lon + pri.lon) / 2.0,
-                            altitude_m: gw.altitude_m,
+                            lat: conflict.cpa_lat,
+                            lon: conflict.cpa_lon,
+                            altitude_m: conflict.cpa_altitude_m,
                             speed_mps: Some(gw.speed_mps),
                         };
                         
@@ -141,13 +145,18 @@ pub async fn run_conflict_loop(state: Arc<AppState>, config: Config) {
                             speed_mps: Some(gw.speed_mps),
                         };
                         
-                        // Destination: continue in current heading direction
-                        // For now, use a point ~500m ahead
+                        // Destination: continue in current heading direction (~500m ahead)
+                        // Using proper ENU conversion instead of degree offsets
+                        use atc_core::spatial::offset_by_bearing;
                         let heading_rad = gw.heading_deg.to_radians();
-                        let offset_deg = 0.005; // ~500m
+                        let (dest_lat, dest_lon) = offset_by_bearing(
+                            gw.lat, gw.lon, 
+                            500.0,  // 500 meters ahead
+                            heading_rad
+                        );
                         let destination = Waypoint {
-                            lat: gw.lat + heading_rad.cos() * offset_deg,
-                            lon: gw.lon + heading_rad.sin() * offset_deg,
+                            lat: dest_lat,
+                            lon: dest_lon,
                             altitude_m: gw.altitude_m,
                             speed_mps: Some(gw.speed_mps),
                         };

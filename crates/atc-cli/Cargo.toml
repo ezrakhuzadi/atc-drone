@@ -11,12 +11,8 @@ name = "generate_token"
 path = "src/bin/generate_token.rs"
 
 [[bin]]
-name = "send_one_track"
-path = "src/bin/send_one_track.rs"
-
-[[bin]]
-name = "send_multi_track"
-path = "src/bin/send_multi_track.rs"
+name = "demo_scenario"
+path = "src/bin/demo_scenario.rs"
 
 [dependencies]
 atc-core.workspace = true

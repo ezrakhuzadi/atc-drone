@@ -240,4 +240,65 @@ impl Geofence {
         
         inside
     }
+    
+    /// Validate geofence configuration.
+    /// Returns list of validation errors (empty = valid).
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        
+        // Check polygon has at least 3 points
+        if self.polygon.len() < 3 {
+            errors.push("Polygon must have at least 3 vertices".to_string());
+        }
+        
+        // Check polygon is closed (first == last)
+        if self.polygon.len() >= 3 {
+            let first = self.polygon.first().unwrap();
+            let last = self.polygon.last().unwrap();
+            if (first[0] - last[0]).abs() > 0.0001 || (first[1] - last[1]).abs() > 0.0001 {
+                errors.push("Polygon must be closed (first vertex must equal last)".to_string());
+            }
+        }
+        
+        // Check altitude bounds
+        if self.lower_altitude_m >= self.upper_altitude_m {
+            errors.push(format!(
+                "Lower altitude ({}) must be less than upper altitude ({})",
+                self.lower_altitude_m, self.upper_altitude_m
+            ));
+        }
+        
+        // Check altitude is reasonable (0-10000m)
+        if self.lower_altitude_m < 0.0 {
+            errors.push("Lower altitude cannot be negative".to_string());
+        }
+        if self.upper_altitude_m > 10000.0 {
+            errors.push("Upper altitude exceeds maximum (10000m)".to_string());
+        }
+        
+        errors
+    }
+    
+    /// Check if geofence is valid.
+    pub fn is_valid(&self) -> bool {
+        self.validate().is_empty()
+    }
+    
+    /// Check if a route segment intersects this geofence.
+    /// Returns true if any point along the segment is inside the geofence.
+    pub fn intersects_segment(&self, lat1: f64, lon1: f64, alt1: f64, lat2: f64, lon2: f64, alt2: f64) -> bool {
+        // Sample points along the segment
+        for i in 0..=10 {
+            let t = i as f64 / 10.0;
+            let lat = lat1 + t * (lat2 - lat1);
+            let lon = lon1 + t * (lon2 - lon1);
+            let alt = alt1 + t * (alt2 - alt1);
+            
+            if self.contains_point(lat, lon, alt) {
+                return true;
+            }
+        }
+        false
+    }
 }
+

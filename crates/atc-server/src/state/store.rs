@@ -269,7 +269,8 @@ impl AppState {
         self.geofences.remove(id).is_some()
     }
 
-    /// Check if a point is inside any active geofence.\n    #[allow(dead_code)] // Will be used for routing avoidance
+    /// Check if a point is inside any active geofence.
+    #[allow(dead_code)] // Will be used for routing avoidance
     pub fn check_point_in_geofences(&self, lat: f64, lon: f64, altitude_m: f64) -> Vec<String> {
         self.geofences
             .iter()
@@ -277,4 +278,33 @@ impl AppState {
             .map(|e| e.key().clone())
             .collect()
     }
+
+    // ========== ADMIN METHODS ==========
+
+    /// Clear all state for demo reset.
+    /// This removes all drones, conflicts, commands, flight plans, and geofences.
+    pub fn clear_all(&self) {
+        self.drones.clear();
+        self.conflicts.clear();
+        self.commands.clear();
+        self.command_cooldowns.clear();
+        self.flight_plans.clear();
+        self.geofences.clear();
+        
+        // Reset the conflict detector
+        if let Ok(mut detector) = self.detector.lock() {
+            *detector = ConflictDetector::new(
+                self.rules.lookahead_seconds,
+                self.rules.min_horizontal_separation_m,
+                self.rules.min_vertical_separation_m,
+                self.rules.warning_multiplier,
+            );
+        }
+        
+        // Reset drone counter
+        self.drone_counter.store(1, Ordering::SeqCst);
+        
+        tracing::info!("All state cleared for demo reset");
+    }
 }
+

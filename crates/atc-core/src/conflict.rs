@@ -73,6 +73,11 @@ pub struct Conflict {
     /// Seconds until closest approach
     pub time_to_closest: f64,
     pub closest_distance_m: f64,
+    /// Predicted CPA (Closest Point of Approach) coordinates
+    /// Midpoint between the two drones at time of closest approach
+    pub cpa_lat: f64,
+    pub cpa_lon: f64,
+    pub cpa_altitude_m: f64,
     pub timestamp: f64,
 }
 
@@ -203,14 +208,16 @@ impl ConflictDetector {
     }
 
     /// Find time and distance of closest approach.
-    /// Returns (time_to_closest_s, closest_distance_m).
+    /// Returns (time_to_closest_s, closest_distance_m, cpa_lat, cpa_lon, cpa_altitude_m).
     fn find_closest_approach(
         &self,
         drone1: &DronePosition,
         drone2: &DronePosition,
-    ) -> (f64, f64) {
+    ) -> (f64, f64, f64, f64, f64) {
         let mut min_distance = f64::INFINITY;
         let mut time_of_min = 0.0;
+        let mut cpa_pos1 = (drone1.lat, drone1.lon, drone1.altitude_m);
+        let mut cpa_pos2 = (drone2.lat, drone2.lon, drone2.altitude_m);
 
         // Sample at 1-second intervals
         for t in 0..=(self.lookahead_seconds as i32) {
@@ -225,10 +232,17 @@ impl ConflictDetector {
             if distance < min_distance {
                 min_distance = distance;
                 time_of_min = t;
+                cpa_pos1 = pos1;
+                cpa_pos2 = pos2;
             }
         }
 
-        (time_of_min, min_distance)
+        // CPA is the midpoint between the two predicted positions
+        let cpa_lat = (cpa_pos1.0 + cpa_pos2.0) / 2.0;
+        let cpa_lon = (cpa_pos1.1 + cpa_pos2.1) / 2.0;
+        let cpa_altitude_m = (cpa_pos1.2 + cpa_pos2.2) / 2.0;
+
+        (time_of_min, min_distance, cpa_lat, cpa_lon, cpa_altitude_m)
     }
 
     /// Check all tracked drones for conflicts.
@@ -253,6 +267,11 @@ impl ConflictDetector {
                 if h_dist < self.separation_horizontal_m
                     && v_dist < self.separation_vertical_m
                 {
+                    // Current position is the CPA for immediate violations
+                    let cpa_lat = (drone1.lat + drone2.lat) / 2.0;
+                    let cpa_lon = (drone1.lon + drone2.lon) / 2.0;
+                    let cpa_altitude_m = (drone1.altitude_m + drone2.altitude_m) / 2.0;
+                    
                     conflicts.push(Conflict {
                         drone1_id: drone1.drone_id.clone(),
                         drone2_id: drone2.drone_id.clone(),
@@ -260,13 +279,16 @@ impl ConflictDetector {
                         distance_m: current_distance,
                         time_to_closest: 0.0,
                         closest_distance_m: current_distance,
+                        cpa_lat,
+                        cpa_lon,
+                        cpa_altitude_m,
                         timestamp: current_timestamp(),
                     });
                     continue;
                 }
 
                 // Check predicted conflicts
-                let (time_to_closest, closest_distance) =
+                let (time_to_closest, closest_distance, cpa_lat, cpa_lon, cpa_altitude_m) =
                     self.find_closest_approach(drone1, drone2);
 
                 // Warning threshold
@@ -287,6 +309,9 @@ impl ConflictDetector {
                     distance_m: current_distance,
                     time_to_closest,
                     closest_distance_m: closest_distance,
+                    cpa_lat,
+                    cpa_lon,
+                    cpa_altitude_m,
                     timestamp: current_timestamp(),
                 });
             }
