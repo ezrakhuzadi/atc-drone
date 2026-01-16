@@ -2,6 +2,7 @@
 
 pub mod commands;
 pub mod flights;
+pub mod geofences;
 mod routes;
 pub mod ws;
 

@@ -3,13 +3,13 @@
 use axum::{
     extract::State,
     http::StatusCode,
-    routing::{get, post},
+    routing::{get, post, delete},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::api::{commands, flights};
+use crate::api::{commands, flights, geofences};
 use crate::state::AppState;
 use atc_core::models::Telemetry;
 
@@ -27,6 +27,12 @@ pub fn create_router() -> Router<Arc<AppState>> {
         .route("/v1/commands", get(commands::get_all_commands))
         .route("/v1/commands/next", get(commands::get_next_command))
         .route("/v1/commands/ack", post(commands::ack_command))
+        // Geofence routes
+        .route("/v1/geofences", post(geofences::create_geofence))
+        .route("/v1/geofences", get(geofences::list_geofences))
+        .route("/v1/geofences/:id", get(geofences::get_geofence))
+        .route("/v1/geofences/:id", delete(geofences::delete_geofence))
+        .route("/v1/geofences/check", get(geofences::check_point))
 }
 
 // === Request/Response types ===

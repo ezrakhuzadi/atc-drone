@@ -164,3 +164,80 @@ pub enum CommandType {
     Resume,
 }
 
+// ========== GEOFENCE MODELS ==========
+
+/// A geographic boundary defining restricted airspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Geofence {
+    pub id: String,
+    pub name: String,
+    pub geofence_type: GeofenceType,
+    /// Polygon vertices as [lat, lon] pairs (closed ring - first == last)
+    pub polygon: Vec<[f64; 2]>,
+    /// Lower altitude limit in meters (floor)
+    pub lower_altitude_m: f64,
+    /// Upper altitude limit in meters (ceiling)
+    pub upper_altitude_m: f64,
+    /// Whether the geofence is currently active
+    pub active: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Type of geofence/restricted area.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GeofenceType {
+    /// No flights allowed
+    NoFlyZone,
+    /// Flights allowed with authorization
+    RestrictedArea,
+    /// Temporary flight restriction (TFR)
+    TemporaryRestriction,
+    /// Advisory only (not enforced)
+    Advisory,
+}
+
+/// Request to create a new geofence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateGeofenceRequest {
+    pub name: String,
+    pub geofence_type: GeofenceType,
+    pub polygon: Vec<[f64; 2]>,
+    pub lower_altitude_m: Option<f64>,
+    pub upper_altitude_m: Option<f64>,
+}
+
+impl Geofence {
+    /// Check if a point is inside this geofence's polygon.
+    /// Uses ray casting algorithm.
+    pub fn contains_point(&self, lat: f64, lon: f64, altitude_m: f64) -> bool {
+        // Check altitude bounds first
+        if altitude_m < self.lower_altitude_m || altitude_m > self.upper_altitude_m {
+            return false;
+        }
+        
+        // Ray casting: count intersections with polygon edges
+        let mut inside = false;
+        let n = self.polygon.len();
+        if n < 3 {
+            return false;
+        }
+        
+        let mut j = n - 1;
+        for i in 0..n {
+            let yi = self.polygon[i][0];
+            let xi = self.polygon[i][1];
+            let yj = self.polygon[j][0];
+            let xj = self.polygon[j][1];
+            
+            if ((yi > lat) != (yj > lat)) 
+                && (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi) 
+            {
+                inside = !inside;
+            }
+            j = i;
+        }
+        
+        inside
+    }
+}

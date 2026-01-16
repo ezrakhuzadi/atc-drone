@@ -1,6 +1,6 @@
 //! In-memory state store using DashMap.
 
-use atc_core::models::{Command, DroneState, FlightPlan, Telemetry};
+use atc_core::models::{Command, DroneState, FlightPlan, Telemetry, Geofence};
 use atc_core::rules::SafetyRules;
 use atc_core::{Conflict, ConflictDetector};
 use dashmap::DashMap;
@@ -23,6 +23,8 @@ pub struct AppState {
     pub tx: broadcast::Sender<DroneState>, // For WS broadcasting
     /// Safety rules (for timeout checks, etc.)
     rules: SafetyRules,
+    /// Geofences/No-fly zones
+    geofences: DashMap<String, Geofence>,
 }
 
 impl AppState {
@@ -53,6 +55,7 @@ impl AppState {
             drone_counter: AtomicU32::new(1),
             tx,
             rules,
+            geofences: DashMap::new(),
         }
     }
 
@@ -229,5 +232,35 @@ impl AppState {
             .flat_map(|entry| entry.value().iter().cloned().collect::<Vec<_>>())
             .collect()
     }
-}
 
+    // ========== GEOFENCE METHODS ==========
+
+    /// Add a geofence.
+    pub fn add_geofence(&self, geofence: Geofence) {
+        self.geofences.insert(geofence.id.clone(), geofence);
+    }
+
+    /// Get all geofences.
+    pub fn get_geofences(&self) -> Vec<Geofence> {
+        self.geofences.iter().map(|e| e.value().clone()).collect()
+    }
+
+    /// Get a specific geofence by ID.
+    pub fn get_geofence(&self, id: &str) -> Option<Geofence> {
+        self.geofences.get(id).map(|e| e.value().clone())
+    }
+
+    /// Remove a geofence by ID.
+    pub fn remove_geofence(&self, id: &str) -> bool {
+        self.geofences.remove(id).is_some()
+    }
+
+    /// Check if a point is inside any active geofence.\n    #[allow(dead_code)] // Will be used for routing avoidance
+    pub fn check_point_in_geofences(&self, lat: f64, lon: f64, altitude_m: f64) -> Vec<String> {
+        self.geofences
+            .iter()
+            .filter(|e| e.value().active && e.value().contains_point(lat, lon, altitude_m))
+            .map(|e| e.key().clone())
+            .collect()
+    }
+}
