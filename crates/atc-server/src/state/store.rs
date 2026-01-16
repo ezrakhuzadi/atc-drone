@@ -206,17 +206,52 @@ impl AppState {
     }
 
     /// Check if drone has an active HOLD or REROUTE command (is in controlled state).
+    /// Only considers non-expired, non-acknowledged commands.
     pub fn has_active_command(&self, drone_id: &str) -> bool {
+        let now = chrono::Utc::now();
         if let Some(queue) = self.commands.get(drone_id) {
             queue.iter().any(|cmd| {
-                matches!(cmd.command_type, 
+                // Must be a control command (HOLD or REROUTE)
+                let is_control = matches!(cmd.command_type, 
                     atc_core::models::CommandType::Hold { .. } | 
                     atc_core::models::CommandType::Reroute { .. }
-                )
+                );
+                // Must not be acknowledged
+                let not_acked = !cmd.acknowledged;
+                // Must not be expired
+                let not_expired = cmd.expires_at
+                    .map(|exp| exp > now)
+                    .unwrap_or(true); // No expiry = never expires
+                
+                is_control && not_acked && not_expired
             })
         } else {
             false
         }
+    }
+    
+    /// Purge expired commands from all queues.
+    /// Should be called periodically (e.g., from conflict loop).
+    pub fn purge_expired_commands(&self) -> usize {
+        let now = chrono::Utc::now();
+        let mut purged_count = 0;
+        
+        for mut entry in self.commands.iter_mut() {
+            let queue = entry.value_mut();
+            let before_len = queue.len();
+            queue.retain(|cmd| {
+                // Keep if no expiry or not yet expired
+                cmd.expires_at
+                    .map(|exp| exp > now)
+                    .unwrap_or(true)
+            });
+            purged_count += before_len - queue.len();
+        }
+        
+        if purged_count > 0 {
+            tracing::debug!("Purged {} expired commands", purged_count);
+        }
+        purged_count
     }
 
     /// Get and remove the next pending command for a drone.

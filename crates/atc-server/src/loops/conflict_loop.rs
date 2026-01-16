@@ -41,6 +41,9 @@ pub async fn run_conflict_loop(state: Arc<AppState>, config: Config) {
         for drone_id in &lost_drones {
             tracing::warn!("Drone {} marked LOST (no telemetry)", drone_id);
         }
+        
+        // Purge expired commands to prevent them from hiding drones
+        state.purge_expired_commands();
 
         let conflicts = state.get_conflicts();
         if conflicts.is_empty() {
@@ -104,27 +107,34 @@ pub async fn run_conflict_loop(state: Arc<AppState>, config: Config) {
                         };
                         
                         if state.has_active_command(priority_id) {
-                            // Priority drone is on HOLD/REROUTE - check if it's in our path
-                            // Use heading to predict: will give_way drone fly past the held drone?
-                            use atc_core::spatial::offset_by_bearing;
+                            // Priority drone is on HOLD/REROUTE - check if it's blocking our path
+                            // Use proper distance-to-segment calculation instead of bounding box
+                            use atc_core::spatial::{offset_by_bearing, distance_to_segment_m};
                             let heading_rad = gw.heading_deg.to_radians();
                             
-                            // Project give_way drone's position 30 seconds ahead (~300m at 10m/s)
+                            // Project give_way drone's position ~30 seconds ahead
+                            let projection_distance = gw.speed_mps * 30.0;
                             let (future_lat, future_lon) = offset_by_bearing(
                                 gw.lat, gw.lon, 
-                                gw.speed_mps * 30.0,  // distance = speed * time
+                                projection_distance,
                                 heading_rad
                             );
                             
-                            // Check if priority drone is between current and future position
-                            let lat_between = (pri.lat > gw.lat.min(future_lat)) && (pri.lat < gw.lat.max(future_lat));
-                            let lon_between = (pri.lon > gw.lon.min(future_lon)) && (pri.lon < gw.lon.max(future_lon));
+                            // Calculate distance from priority drone to our projected path
+                            let distance_to_path = distance_to_segment_m(
+                                pri.lat, pri.lon,
+                                gw.lat, gw.lon,
+                                future_lat, future_lon,
+                            );
                             
-                            if !lat_between && !lon_between {
+                            // Use horizontal separation threshold (with buffer)
+                            let blocking_threshold = state.rules().min_horizontal_separation_m * 2.0;
+                            
+                            if distance_to_path > blocking_threshold {
                                 // Priority drone is NOT in our path - skip reroute
                                 tracing::info!(
-                                    "Skipping reroute for {} - {} is holding but not blocking path",
-                                    give_way_id, priority_id
+                                    "Skipping reroute for {} - {} is {:.0}m from path (threshold: {:.0}m)",
+                                    give_way_id, priority_id, distance_to_path, blocking_threshold
                                 );
                                 continue;
                             }

@@ -208,6 +208,56 @@ pub fn offset_by_bearing(lat: f64, lon: f64, distance_m: f64, bearing_rad: f64) 
     offset_position(lat, lon, north_m, east_m)
 }
 
+/// Calculate minimum distance from a point to a line segment (in meters).
+/// 
+/// This is the proper way to check if a stationary drone is "blocking" a path,
+/// rather than using bounding-box checks.
+/// 
+/// # Arguments
+/// * `point_lat`, `point_lon` - The point to measure from (e.g., priority drone)
+/// * `seg_start_lat`, `seg_start_lon` - Segment start (e.g., give-way drone position)
+/// * `seg_end_lat`, `seg_end_lon` - Segment end (e.g., give-way projected position)
+/// 
+/// # Returns
+/// Distance in meters from the point to the closest point on the segment
+pub fn distance_to_segment_m(
+    point_lat: f64, point_lon: f64,
+    seg_start_lat: f64, seg_start_lon: f64,
+    seg_end_lat: f64, seg_end_lon: f64,
+) -> f64 {
+    // Convert to local ENU (using segment start as origin)
+    let ref_lat = seg_start_lat;
+    
+    // Point in local coords
+    let px = lon_to_meters(point_lon - seg_start_lon, ref_lat);
+    let py = lat_to_meters(point_lat - seg_start_lat);
+    
+    // Segment end in local coords
+    let sx = lon_to_meters(seg_end_lon - seg_start_lon, ref_lat);
+    let sy = lat_to_meters(seg_end_lat - seg_start_lat);
+    
+    // Segment length squared
+    let seg_len_sq = sx * sx + sy * sy;
+    
+    if seg_len_sq < 0.0001 {
+        // Segment is essentially a point
+        return (px * px + py * py).sqrt();
+    }
+    
+    // Project point onto segment line: t = ((P-A) · (B-A)) / |B-A|²
+    let t = ((px * sx + py * sy) / seg_len_sq).clamp(0.0, 1.0);
+    
+    // Closest point on segment
+    let closest_x = t * sx;
+    let closest_y = t * sy;
+    
+    // Distance from point to closest point on segment
+    let dx = px - closest_x;
+    let dy = py - closest_y;
+    
+    (dx * dx + dy * dy).sqrt()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
