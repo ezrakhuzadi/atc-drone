@@ -92,6 +92,8 @@ struct DemoState {
     is_rerouting: bool,
     reroute_waypoints: Vec<(f64, f64, f64)>,
     reroute_index: usize,
+    reroute_segment_start_time: f64,  // When we started flying towards current waypoint
+    reroute_segment_start_pos: (f64, f64, f64), // Position when segment started (lat, lon, alt)
     // Hold state
     is_holding: bool,
     hold_until: Option<time::Instant>,
@@ -122,6 +124,8 @@ impl DemoState {
             is_rerouting: false,
             reroute_waypoints: Vec::new(),
             reroute_index: 0,
+            reroute_segment_start_time: 0.0,
+            reroute_segment_start_pos: (0.0, 0.0, 0.0),
             is_holding: false,
             hold_until: None,
         }
@@ -178,8 +182,22 @@ impl DemoState {
             }
             FlightPhase::Cruise => {
                 if self.is_rerouting && self.reroute_index < self.reroute_waypoints.len() {
-                    let wp = self.reroute_waypoints[self.reroute_index];
-                    (wp.0, wp.1)
+                    // Physics-based interpolation towards current waypoint
+                    let target = self.reroute_waypoints[self.reroute_index];
+                    let start_pos = self.reroute_segment_start_pos;
+                    
+                    let segment_dist = haversine_distance(start_pos.0, start_pos.1, target.0, target.1);
+                    let segment_time = segment_dist / DRONE_SPEED_MPS;
+                    let segment_elapsed = cruise_elapsed - self.reroute_segment_start_time;
+                    let segment_progress = if segment_time > 0.01 {
+                        (segment_elapsed / segment_time).clamp(0.0, 1.0)
+                    } else {
+                        1.0 // Already at waypoint
+                    };
+                    
+                    let lat = start_pos.0 + segment_progress * (target.0 - start_pos.0);
+                    let lon = start_pos.1 + segment_progress * (target.1 - start_pos.1);
+                    (lat, lon)
                 } else {
                     // Use current position as start (updated after reroute completes)
                     let remaining_distance = haversine_distance(
@@ -375,6 +393,9 @@ async fn main() -> anyhow::Result<()> {
                             .map(|wp| (wp.lat, wp.lon, wp.altitude_m))
                             .collect();
                         drone.reroute_index = 0;
+                        // Initialize segment tracking with current position
+                        drone.reroute_segment_start_time = cruise_elapsed;
+                        drone.reroute_segment_start_pos = (lat, lon, alt);
                         println!("  [CMD] {} REROUTE ({} waypoints)", drone.drone_id, waypoints.len());
                         println!("        Reason: {}\n", reason.as_deref().unwrap_or("none"));
                     }
@@ -386,23 +407,36 @@ async fn main() -> anyhow::Result<()> {
                 let _ = drone.client.ack_command(&cmd.command_id).await;
             }
 
-            // Advance reroute
-            if drone.is_rerouting && update_count % 5 == 0 {
-                drone.reroute_index += 1;
-                if drone.reroute_index >= drone.reroute_waypoints.len() {
-                    // Save final reroute position as new current position
-                    if let Some(last_wp) = drone.reroute_waypoints.last() {
-                        drone.current_lat = last_wp.0;
-                        drone.current_lon = last_wp.1;
-                        drone.current_alt = last_wp.2;
-                    }
-                    // Reset cruise timer so we calculate remaining path from HERE, not from start
-                    drone.cruise_start_time = elapsed;
+            // Advance reroute based on PHYSICS (distance/speed), not fixed time
+            if drone.is_rerouting && drone.reroute_index < drone.reroute_waypoints.len() {
+                let target = drone.reroute_waypoints[drone.reroute_index];
+                let start_pos = drone.reroute_segment_start_pos;
+                
+                let segment_dist = haversine_distance(start_pos.0, start_pos.1, target.0, target.1);
+                let segment_time = segment_dist / DRONE_SPEED_MPS;
+                let segment_elapsed = cruise_elapsed - drone.reroute_segment_start_time;
+                
+                // Check if we've reached this waypoint
+                if segment_elapsed >= segment_time {
+                    // Update current position to this waypoint
+                    drone.current_lat = target.0;
+                    drone.current_lon = target.1;
+                    drone.current_alt = target.2;
                     
-                    drone.is_rerouting = false;
-                    drone.reroute_waypoints.clear();
-                    drone.reroute_index = 0;
-                    println!("[{:3}] {} reroute complete, continuing from new position", update_count, drone.drone_id);
+                    drone.reroute_index += 1;
+                    
+                    if drone.reroute_index >= drone.reroute_waypoints.len() {
+                        // All waypoints done, resume normal cruise
+                        drone.cruise_start_time = elapsed;
+                        drone.is_rerouting = false;
+                        drone.reroute_waypoints.clear();
+                        drone.reroute_index = 0;
+                        println!("[{:3}] {} reroute complete, continuing from new position", update_count, drone.drone_id);
+                    } else {
+                        // Start next segment
+                        drone.reroute_segment_start_time = cruise_elapsed;
+                        drone.reroute_segment_start_pos = (target.0, target.1, target.2);
+                    }
                 }
             }
         }

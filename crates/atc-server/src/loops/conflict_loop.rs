@@ -19,8 +19,8 @@ use atc_core::{
 };
 
 /// Cooldown in seconds before issuing another command to the same drone.
-/// Set to 30s to cover typical reroute duration (~25s).
-const COMMAND_COOLDOWN_SECS: u64 = 30;
+/// Set to 60s to cover full reroute execution (physics-based ~30-45s) plus buffer.
+const COMMAND_COOLDOWN_SECS: u64 = 60;
 
 /// Start the conflict detection loop.
 pub async fn run_conflict_loop(state: Arc<AppState>, config: Config) {
