@@ -155,8 +155,12 @@ pub enum CommandType {
     Hold { duration_secs: u32 },
     /// Change altitude
     AltitudeChange { target_altitude_m: f64 },
-    /// Reroute to new waypoint
-    Reroute { waypoint: Waypoint },
+    /// Reroute to new waypoints (conflict avoidance)
+    Reroute { 
+        waypoints: Vec<Waypoint>,
+        reason: Option<String>,
+    },
     /// Resume normal operation
     Resume,
 }
+
