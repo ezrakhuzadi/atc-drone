@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use reqwest::Client;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
@@ -36,6 +36,12 @@ pub struct BlenderClient {
     pub(crate) client: Client,
     pub(crate) base_url: String,
     pub(crate) session_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BlenderConformanceStatusResponse {
+    pub status: String,
+    pub record: Option<atc_core::models::ConformanceRecord>,
 }
 
 #[derive(Debug, Serialize)]
@@ -160,5 +166,40 @@ impl BlenderClient {
             .context("Failed to send observation")?;
 
         Ok(response.status().as_u16())
+    }
+
+    /// Fetch conformance status for a specific aircraft.
+    pub async fn fetch_conformance_status(&self, aircraft_id: &str) -> Result<BlenderConformanceStatusResponse> {
+        let url = format!(
+            "{}/conformance_monitoring_operations/conformance_status/?aircraft_id={}",
+            self.base_url, aircraft_id
+        );
+
+        let token = generate_dummy_jwt();
+
+        let response = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await
+            .context("Failed to fetch conformance status")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!(
+                "Conformance status request failed: {} {}",
+                status,
+                body
+            ));
+        }
+
+        let payload = response
+            .json::<BlenderConformanceStatusResponse>()
+            .await
+            .context("Failed to parse conformance status response")?;
+
+        Ok(payload)
     }
 }

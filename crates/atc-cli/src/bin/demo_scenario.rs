@@ -68,6 +68,10 @@ struct Args {
     /// Reset state before running
     #[arg(long, default_value_t = true)]
     reset: bool,
+
+    /// Owner ID for user-specific drone tracking (e.g., 'guest')
+    #[arg(long, default_value = "guest")]
+    owner: String,
 }
 
 /// Drone state during simulation
@@ -290,6 +294,7 @@ async fn main() -> anyhow::Result<()> {
     println!("╚═══════════════════════════════════════════════════════════════╝\n");
 
     let start_time = time::Instant::now();
+    let owner_id = args.owner.clone();  // For telemetry owner tracking
     let mut update_count = 0u32;
     let mut interval = time::interval(Duration::from_secs_f64(1.0 / UPDATE_RATE_HZ));
 
@@ -359,8 +364,8 @@ async fn main() -> anyhow::Result<()> {
                 DRONE_SPEED_MPS
             };
 
-            // Send telemetry
-            match drone.client.send_position(lat, lon, alt, drone.heading, speed).await {
+            // Send telemetry with owner ID
+            match drone.client.send_position_with_owner(lat, lon, alt, drone.heading, speed, Some(owner_id.clone())).await {
                 Ok(_) => {
                     let status = if drone.is_rerouting {
                         format!("REROUTE[{}/{}]", drone.reroute_index + 1, drone.reroute_waypoints.len())

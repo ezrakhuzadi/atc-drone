@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Telemetry {
     pub drone_id: String,
+    /// Owner/operator ID for user-specific filtering
+    #[serde(default)]
+    pub owner_id: Option<String>,
     pub lat: f64,
     pub lon: f64,
     pub altitude_m: f64,
@@ -27,6 +30,8 @@ pub struct Telemetry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DroneState {
     pub drone_id: String,
+    /// Owner/operator ID for user-specific filtering
+    pub owner_id: Option<String>,
     pub lat: f64,
     pub lon: f64,
     pub altitude_m: f64,
@@ -58,6 +63,7 @@ impl DroneState {
     pub fn from_telemetry(telemetry: &Telemetry) -> Self {
         Self {
             drone_id: telemetry.drone_id.clone(),
+            owner_id: telemetry.owner_id.clone(),
             lat: telemetry.lat,
             lon: telemetry.lon,
             altitude_m: telemetry.altitude_m,
@@ -197,6 +203,35 @@ pub enum GeofenceType {
     Advisory,
 }
 
+// ========== CONFORMANCE MONITORING ==========
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConformanceRecord {
+    pub id: String,
+    pub flight_declaration_id: String,
+    pub aircraft_id: String,
+    pub conformance_state: i32,
+    pub conformance_state_label: String,
+    pub conformance_state_code: Option<String>,
+    pub timestamp: String,
+    pub description: String,
+    pub event_type: String,
+    pub geofence_breach: bool,
+    pub geofence_id: Option<String>,
+    pub resolved: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConformanceStatus {
+    pub drone_id: String,
+    pub owner_id: Option<String>,
+    pub status: String,
+    pub last_checked: DateTime<Utc>,
+    pub record: Option<ConformanceRecord>,
+}
+
 /// Request to create a new geofence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateGeofenceRequest {
@@ -301,4 +336,3 @@ impl Geofence {
         false
     }
 }
-

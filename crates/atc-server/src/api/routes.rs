@@ -1,7 +1,7 @@
 //! REST API routes.
 
 use axum::{
-    extract::State,
+    extract::{State, Query},
     http::StatusCode,
     routing::{get, post, delete},
     Json, Router,
@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::api::{commands, flights, geofences};
 use crate::state::AppState;
-use atc_core::models::Telemetry;
+use atc_core::models::{Telemetry, ConformanceStatus};
 
 /// Create the API router.
 pub fn create_router() -> Router<Arc<AppState>> {
@@ -20,6 +20,7 @@ pub fn create_router() -> Router<Arc<AppState>> {
         .route("/v1/telemetry", post(receive_telemetry))
         .route("/v1/drones", get(list_drones))
         .route("/v1/conflicts", get(list_conflicts))
+        .route("/v1/conformance", get(list_conformance))
         .route("/v1/flights/plan", post(flights::create_flight_plan))
         .route("/v1/flights", get(flights::get_flight_plans))
         // Command dispatch routes
@@ -43,8 +44,22 @@ pub fn create_router() -> Router<Arc<AppState>> {
 #[derive(Debug, Deserialize)]
 pub struct RegisterRequest {
     pub drone_id: Option<String>,
+    /// Owner/operator ID for user-specific tracking
+    pub owner_id: Option<String>,
     #[allow(dead_code)] // Reserved for future drone type handling
     pub drone_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListDronesQuery {
+    /// Filter drones by owner ID
+    pub owner_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConformanceQuery {
+    /// Filter conformance statuses by owner ID
+    pub owner_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -84,14 +99,39 @@ async fn receive_telemetry(
 
 async fn list_drones(
     State(state): State<Arc<AppState>>,
+    Query(query): Query<ListDronesQuery>,
 ) -> Json<Vec<atc_core::models::DroneState>> {
-    Json(state.get_all_drones())
+    let all_drones = state.get_all_drones();
+    
+    // Filter by owner_id if provided
+    let filtered = if let Some(owner_id) = query.owner_id {
+        all_drones.into_iter()
+            .filter(|d| d.owner_id.as_ref() == Some(&owner_id))
+            .collect()
+    } else {
+        all_drones
+    };
+    
+    Json(filtered)
 }
 
 async fn list_conflicts(
     State(state): State<Arc<AppState>>,
 ) -> Json<Vec<atc_core::Conflict>> {
     Json(state.get_conflicts())
+}
+
+async fn list_conformance(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ConformanceQuery>,
+) -> Json<Vec<ConformanceStatus>> {
+    let mut statuses = state.get_conformance_statuses();
+
+    if let Some(owner_id) = query.owner_id {
+        statuses.retain(|status| status.owner_id.as_ref() == Some(&owner_id));
+    }
+
+    Json(statuses)
 }
 
 // === Admin Handlers ===
@@ -103,4 +143,3 @@ async fn admin_reset(
     state.clear_all();
     StatusCode::OK
 }
-

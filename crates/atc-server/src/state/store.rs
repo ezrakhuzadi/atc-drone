@@ -1,6 +1,6 @@
 //! In-memory state store using DashMap.
 
-use atc_core::models::{Command, DroneState, FlightPlan, Telemetry, Geofence};
+use atc_core::models::{Command, DroneState, FlightPlan, Telemetry, Geofence, ConformanceStatus};
 use atc_core::rules::SafetyRules;
 use atc_core::{Conflict, ConflictDetector};
 use dashmap::DashMap;
@@ -25,6 +25,8 @@ pub struct AppState {
     rules: SafetyRules,
     /// Geofences/No-fly zones
     geofences: DashMap<String, Geofence>,
+    /// Latest conformance status per drone
+    conformance: DashMap<String, ConformanceStatus>,
 }
 
 impl AppState {
@@ -56,6 +58,7 @@ impl AppState {
             tx,
             rules,
             geofences: DashMap::new(),
+            conformance: DashMap::new(),
         }
     }
 
@@ -124,6 +127,11 @@ impl AppState {
         self.drones.iter().map(|r| r.value().clone()).collect()
     }
 
+    /// Get a single drone state by ID.
+    pub fn get_drone(&self, drone_id: &str) -> Option<DroneState> {
+        self.drones.get(drone_id).map(|entry| entry.value().clone())
+    }
+
     /// Check for drones that haven't reported in and mark them as Lost.
     /// Returns the IDs of newly-lost drones.
     pub fn check_timeouts(&self) -> Vec<String> {
@@ -161,6 +169,23 @@ impl AppState {
     /// Get current conflicts.
     pub fn get_conflicts(&self) -> Vec<Conflict> {
         self.conflicts.iter().map(|r| r.value().clone()).collect()
+    }
+
+    // ========== CONFORMANCE METHODS ==========
+
+    /// Store the latest conformance status for a drone.
+    pub fn set_conformance_status(&self, status: ConformanceStatus) {
+        self.conformance.insert(status.drone_id.clone(), status);
+    }
+
+    /// Get conformance status for all drones.
+    pub fn get_conformance_statuses(&self) -> Vec<ConformanceStatus> {
+        self.conformance.iter().map(|r| r.value().clone()).collect()
+    }
+
+    /// Get conformance status for a single drone.
+    pub fn get_conformance_status(&self, drone_id: &str) -> Option<ConformanceStatus> {
+        self.conformance.get(drone_id).map(|r| r.value().clone())
     }
     
     /// Get all flight plans
@@ -325,6 +350,7 @@ impl AppState {
         self.command_cooldowns.clear();
         self.flight_plans.clear();
         self.geofences.clear();
+        self.conformance.clear();
         
         // Reset the conflict detector
         if let Ok(mut detector) = self.detector.lock() {
@@ -342,4 +368,3 @@ impl AppState {
         tracing::info!("All state cleared for demo reset");
     }
 }
-

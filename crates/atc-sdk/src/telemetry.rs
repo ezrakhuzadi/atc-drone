@@ -16,6 +16,19 @@ impl AtcClient {
         heading_deg: f64,
         speed_mps: f64,
     ) -> Result<()> {
+        self.send_position_with_owner(lat, lon, altitude_m, heading_deg, speed_mps, None).await
+    }
+
+    /// Send position update with owner ID for user-specific tracking.
+    pub async fn send_position_with_owner(
+        &self,
+        lat: f64,
+        lon: f64,
+        altitude_m: f64,
+        heading_deg: f64,
+        speed_mps: f64,
+        owner_id: Option<String>,
+    ) -> Result<()> {
         let drone_id = self
             .drone_id()
             .ok_or_else(|| anyhow::anyhow!("Not registered"))?;
@@ -29,6 +42,7 @@ impl AtcClient {
 
         let telemetry = Telemetry {
             drone_id: drone_id.to_string(),
+            owner_id,
             lat,
             lon,
             altitude_m,

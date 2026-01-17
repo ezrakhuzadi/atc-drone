@@ -32,6 +32,8 @@ async fn main() -> Result<()> {
     
     // Start background loops
     tokio::spawn(loops::conflict_loop::run_conflict_loop(state.clone(), config.clone()));
+    tokio::spawn(loops::conformance_loop::run_conformance_loop(state.clone(), config.clone()));
+    tokio::spawn(loops::mission_loop::run_mission_loop(state.clone()));
     tokio::spawn(loops::blender_sync_loop::run_blender_loop(state.clone(), config));
 
     // Build the app
