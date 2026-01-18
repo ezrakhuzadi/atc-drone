@@ -7,12 +7,15 @@ use serde::{Deserialize, Serialize};
 pub struct AtcClient {
     pub(crate) base_url: String,
     pub(crate) drone_id: Option<String>,
+    pub(crate) owner_id: Option<String>,
     pub(crate) client: reqwest::Client,
 }
 
 #[derive(Debug, Serialize)]
 pub struct RegisterRequest {
     pub drone_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<String>,
     pub drone_type: String,
 }
 
@@ -33,16 +36,27 @@ impl AtcClient {
         Self {
             base_url: base_url.into(),
             drone_id: None,
+            owner_id: None,
             client: reqwest::Client::new(),
         }
     }
 
     /// Register this drone with the ATC server.
     pub async fn register(&mut self, drone_id: Option<&str>) -> Result<RegisterResponse> {
+        self.register_with_owner(drone_id, None).await
+    }
+
+    /// Register this drone with the ATC server, including an owner ID.
+    pub async fn register_with_owner(
+        &mut self,
+        drone_id: Option<&str>,
+        owner_id: Option<&str>,
+    ) -> Result<RegisterResponse> {
         let url = format!("{}/v1/drones/register", self.base_url);
-        
+
         let request = RegisterRequest {
             drone_id: drone_id.map(|s| s.to_string()),
+            owner_id: owner_id.map(|s| s.to_string()),
             drone_type: "UAV".to_string(),
         };
 
@@ -56,12 +70,25 @@ impl AtcClient {
             .await?;
 
         self.drone_id = Some(response.drone_id.clone());
+        if let Some(owner_id) = owner_id {
+            self.owner_id = Some(owner_id.to_string());
+        }
         Ok(response)
     }
 
     /// Get the current drone ID.
     pub fn drone_id(&self) -> Option<&str> {
         self.drone_id.as_deref()
+    }
+
+    /// Get the owner ID associated with this client.
+    pub fn owner_id(&self) -> Option<&str> {
+        self.owner_id.as_deref()
+    }
+
+    /// Set or update the owner ID for this client.
+    pub fn set_owner_id(&mut self, owner_id: Option<String>) {
+        self.owner_id = owner_id;
     }
 
     /// Send telemetry update to the ATC server.
@@ -143,4 +170,3 @@ impl AtcClient {
         Ok(())
     }
 }
-

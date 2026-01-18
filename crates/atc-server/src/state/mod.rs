@@ -2,4 +2,4 @@
 
 pub mod store;
 
-pub use store::AppState;
+pub use store::{AppState, ExternalTraffic};

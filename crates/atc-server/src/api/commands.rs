@@ -18,6 +18,8 @@ use crate::state::AppState;
 #[derive(Debug, Deserialize)]
 pub struct IssueCommandRequest {
     pub drone_id: String,
+    /// Owner/operator ID for access enforcement
+    pub owner_id: Option<String>,
     #[serde(flatten)]
     pub command_type: CommandType,
     /// Command expiry in seconds (default: 60)
@@ -50,6 +52,13 @@ pub async fn issue_command(
     State(state): State<Arc<AppState>>,
     Json(request): Json<IssueCommandRequest>,
 ) -> Result<Json<IssueCommandResponse>, StatusCode> {
+    let drone = state.get_drone(&request.drone_id).ok_or(StatusCode::NOT_FOUND)?;
+    if let Some(expected_owner) = drone.owner_id {
+        if request.owner_id.as_deref() != Some(expected_owner.as_str()) {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
+
     let now = Utc::now();
     let expires_in = request.expires_in_secs.unwrap_or(60);
     

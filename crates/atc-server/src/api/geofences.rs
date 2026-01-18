@@ -12,7 +12,7 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use crate::state::AppState;
-use atc_core::{Geofence, CreateGeofenceRequest};
+use atc_core::{Geofence, CreateGeofenceRequest, UpdateGeofenceRequest};
 
 /// Create a new geofence.
 pub async fn create_geofence(
@@ -63,6 +63,61 @@ pub async fn get_geofence(
     state.get_geofence(&id)
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// Update a geofence by ID.
+pub async fn update_geofence(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateGeofenceRequest>,
+) -> Result<Json<Geofence>, (StatusCode, Json<serde_json::Value>)> {
+    let mut geofence = match state.get_geofence(&id) {
+        Some(existing) => existing,
+        None => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "Geofence not found",
+                    "id": id
+                }))
+            ));
+        }
+    };
+
+    if let Some(name) = req.name {
+        geofence.name = name;
+    }
+    if let Some(geofence_type) = req.geofence_type {
+        geofence.geofence_type = geofence_type;
+    }
+    if let Some(polygon) = req.polygon {
+        geofence.polygon = polygon;
+    }
+    if let Some(lower_altitude_m) = req.lower_altitude_m {
+        geofence.lower_altitude_m = lower_altitude_m;
+    }
+    if let Some(upper_altitude_m) = req.upper_altitude_m {
+        geofence.upper_altitude_m = upper_altitude_m;
+    }
+    if let Some(active) = req.active {
+        geofence.active = active;
+    }
+
+    let errors = geofence.validate();
+    if !errors.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Invalid geofence",
+                "validation_errors": errors
+            }))
+        ));
+    }
+
+    state.add_geofence(geofence.clone());
+    tracing::info!("Updated geofence '{}' ({})", geofence.name, geofence.id);
+
+    Ok(Json(geofence))
 }
 
 /// Delete a geofence by ID.

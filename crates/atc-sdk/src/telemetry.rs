@@ -16,7 +16,15 @@ impl AtcClient {
         heading_deg: f64,
         speed_mps: f64,
     ) -> Result<()> {
-        self.send_position_with_owner(lat, lon, altitude_m, heading_deg, speed_mps, None).await
+        self.send_position_with_owner(
+            lat,
+            lon,
+            altitude_m,
+            heading_deg,
+            speed_mps,
+            self.owner_id.clone(),
+        )
+        .await
     }
 
     /// Send position update with owner ID for user-specific tracking.
@@ -32,6 +40,7 @@ impl AtcClient {
         let drone_id = self
             .drone_id()
             .ok_or_else(|| anyhow::anyhow!("Not registered"))?;
+        let effective_owner_id = owner_id.or_else(|| self.owner_id.clone());
 
         // Calculate velocity components from heading and speed
         // heading_deg: 0 = North, 90 = East (clockwise from North)
@@ -42,7 +51,7 @@ impl AtcClient {
 
         let telemetry = Telemetry {
             drone_id: drone_id.to_string(),
-            owner_id,
+            owner_id: effective_owner_id,
             lat,
             lon,
             altitude_m,

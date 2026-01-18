@@ -1,17 +1,21 @@
 //! In-memory state store using DashMap.
 
-use atc_core::models::{Command, DroneState, FlightPlan, Telemetry, Geofence, ConformanceStatus};
+use atc_core::models::{Command, DroneState, FlightPlan, Telemetry, Geofence, ConformanceStatus, DaaAdvisory, DroneStatus};
 use atc_core::rules::SafetyRules;
 use atc_core::{Conflict, ConflictDetector};
 use dashmap::DashMap;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{atomic::{AtomicU32, Ordering}, RwLock};
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
 
 use tokio::sync::broadcast;
 
 /// Application state - thread-safe store for drones and conflicts.
 pub struct AppState {
     drones: DashMap<String, DroneState>,
+    drone_owners: DashMap<String, String>,
+    external_traffic: DashMap<String, ExternalTraffic>,
     pub flight_plans: DashMap<String, FlightPlan>,
     detector: std::sync::Mutex<ConflictDetector>,
     conflicts: DashMap<String, Conflict>,
@@ -27,6 +31,22 @@ pub struct AppState {
     geofences: DashMap<String, Geofence>,
     /// Latest conformance status per drone
     conformance: DashMap<String, ConformanceStatus>,
+    /// Latest DAA advisories per drone
+    daa_advisories: DashMap<String, DaaAdvisory>,
+    /// Current RID viewport (min_lat,min_lon,max_lat,max_lon)
+    rid_view_bbox: RwLock<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalTraffic {
+    pub traffic_id: String,
+    pub source: String,
+    pub lat: f64,
+    pub lon: f64,
+    pub altitude_m: f64,
+    pub heading_deg: f64,
+    pub speed_mps: f64,
+    pub last_update: chrono::DateTime<chrono::Utc>,
 }
 
 impl AppState {
@@ -49,6 +69,8 @@ impl AppState {
         
         Self {
             drones: DashMap::new(),
+            drone_owners: DashMap::new(),
+            external_traffic: DashMap::new(),
             flight_plans: DashMap::new(),
             detector: std::sync::Mutex::new(detector),
             conflicts: DashMap::new(),
@@ -59,6 +81,8 @@ impl AppState {
             rules,
             geofences: DashMap::new(),
             conformance: DashMap::new(),
+            daa_advisories: DashMap::new(),
+            rid_view_bbox: RwLock::new(String::new()),
         }
     }
 
@@ -68,30 +92,94 @@ impl AppState {
         &self.rules
     }
 
+    /// Update the RID viewport used for DSS subscriptions.
+    pub fn set_rid_view_bbox(&self, view: String) {
+        if let Ok(mut guard) = self.rid_view_bbox.write() {
+            *guard = view;
+        }
+    }
+
+    /// Get the current RID viewport string.
+    pub fn get_rid_view_bbox(&self) -> String {
+        self.rid_view_bbox
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
     /// Get next drone ID number.
     pub fn next_drone_id(&self) -> u32 {
         self.drone_counter.fetch_add(1, Ordering::SeqCst)
     }
 
     /// Register a new drone.
-    pub fn register_drone(&self, _drone_id: &str) {
-        // Pre-register with no position
+    pub fn register_drone(&self, drone_id: &str, owner_id: Option<String>) {
+        let owner_for_state = owner_id
+            .clone()
+            .or_else(|| self.drone_owners.get(drone_id).map(|entry| entry.value().clone()));
+        let now = Utc::now();
+
+        self.drones
+            .entry(drone_id.to_string())
+            .or_insert_with(|| DroneState {
+                drone_id: drone_id.to_string(),
+                owner_id: owner_for_state.clone(),
+                lat: 0.0,
+                lon: 0.0,
+                altitude_m: 0.0,
+                heading_deg: 0.0,
+                speed_mps: 0.0,
+                velocity_x: 0.0,
+                velocity_y: 0.0,
+                velocity_z: 0.0,
+                last_update: now,
+                status: DroneStatus::Inactive,
+            });
+
+        if let Some(owner_id) = owner_id {
+            self.drone_owners.insert(drone_id.to_string(), owner_id.clone());
+            if let Some(mut entry) = self.drones.get_mut(drone_id) {
+                if entry.owner_id.is_none() {
+                    entry.owner_id = Some(owner_id);
+                }
+            }
+        }
     }
 
     /// Update drone state from telemetry.
     pub fn update_telemetry(&self, telemetry: Telemetry) {
         let drone_id = telemetry.drone_id.clone();
+        let mut telemetry = telemetry;
+        let hold_active = self.has_active_hold_command(&drone_id);
+
+        if telemetry.owner_id.is_none() {
+            if let Some(owner_id) = self.drone_owners.get(&drone_id) {
+                telemetry.owner_id = Some(owner_id.value().clone());
+            }
+        }
+
+        if let Some(owner_id) = telemetry.owner_id.clone() {
+            self.drone_owners.insert(drone_id.clone(), owner_id);
+        }
         let mut updated_state = None;
+
+        self.external_traffic.remove(&drone_id);
 
         // Update or create drone state
         self.drones
             .entry(drone_id.clone())
             .and_modify(|state| {
                 state.update(&telemetry);
+                if hold_active {
+                    state.status = DroneStatus::Holding;
+                }
                 updated_state = Some(state.clone());
             })
             .or_insert_with(|| {
-                let state = DroneState::from_telemetry(&telemetry);
+                let mut state = DroneState::from_telemetry(&telemetry);
+                if hold_active {
+                    state.status = DroneStatus::Holding;
+                }
                 updated_state = Some(state.clone());
                 state
             });
@@ -110,21 +198,81 @@ impl AppState {
                 telemetry.altitude_m,
             ).with_velocity(telemetry.heading_deg, telemetry.speed_mps));
 
-            // Run conflict detection
-            let new_conflicts = detector.detect_conflicts();
-            
-            // Update conflicts map
-            self.conflicts.clear();
-            for conflict in new_conflicts {
-                let key = format!("{}-{}", conflict.drone1_id, conflict.drone2_id);
-                self.conflicts.insert(key, conflict);
-            }
+            self.update_conflicts_from_detector(&mut detector);
         }
     }
 
     /// Get all drone states.
     pub fn get_all_drones(&self) -> Vec<DroneState> {
         self.drones.iter().map(|r| r.value().clone()).collect()
+    }
+
+    /// Upsert external traffic and feed it into conflict detection.
+    pub fn upsert_external_traffic(&self, traffic: ExternalTraffic) {
+        let traffic_id = traffic.traffic_id.clone();
+        self.external_traffic.insert(traffic_id.clone(), traffic.clone());
+
+        if let Ok(mut detector) = self.detector.lock() {
+            detector.update_position(
+                atc_core::DronePosition::new(
+                    &traffic_id,
+                    traffic.lat,
+                    traffic.lon,
+                    traffic.altitude_m,
+                ).with_velocity(traffic.heading_deg, traffic.speed_mps)
+            );
+            self.update_conflicts_from_detector(&mut detector);
+        }
+    }
+
+    /// Get all external traffic tracks.
+    pub fn get_external_traffic(&self) -> Vec<ExternalTraffic> {
+        self.external_traffic.iter().map(|r| r.value().clone()).collect()
+    }
+
+    /// Remove stale external tracks and purge them from the conflict detector.
+    pub fn purge_external_traffic(&self, max_age_secs: i64) -> Vec<String> {
+        let now = Utc::now();
+        let stale_ids: Vec<String> = self.external_traffic.iter()
+            .filter_map(|entry| {
+                let age = (now - entry.last_update).num_seconds();
+                if age > max_age_secs {
+                    Some(entry.key().clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for id in &stale_ids {
+            self.external_traffic.remove(id);
+        }
+
+        if !stale_ids.is_empty() {
+            if let Ok(mut detector) = self.detector.lock() {
+                for id in &stale_ids {
+                    detector.remove_drone(id);
+                }
+                self.update_conflicts_from_detector(&mut detector);
+            }
+        }
+
+        stale_ids
+    }
+
+    /// Check if a drone ID belongs to external traffic.
+    pub fn is_external_traffic(&self, drone_id: &str) -> bool {
+        self.external_traffic.contains_key(drone_id)
+    }
+
+    fn update_conflicts_from_detector(&self, detector: &mut ConflictDetector) {
+        let new_conflicts = detector.detect_conflicts();
+
+        self.conflicts.clear();
+        for conflict in new_conflicts {
+            let key = format!("{}-{}", conflict.drone1_id, conflict.drone2_id);
+            self.conflicts.insert(key, conflict);
+        }
     }
 
     /// Get a single drone state by ID.
@@ -186,6 +334,27 @@ impl AppState {
     /// Get conformance status for a single drone.
     pub fn get_conformance_status(&self, drone_id: &str) -> Option<ConformanceStatus> {
         self.conformance.get(drone_id).map(|r| r.value().clone())
+    }
+
+    // ========== DAA METHODS ==========
+
+    /// Store or update a DAA advisory.
+    pub fn set_daa_advisory(&self, advisory: DaaAdvisory) {
+        self.daa_advisories
+            .insert(advisory.advisory_id.clone(), advisory);
+    }
+
+    /// Mark a DAA advisory resolved.
+    pub fn resolve_daa_advisory(&self, advisory_id: &str) {
+        if let Some(mut entry) = self.daa_advisories.get_mut(advisory_id) {
+            entry.resolved = true;
+            entry.updated_at = chrono::Utc::now();
+        }
+    }
+
+    /// Get all DAA advisories.
+    pub fn get_daa_advisories(&self) -> Vec<DaaAdvisory> {
+        self.daa_advisories.iter().map(|r| r.value().clone()).collect()
     }
     
     /// Get all flight plans
@@ -249,6 +418,23 @@ impl AppState {
                     .unwrap_or(true); // No expiry = never expires
                 
                 is_control && not_acked && not_expired
+            })
+        } else {
+            false
+        }
+    }
+
+    /// Check if drone has an active HOLD command (non-expired, non-acknowledged).
+    pub fn has_active_hold_command(&self, drone_id: &str) -> bool {
+        let now = chrono::Utc::now();
+        if let Some(queue) = self.commands.get(drone_id) {
+            queue.iter().any(|cmd| {
+                let is_hold = matches!(cmd.command_type, atc_core::models::CommandType::Hold { .. });
+                let not_acked = !cmd.acknowledged;
+                let not_expired = cmd.expires_at
+                    .map(|exp| exp > now)
+                    .unwrap_or(true);
+                is_hold && not_acked && not_expired
             })
         } else {
             false
@@ -345,12 +531,15 @@ impl AppState {
     /// This removes all drones, conflicts, commands, flight plans, and geofences.
     pub fn clear_all(&self) {
         self.drones.clear();
+        self.drone_owners.clear();
+        self.external_traffic.clear();
         self.conflicts.clear();
         self.commands.clear();
         self.command_cooldowns.clear();
         self.flight_plans.clear();
         self.geofences.clear();
         self.conformance.clear();
+        self.daa_advisories.clear();
         
         // Reset the conflict detector
         if let Ok(mut detector) = self.detector.lock() {

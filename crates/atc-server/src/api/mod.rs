@@ -1,6 +1,7 @@
 //! API routes for the ATC server.
 
 pub mod commands;
+pub mod daa;
 pub mod flights;
 pub mod geofences;
 mod routes;

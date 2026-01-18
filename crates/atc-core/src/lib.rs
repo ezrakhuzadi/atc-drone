@@ -10,6 +10,6 @@ pub mod rules;
 pub mod spatial;
 
 pub use conflict::{Conflict, ConflictDetector, ConflictSeverity, DronePosition};
-pub use models::{Command, CommandType, DroneState, FlightPlan, FlightPlanRequest, FlightStatus, Telemetry, Waypoint, Geofence, GeofenceType, CreateGeofenceRequest};
+pub use models::{Command, CommandType, DroneState, FlightPlan, FlightPlanMetadata, FlightPlanRequest, FlightStatus, Telemetry, TrajectoryPoint, Waypoint, Geofence, GeofenceType, CreateGeofenceRequest, UpdateGeofenceRequest};
 pub use routing::{AvoidanceType, generate_avoidance_route, select_avoidance_type};
 pub use spatial::haversine_distance;

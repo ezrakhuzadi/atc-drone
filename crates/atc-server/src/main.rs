@@ -29,11 +29,14 @@ async fn main() -> Result<()> {
     let config = Config::from_env();
     let port = config.server_port;
     let state = Arc::new(AppState::new());
+    state.set_rid_view_bbox(config.rid_view_bbox.clone());
     
     // Start background loops
     tokio::spawn(loops::conflict_loop::run_conflict_loop(state.clone(), config.clone()));
     tokio::spawn(loops::conformance_loop::run_conformance_loop(state.clone(), config.clone()));
     tokio::spawn(loops::mission_loop::run_mission_loop(state.clone()));
+    tokio::spawn(loops::rid_sync_loop::run_rid_loop(state.clone(), config.clone()));
+    tokio::spawn(loops::geofence_sync_loop::run_geofence_sync_loop(state.clone(), config.clone()));
     tokio::spawn(loops::blender_sync_loop::run_blender_loop(state.clone(), config));
 
     // Build the app

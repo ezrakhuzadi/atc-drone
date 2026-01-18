@@ -13,7 +13,7 @@ pub async fn run_blender_loop(state: Arc<AppState>, config: Config) {
     let client = BlenderClient::new(
         config.blender_url,
         config.blender_session_id,
-        "server-backend-token" 
+        config.blender_auth_token,
     );
 
     let mut ticker = interval(Duration::from_millis(1000));

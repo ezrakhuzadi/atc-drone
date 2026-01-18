@@ -4,6 +4,7 @@
 //! and broadcasting updates as geofences to Blender.
 //! Issues REROUTE commands when critical conflicts are detected.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::interval;
@@ -14,7 +15,7 @@ use crate::state::AppState;
 use atc_blender::{BlenderClient, conflict_to_geofence};
 use atc_core::{
     ConflictSeverity, 
-    models::{Command, CommandType, Waypoint},
+    models::{Command, CommandType, DaaAdvisory, DaaSeverity, Waypoint},
     generate_avoidance_route, select_avoidance_type,
 };
 
@@ -30,7 +31,7 @@ pub async fn run_conflict_loop(state: Arc<AppState>, config: Config) {
     let blender = BlenderClient::new(
         &config.blender_url,
         &config.blender_session_id,
-        "", // Token is generated per-request
+        &config.blender_auth_token,
     );
 
     loop {
@@ -46,7 +47,9 @@ pub async fn run_conflict_loop(state: Arc<AppState>, config: Config) {
         state.purge_expired_commands();
 
         let conflicts = state.get_conflicts();
+        let mut active_daa_ids: HashSet<String> = HashSet::new();
         if conflicts.is_empty() {
+            resolve_inactive_conflict_advisories(state.as_ref(), &active_daa_ids);
             continue;
         }
 
@@ -57,16 +60,29 @@ pub async fn run_conflict_loop(state: Arc<AppState>, config: Config) {
 
         // Get current drone positions for geofence generation
         let drones = state.get_all_drones();
+        let external_tracks = state.get_external_traffic();
+        let external_by_id: HashMap<String, _> = external_tracks
+            .into_iter()
+            .map(|track| (track.traffic_id.clone(), track))
+            .collect();
 
         // Transform conflicts to geofences + issue REROUTE commands
         let mut geofences = Vec::with_capacity(conflicts.len());
         for conflict in &conflicts {
+            let conflict_key = format!("{}-{}", conflict.drone1_id, conflict.drone2_id);
+            let now = Utc::now();
             // Find drone positions
             let drone1 = drones.iter().find(|d| d.drone_id == conflict.drone1_id);
             let drone2 = drones.iter().find(|d| d.drone_id == conflict.drone2_id);
+            let external1 = external_by_id.get(&conflict.drone1_id);
+            let external2 = external_by_id.get(&conflict.drone2_id);
             
-            let drone1_pos = drone1.map(|d| (d.lat, d.lon, d.altitude_m));
-            let drone2_pos = drone2.map(|d| (d.lat, d.lon, d.altitude_m));
+            let drone1_pos = drone1
+                .map(|d| (d.lat, d.lon, d.altitude_m))
+                .or_else(|| external1.map(|t| (t.lat, t.lon, t.altitude_m)));
+            let drone2_pos = drone2
+                .map(|d| (d.lat, d.lon, d.altitude_m))
+                .or_else(|| external2.map(|t| (t.lat, t.lon, t.altitude_m)));
 
             let gf = conflict_to_geofence(conflict, drone1_pos, drone2_pos);
             
@@ -78,6 +94,58 @@ pub async fn run_conflict_loop(state: Arc<AppState>, config: Config) {
                 conflict.distance_m as i32,
                 gf.id
             );
+
+            let (severity, action) = match conflict.severity {
+                ConflictSeverity::Critical => (DaaSeverity::Critical, "reroute"),
+                ConflictSeverity::Warning => (DaaSeverity::Warning, "reroute"),
+                ConflictSeverity::Info => (DaaSeverity::Advisory, "monitor"),
+            };
+
+            if let Some(drone) = drone1 {
+                let advisory_id = format!("conflict-{}-{}", drone.drone_id, conflict.drone2_id);
+                active_daa_ids.insert(advisory_id.clone());
+                state.set_daa_advisory(DaaAdvisory {
+                    advisory_id,
+                    drone_id: drone.drone_id.clone(),
+                    owner_id: drone.owner_id.clone(),
+                    source: "conflict".to_string(),
+                    severity,
+                    action: action.to_string(),
+                    description: format!(
+                        "Conflict with {} ({:.0}m separation)",
+                        conflict.drone2_id,
+                        conflict.distance_m
+                    ),
+                    related_id: Some(conflict_key.clone()),
+                    record: None,
+                    created_at: now,
+                    updated_at: now,
+                    resolved: false,
+                });
+            }
+
+            if let Some(drone) = drone2 {
+                let advisory_id = format!("conflict-{}-{}", drone.drone_id, conflict.drone1_id);
+                active_daa_ids.insert(advisory_id.clone());
+                state.set_daa_advisory(DaaAdvisory {
+                    advisory_id,
+                    drone_id: drone.drone_id.clone(),
+                    owner_id: drone.owner_id.clone(),
+                    source: "conflict".to_string(),
+                    severity,
+                    action: action.to_string(),
+                    description: format!(
+                        "Conflict with {} ({:.0}m separation)",
+                        conflict.drone1_id,
+                        conflict.distance_m
+                    ),
+                    related_id: Some(conflict_key.clone()),
+                    record: None,
+                    created_at: now,
+                    updated_at: now,
+                    resolved: false,
+                });
+            }
             
             geofences.push(gf);
 
@@ -85,6 +153,81 @@ pub async fn run_conflict_loop(state: Arc<AppState>, config: Config) {
             // Issue REROUTE to the lower-priority drone (higher ID = newer = gives way)
             if matches!(conflict.severity, ConflictSeverity::Critical | ConflictSeverity::Warning) {
                 let now = Utc::now();
+
+                let drone1_external = drone1.is_none() && external1.is_some();
+                let drone2_external = drone2.is_none() && external2.is_some();
+                if drone1_external ^ drone2_external {
+                    let local_drone = if drone1_external { drone2 } else { drone1 };
+                    let external = if drone1_external { external1 } else { external2 };
+
+                    if let Some(gw) = local_drone {
+                        let give_way_id = gw.drone_id.clone();
+                        if state.can_issue_command(&give_way_id, COMMAND_COOLDOWN_SECS) {
+                            let conflict_point = Waypoint {
+                                lat: conflict.cpa_lat,
+                                lon: conflict.cpa_lon,
+                                altitude_m: conflict.cpa_altitude_m,
+                                speed_mps: Some(gw.speed_mps),
+                            };
+
+                            let current_pos = Waypoint {
+                                lat: gw.lat,
+                                lon: gw.lon,
+                                altitude_m: gw.altitude_m,
+                                speed_mps: Some(gw.speed_mps),
+                            };
+
+                            use atc_core::spatial::offset_by_bearing;
+                            let heading_rad = gw.heading_deg.to_radians();
+                            let (dest_lat, dest_lon) = offset_by_bearing(
+                                gw.lat, gw.lon,
+                                500.0,
+                                heading_rad
+                            );
+                            let destination = Waypoint {
+                                lat: dest_lat,
+                                lon: dest_lon,
+                                altitude_m: gw.altitude_m,
+                                speed_mps: Some(gw.speed_mps),
+                            };
+
+                            let priority_alt = external
+                                .map(|traffic| traffic.altitude_m)
+                                .unwrap_or(conflict.cpa_altitude_m);
+                            let avoidance_type = select_avoidance_type(
+                                gw.altitude_m,
+                                priority_alt,
+                                gw.altitude_m > 100.0,
+                            );
+
+                            let avoidance_waypoints = generate_avoidance_route(
+                                &current_pos,
+                                &destination,
+                                &conflict_point,
+                                avoidance_type,
+                            );
+
+                            let cmd = Command {
+                                command_id: format!("REROUTE-{}-{}", give_way_id, now.timestamp()),
+                                drone_id: give_way_id.clone(),
+                                command_type: CommandType::Reroute {
+                                    waypoints: avoidance_waypoints,
+                                    reason: Some("Conflict avoidance (external traffic)".to_string()),
+                                },
+                                issued_at: now,
+                                expires_at: Some(now + ChronoDuration::seconds(60)),
+                                acknowledged: false,
+                            };
+                            state.enqueue_command(cmd);
+                            state.mark_command_issued(&give_way_id);
+                            tracing::info!(
+                                "Auto-issued REROUTE to {} due to external traffic",
+                                give_way_id
+                            );
+                        }
+                    }
+                    continue;
+                }
                 
                 // Determine which drone should give way
                 let (give_way_id, priority_drone) = if conflict.drone1_id < conflict.drone2_id {
@@ -237,6 +380,21 @@ pub async fn run_conflict_loop(state: Arc<AppState>, config: Config) {
         } else {
             tracing::debug!("Synced {} conflict geofences to Blender", geofences.len());
         }
+
+        resolve_inactive_conflict_advisories(state.as_ref(), &active_daa_ids);
     }
 }
 
+fn resolve_inactive_conflict_advisories(state: &AppState, active_ids: &HashSet<String>) {
+    for advisory in state.get_daa_advisories() {
+        if advisory.source != "conflict" {
+            continue;
+        }
+        if active_ids.contains(&advisory.advisory_id) {
+            continue;
+        }
+        if !advisory.resolved {
+            state.resolve_daa_advisory(&advisory.advisory_id);
+        }
+    }
+}

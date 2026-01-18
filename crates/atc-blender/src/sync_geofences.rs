@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 use atc_core::{Conflict, ConflictSeverity};
+use chrono::{Duration as ChronoDuration, Utc};
 use serde::Serialize;
 use std::f64::consts::PI;
 
@@ -43,6 +44,37 @@ pub struct GeoJsonProperties {
     pub drone2_id: String,
     pub distance_m: f64,
     pub time_to_closest: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct BlenderGeofencePayload {
+    #[serde(rename = "type")]
+    payload_type: String,
+    features: Vec<BlenderGeofenceFeature>,
+}
+
+#[derive(Debug, Serialize)]
+struct BlenderGeofenceFeature {
+    #[serde(rename = "type")]
+    feature_type: String,
+    properties: BlenderGeofenceProperties,
+    geometry: BlenderGeofenceGeometry,
+}
+
+#[derive(Debug, Serialize)]
+struct BlenderGeofenceProperties {
+    name: String,
+    upper_limit: i32,
+    lower_limit: i32,
+    start_time: String,
+    end_time: String,
+}
+
+#[derive(Debug, Serialize)]
+struct BlenderGeofenceGeometry {
+    #[serde(rename = "type")]
+    geometry_type: String,
+    coordinates: Vec<Vec<[f64; 2]>>,
 }
 
 /// Generate a circular polygon (approximated with 32 points) around a center point.
@@ -129,6 +161,29 @@ pub fn conflict_to_geofence(
 
 use super::client::BlenderClient;
 
+fn build_blender_payload(geofence: &ConflictGeofence) -> BlenderGeofencePayload {
+    let start_time = Utc::now().to_rfc3339();
+    let end_time = (Utc::now() + ChronoDuration::hours(1)).to_rfc3339();
+
+    BlenderGeofencePayload {
+        payload_type: "FeatureCollection".to_string(),
+        features: vec![BlenderGeofenceFeature {
+            feature_type: "Feature".to_string(),
+            properties: BlenderGeofenceProperties {
+                name: geofence.name.clone(),
+                upper_limit: geofence.upper_limit,
+                lower_limit: geofence.lower_limit,
+                start_time,
+                end_time,
+            },
+            geometry: BlenderGeofenceGeometry {
+                geometry_type: geofence.raw_geo_fence.geometry.geometry_type.clone(),
+                coordinates: geofence.raw_geo_fence.geometry.coordinates.clone(),
+            },
+        }],
+    }
+}
+
 impl BlenderClient {
     /// Send conflict geofences to Blender.
     pub async fn send_conflict_geofences(&self, geofences: &[ConflictGeofence]) -> Result<u16> {
@@ -151,18 +206,17 @@ impl BlenderClient {
     }
 
     async fn send_geofence_request(&self, url: &str, geofence: &ConflictGeofence) -> Result<u16> {
-        let token = super::client::generate_dummy_jwt();
-        
+        let auth_header = self.auth_header();
+        let payload = build_blender_payload(geofence);
         let response = self
             .client
-            .post(url)
+            .put(url)
             .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", token))
-            .json(geofence)
+            .header("Authorization", auth_header)
+            .json(&payload)
             .send()
             .await?;
 
         Ok(response.status().as_u16())
     }
 }
-

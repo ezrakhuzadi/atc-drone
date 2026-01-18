@@ -11,7 +11,14 @@ use chrono::{Duration as ChronoDuration, Utc};
 use tokio::time::interval;
 
 use atc_blender::BlenderClient;
-use atc_core::models::{Command, CommandType, ConformanceRecord, ConformanceStatus};
+use atc_core::models::{
+    Command,
+    CommandType,
+    ConformanceRecord,
+    ConformanceStatus,
+    DaaAdvisory,
+    DaaSeverity,
+};
 
 use crate::config::Config;
 use crate::state::AppState;
@@ -25,7 +32,7 @@ pub async fn run_conformance_loop(state: Arc<AppState>, config: Config) {
     let blender = BlenderClient::new(
         &config.blender_url,
         &config.blender_session_id,
-        "", // Token is generated per-request
+        &config.blender_auth_token,
     );
 
     let mut ticker = interval(Duration::from_secs(CONFORMANCE_POLL_SECS));
@@ -61,8 +68,28 @@ pub async fn run_conformance_loop(state: Arc<AppState>, config: Config) {
 
             let previous = last_status.insert(drone.drone_id.clone(), status.status.clone());
             let record = status.record.as_ref();
+            let advisory_id = format!("conformance-{}", drone.drone_id);
 
             if status.status == "nonconforming" && requires_hold(record) {
+                let now = Utc::now();
+                let description = record
+                    .map(|entry| entry.description.clone())
+                    .unwrap_or_else(|| "Conformance issue detected".to_string());
+                state.set_daa_advisory(DaaAdvisory {
+                    advisory_id,
+                    drone_id: drone.drone_id.clone(),
+                    owner_id: drone.owner_id.clone(),
+                    source: "conformance".to_string(),
+                    severity: DaaSeverity::Critical,
+                    action: "hold".to_string(),
+                    description,
+                    related_id: record.and_then(|entry| entry.geofence_id.clone()),
+                    record: status.record.clone(),
+                    created_at: now,
+                    updated_at: now,
+                    resolved: false,
+                });
+
                 if !state.has_active_command(&drone.drone_id)
                     && state.can_issue_command(&drone.drone_id, CONFORMANCE_COMMAND_COOLDOWN_SECS)
                 {
@@ -84,7 +111,27 @@ pub async fn run_conformance_loop(state: Arc<AppState>, config: Config) {
                         drone.drone_id
                     );
                 }
+            } else if status.status == "nonconforming" {
+                let now = Utc::now();
+                let description = record
+                    .map(|entry| entry.description.clone())
+                    .unwrap_or_else(|| "Conformance issue detected".to_string());
+                state.set_daa_advisory(DaaAdvisory {
+                    advisory_id,
+                    drone_id: drone.drone_id.clone(),
+                    owner_id: drone.owner_id.clone(),
+                    source: "conformance".to_string(),
+                    severity: DaaSeverity::Warning,
+                    action: "monitor".to_string(),
+                    description,
+                    related_id: record.and_then(|entry| entry.geofence_id.clone()),
+                    record: status.record.clone(),
+                    created_at: now,
+                    updated_at: now,
+                    resolved: false,
+                });
             } else if status.status == "conforming" && previous.as_deref() == Some("nonconforming") {
+                state.resolve_daa_advisory(&advisory_id);
                 if !state.has_active_command(&drone.drone_id)
                     && state.can_issue_command(&drone.drone_id, CONFORMANCE_COMMAND_COOLDOWN_SECS)
                 {

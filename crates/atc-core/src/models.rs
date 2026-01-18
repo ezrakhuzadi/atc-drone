@@ -88,6 +88,9 @@ impl DroneState {
         self.velocity_y = telemetry.velocity_y;
         self.velocity_z = telemetry.velocity_z;
         self.last_update = telemetry.timestamp;
+        if telemetry.owner_id.is_some() {
+            self.owner_id = telemetry.owner_id.clone();
+        }
         self.status = DroneStatus::Active;
     }
 }
@@ -97,7 +100,12 @@ impl DroneState {
 pub struct FlightPlan {
     pub flight_id: String,
     pub drone_id: String,
+    pub owner_id: Option<String>,
     pub waypoints: Vec<Waypoint>,
+    #[serde(default)]
+    pub trajectory_log: Option<Vec<TrajectoryPoint>>,
+    #[serde(default)]
+    pub metadata: Option<FlightPlanMetadata>,
     pub status: FlightStatus,
     /// Scheduled departure time
     pub departure_time: DateTime<Utc>,
@@ -109,8 +117,13 @@ pub struct FlightPlan {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlightPlanRequest {
     pub drone_id: String,
+    pub owner_id: Option<String>,
     /// If provided, specific waypoints are used. If not, a route is generated.
     pub waypoints: Option<Vec<Waypoint>>,
+    #[serde(default)]
+    pub trajectory_log: Option<Vec<TrajectoryPoint>>,
+    #[serde(default)]
+    pub metadata: Option<FlightPlanMetadata>,
     /// Alternatively, provide origin/destination for auto-generation
     pub origin: Option<Waypoint>,
     pub destination: Option<Waypoint>,
@@ -124,6 +137,40 @@ pub struct Waypoint {
     pub lon: f64,
     pub altitude_m: f64,
     pub speed_mps: Option<f64>,
+}
+
+/// Time-stamped trajectory point for high-fidelity conflict checks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrajectoryPoint {
+    pub lat: f64,
+    pub lon: f64,
+    #[serde(alias = "alt")]
+    pub altitude_m: f64,
+    #[serde(default, alias = "time_offset")]
+    pub time_offset_s: Option<f64>,
+}
+
+/// Metadata captured with a flight plan submission.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlightPlanMetadata {
+    #[serde(default)]
+    pub drone_speed_mps: Option<f64>,
+    #[serde(default)]
+    pub total_distance_m: Option<f64>,
+    #[serde(default)]
+    pub total_flight_time_s: Option<f64>,
+    #[serde(default)]
+    pub trajectory_points: Option<u64>,
+    #[serde(default)]
+    pub planned_altitude_m: Option<f64>,
+    #[serde(default)]
+    pub max_obstacle_height_m: Option<f64>,
+    #[serde(default)]
+    pub faa_compliant: Option<bool>,
+    #[serde(default)]
+    pub submitted_at: Option<String>,
+    #[serde(default)]
+    pub blender_declaration_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -232,6 +279,35 @@ pub struct ConformanceStatus {
     pub record: Option<ConformanceRecord>,
 }
 
+// ========== DAA (DETECT AND AVOID) ========== 
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DaaSeverity {
+    Advisory,
+    Warning,
+    Critical,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaaAdvisory {
+    pub advisory_id: String,
+    pub drone_id: String,
+    pub owner_id: Option<String>,
+    /// Advisory source (conformance, conflict, or other backend)
+    pub source: String,
+    pub severity: DaaSeverity,
+    /// Recommended action (monitor, hold, reroute)
+    pub action: String,
+    pub description: String,
+    /// Optional related identifier (conflict id, geofence id, etc.)
+    pub related_id: Option<String>,
+    pub record: Option<ConformanceRecord>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub resolved: bool,
+}
+
 /// Request to create a new geofence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateGeofenceRequest {
@@ -240,6 +316,17 @@ pub struct CreateGeofenceRequest {
     pub polygon: Vec<[f64; 2]>,
     pub lower_altitude_m: Option<f64>,
     pub upper_altitude_m: Option<f64>,
+}
+
+/// Request to update an existing geofence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateGeofenceRequest {
+    pub name: Option<String>,
+    pub geofence_type: Option<GeofenceType>,
+    pub polygon: Option<Vec<[f64; 2]>>,
+    pub lower_altitude_m: Option<f64>,
+    pub upper_altitude_m: Option<f64>,
+    pub active: Option<bool>,
 }
 
 impl Geofence {

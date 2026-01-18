@@ -6,6 +6,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use serde_json::Value;
 
 /// Generate a dummy JWT token that Blender will accept.
 /// Blender with BYPASS_AUTH_TOKEN_VERIFICATION=1 still validates:
@@ -36,6 +37,7 @@ pub struct BlenderClient {
     pub(crate) client: Client,
     pub(crate) base_url: String,
     pub(crate) session_id: String,
+    pub(crate) auth_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,12 +72,18 @@ struct ObservationRequest {
 
 impl BlenderClient {
     /// Create a new Blender client.
-    /// Note: Token is not needed as we generate a dummy JWT for each request.
+    /// If a token is provided, it will be used for all requests; otherwise a dummy JWT is generated.
     pub fn new(
         base_url: impl Into<String>,
         session_id: impl Into<String>,
-        _token: impl Into<String>, // Kept for API compatibility, but unused
+        token: impl Into<String>,
     ) -> Self {
+        let token = token.into();
+        let auth_token = if token.trim().is_empty() {
+            None
+        } else {
+            Some(token)
+        };
         Self {
             client: Client::builder()
                 .timeout(Duration::from_secs(10))
@@ -83,7 +91,16 @@ impl BlenderClient {
                 .expect("Failed to create HTTP client"),
             base_url: base_url.into(),
             session_id: session_id.into(),
+            auth_token,
         }
+    }
+
+    pub(crate) fn auth_header(&self) -> String {
+        let token = self
+            .auth_token
+            .clone()
+            .unwrap_or_else(generate_dummy_jwt);
+        format!("Bearer {}", token)
     }
 
     /// Send telemetry observation to Blender.
@@ -152,14 +169,14 @@ impl BlenderClient {
     }
 
     async fn send_request(&self, url: &str, request: &ObservationRequest) -> Result<u16> {
-        // Generate a fresh JWT for each request (handles token expiration)
-        let token = generate_dummy_jwt();
+        // Resolve auth token (configured or dummy)
+        let auth_header = self.auth_header();
         
         let response = self
             .client
             .post(url)
             .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", token))
+            .header("Authorization", auth_header)
             .json(request)
             .send()
             .await
@@ -175,12 +192,12 @@ impl BlenderClient {
             self.base_url, aircraft_id
         );
 
-        let token = generate_dummy_jwt();
+        let auth_header = self.auth_header();
 
         let response = self
             .client
             .get(&url)
-            .header("Authorization", format!("Bearer {}", token))
+            .header("Authorization", auth_header)
             .send()
             .await
             .context("Failed to fetch conformance status")?;
@@ -201,5 +218,156 @@ impl BlenderClient {
             .context("Failed to parse conformance status response")?;
 
         Ok(payload)
+    }
+
+    /// Create a DSS Remote ID subscription for a viewport.
+    pub async fn create_rid_subscription(&self, view: &str) -> Result<String> {
+        let url = format!(
+            "{}/rid/create_dss_subscription",
+            self.base_url
+        );
+
+        let auth_header = self.auth_header();
+
+        let response = self
+            .client
+            .put(&url)
+            .header("Authorization", auth_header)
+            .query(&[("view", view)])
+            .send()
+            .await
+            .context("Failed to create RID subscription")?;
+
+        let status = response.status();
+        let payload: Value = response
+            .json()
+            .await
+            .context("Failed to parse RID subscription response")?;
+
+        if !status.is_success() {
+            return Err(anyhow::anyhow!(
+                "RID subscription request failed: {} {}",
+                status,
+                payload
+            ));
+        }
+
+        let subscription_id = payload
+            .get("dss_subscription_response")
+            .and_then(|value| value.get("dss_subscription_id"))
+            .and_then(|value| value.as_str())
+            .or_else(|| payload.get("dss_subscription_id").and_then(|value| value.as_str()))
+            .ok_or_else(|| anyhow::anyhow!("RID subscription missing ID"))?;
+
+        Ok(subscription_id.to_string())
+    }
+
+    /// Fetch RID data for a DSS subscription.
+    pub async fn fetch_rid_data(&self, subscription_id: &str) -> Result<Value> {
+        let url = format!(
+            "{}/rid/get_rid_data/{}",
+            self.base_url, subscription_id
+        );
+
+        let auth_header = self.auth_header();
+
+        let response = self
+            .client
+            .get(&url)
+            .header("Authorization", auth_header)
+            .send()
+            .await
+            .context("Failed to fetch RID data")?;
+
+        if response.status().as_u16() == 404 {
+            return Ok(Value::Array(Vec::new()));
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!(
+                "RID data request failed: {} {}",
+                status,
+                body
+            ));
+        }
+
+        let payload: Value = response
+            .json()
+            .await
+            .context("Failed to parse RID data response")?;
+
+        Ok(payload)
+    }
+
+    /// Create a geofence in Flight Blender and return its ID.
+    pub async fn create_geofence(&self, payload: &Value) -> Result<String> {
+        let url = format!("{}/geo_fence_ops/set_geo_fence", self.base_url);
+        let auth_header = self.auth_header();
+
+        let response = self
+            .client
+            .put(&url)
+            .header("Content-Type", "application/json")
+            .header("Authorization", auth_header)
+            .json(payload)
+            .send()
+            .await
+            .context("Failed to create geofence")?;
+
+        let status = response.status();
+        let body: Value = response
+            .json()
+            .await
+            .context("Failed to parse geofence response")?;
+
+        if !status.is_success() {
+            return Err(anyhow::anyhow!(
+                "Geofence create failed: {} {}",
+                status,
+                body
+            ));
+        }
+
+        let geofence_id = body
+            .get("id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Geofence response missing ID"))?;
+
+        Ok(geofence_id.to_string())
+    }
+
+    /// Delete a geofence in Flight Blender by ID.
+    pub async fn delete_geofence(&self, geofence_id: &str) -> Result<()> {
+        let url = format!(
+            "{}/geo_fence_ops/geo_fence/{}/delete",
+            self.base_url, geofence_id
+        );
+        let auth_header = self.auth_header();
+
+        let response = self
+            .client
+            .delete(&url)
+            .header("Authorization", auth_header)
+            .send()
+            .await
+            .context("Failed to delete geofence")?;
+
+        if response.status().as_u16() == 404 {
+            return Ok(());
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!(
+                "Geofence delete failed: {} {}",
+                status,
+                body
+            ));
+        }
+
+        Ok(())
     }
 }

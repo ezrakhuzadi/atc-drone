@@ -1,11 +1,14 @@
 //! Spatial math for conflict detection and distance calculations.
 
-use crate::models::FlightPlan;
+use crate::models::{FlightPlan, TrajectoryPoint};
+use std::cmp::Ordering;
 
 // Minimum separation distance in meters
 const MIN_SEPARATION_M: f64 = 50.0;
 // Minimum vertical separation in meters
 const MIN_VERTICAL_SEP_M: f64 = 30.0;
+const TIME_SAMPLE_SECS_MIN: f64 = 0.5;
+const TIME_SAMPLE_SECS_MAX: f64 = 2.0;
 
 /// Check if two flight plans conflict.
 /// 
@@ -14,6 +17,10 @@ const MIN_VERTICAL_SEP_M: f64 = 30.0;
 /// 
 /// Returns true if conflict found.
 pub fn check_plan_conflict(new_plan: &FlightPlan, existing_plan: &FlightPlan) -> bool {
+    if let (Some(path1), Some(path2)) = (build_timed_path(new_plan), build_timed_path(existing_plan)) {
+        return check_timed_conflict(&path1, &path2);
+    }
+
     // 1. Check time overlap window
     let start1 = new_plan.departure_time;
     let end1 = new_plan.waypoints.last().map(|_| start1 + chrono::Duration::seconds(600)).unwrap_or(start1);
@@ -70,6 +77,134 @@ pub fn check_plan_conflict(new_plan: &FlightPlan, existing_plan: &FlightPlan) ->
     }
     
     false
+}
+
+#[derive(Debug, Clone)]
+struct TimedPoint {
+    time_s: f64,
+    lat: f64,
+    lon: f64,
+    altitude_m: f64,
+}
+
+fn build_timed_path(plan: &FlightPlan) -> Option<Vec<TimedPoint>> {
+    let trajectory = plan.trajectory_log.as_ref()?;
+    let base_time = plan.departure_time.timestamp_millis() as f64 / 1000.0;
+
+    let mut points: Vec<TimedPoint> = trajectory
+        .iter()
+        .filter_map(|point| to_timed_point(point, base_time))
+        .collect();
+
+    if points.len() < 2 {
+        return None;
+    }
+
+    points.sort_by(|a, b| a.time_s.partial_cmp(&b.time_s).unwrap_or(Ordering::Equal));
+    Some(points)
+}
+
+fn to_timed_point(point: &TrajectoryPoint, base_time: f64) -> Option<TimedPoint> {
+    let offset = point.time_offset_s?;
+    if !offset.is_finite() || offset < 0.0 {
+        return None;
+    }
+    Some(TimedPoint {
+        time_s: base_time + offset,
+        lat: point.lat,
+        lon: point.lon,
+        altitude_m: point.altitude_m,
+    })
+}
+
+fn check_timed_conflict(path1: &[TimedPoint], path2: &[TimedPoint]) -> bool {
+    let Some(first1) = path1.first() else {
+        return false;
+    };
+    let Some(first2) = path2.first() else {
+        return false;
+    };
+    let Some(last1) = path1.last() else {
+        return false;
+    };
+    let Some(last2) = path2.last() else {
+        return false;
+    };
+
+    let start = first1.time_s.max(first2.time_s);
+    let end = last1.time_s.min(last2.time_s);
+    if start > end {
+        return false;
+    }
+
+    let step1 = derive_sample_step(path1);
+    let step2 = derive_sample_step(path2);
+    let step = step1.min(step2).clamp(TIME_SAMPLE_SECS_MIN, TIME_SAMPLE_SECS_MAX);
+
+    let mut t = start;
+    let mut idx1 = 0usize;
+    let mut idx2 = 0usize;
+
+    while t <= end {
+        let pos1 = interpolate_position(path1, t, &mut idx1);
+        let pos2 = interpolate_position(path2, t, &mut idx2);
+
+        if let (Some(p1), Some(p2)) = (pos1, pos2) {
+            let dist = haversine_distance(p1.lat, p1.lon, p2.lat, p2.lon);
+            let alt_diff = (p1.altitude_m - p2.altitude_m).abs();
+            if dist < MIN_SEPARATION_M && alt_diff < MIN_VERTICAL_SEP_M {
+                return true;
+            }
+        }
+
+        t += step;
+    }
+
+    false
+}
+
+fn derive_sample_step(path: &[TimedPoint]) -> f64 {
+    if path.len() < 2 {
+        return 1.0;
+    }
+    let delta = (path[1].time_s - path[0].time_s).abs();
+    if delta.is_finite() && delta > 0.0 {
+        delta
+    } else {
+        1.0
+    }
+}
+
+fn interpolate_position(path: &[TimedPoint], t: f64, index: &mut usize) -> Option<TimedPoint> {
+    if path.is_empty() {
+        return None;
+    }
+    if t < path.first()?.time_s || t > path.last()?.time_s {
+        return None;
+    }
+
+    while *index + 1 < path.len() && path[*index + 1].time_s < t {
+        *index += 1;
+    }
+
+    let current = &path[*index];
+    if (current.time_s - t).abs() < f64::EPSILON {
+        return Some(current.clone());
+    }
+
+    let next = path.get(*index + 1)?;
+    let span = next.time_s - current.time_s;
+    if span <= 0.0 {
+        return Some(current.clone());
+    }
+
+    let ratio = ((t - current.time_s) / span).clamp(0.0, 1.0);
+    Some(TimedPoint {
+        time_s: t,
+        lat: current.lat + (next.lat - current.lat) * ratio,
+        lon: current.lon + (next.lon - current.lon) * ratio,
+        altitude_m: current.altitude_m + (next.altitude_m - current.altitude_m) * ratio,
+    })
 }
 
 /// Check if two altitude ranges overlap (with separation buffer).
@@ -275,4 +410,3 @@ mod tests {
         assert!(dist < 0.001);
     }
 }
-
