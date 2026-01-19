@@ -17,6 +17,7 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 axum.workspace = true
+axum-server = { version = "0.6", features = ["tls-rustls"] }
 tower.workspace = true
 tower-http.workspace = true
 dashmap.workspace = true
@@ -26,4 +27,13 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 chrono.workspace = true
 futures = "0.3.31"
+reqwest = { version = "0.12", features = ["json"] }
 uuid = { version = "1.19.0", features = ["v4"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util", "macros"] }
+atc-core.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
+hyper = "1"

@@ -338,6 +338,156 @@ impl BlenderClient {
         Ok(geofence_id.to_string())
     }
 
+    /// Fetch geofences from Flight Blender (optionally filtered by view bbox).
+    pub async fn fetch_geofences(&self, view: Option<&str>) -> Result<Vec<Value>> {
+        let auth_header = self.auth_header();
+        let mut results: Vec<Value> = Vec::new();
+        let mut next_url = Some(format!("{}/geo_fence_ops/geo_fence", self.base_url));
+        let mut first = true;
+
+        while let Some(url) = next_url {
+            let mut request = self
+                .client
+                .get(&url)
+                .header("Authorization", auth_header.clone());
+
+            if first {
+                if let Some(view) = view {
+                    if !view.trim().is_empty() {
+                        request = request.query(&[("view", view)]);
+                    }
+                }
+                first = false;
+            }
+
+            let response = request
+                .send()
+                .await
+                .context("Failed to fetch geofences")?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                return Err(anyhow::anyhow!(
+                    "Geofence fetch failed: {} {}",
+                    status,
+                    body
+                ));
+            }
+
+            let payload: Value = response
+                .json()
+                .await
+                .context("Failed to parse geofence response")?;
+
+            if let Some(entries) = payload.as_array() {
+                results.extend(entries.iter().cloned());
+                next_url = None;
+                continue;
+            }
+
+            if let Some(entries) = payload.get("results").and_then(|v| v.as_array()) {
+                results.extend(entries.iter().cloned());
+                next_url = payload
+                    .get("next")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                continue;
+            }
+
+            next_url = None;
+        }
+
+        Ok(results)
+    }
+
+    /// Fetch flight declarations from Flight Blender.
+    pub async fn fetch_flight_declarations(&self) -> Result<Vec<Value>> {
+        let auth_header = self.auth_header();
+        let mut results: Vec<Value> = Vec::new();
+        let mut next_url = Some(format!(
+            "{}/flight_declaration_ops/flight_declaration",
+            self.base_url
+        ));
+
+        while let Some(url) = next_url {
+            let response = self
+                .client
+                .get(&url)
+                .header("Authorization", auth_header.clone())
+                .send()
+                .await
+                .context("Failed to fetch flight declarations")?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                return Err(anyhow::anyhow!(
+                    "Flight declarations fetch failed: {} {}",
+                    status,
+                    body
+                ));
+            }
+
+            let payload: Value = response
+                .json()
+                .await
+                .context("Failed to parse flight declarations response")?;
+
+            if let Some(entries) = payload.as_array() {
+                results.extend(entries.iter().cloned());
+                next_url = None;
+                continue;
+            }
+
+            if let Some(entries) = payload.get("results").and_then(|v| v.as_array()) {
+                results.extend(entries.iter().cloned());
+                next_url = payload
+                    .get("next")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                continue;
+            }
+
+            next_url = None;
+        }
+
+        Ok(results)
+    }
+
+    /// Check whether a flight declaration exists in Flight Blender.
+    pub async fn flight_declaration_exists(&self, declaration_id: &str) -> Result<bool> {
+        let url = format!(
+            "{}/flight_declaration_ops/flight_declaration/{}",
+            self.base_url, declaration_id
+        );
+        let auth_header = self.auth_header();
+
+        let response = self
+            .client
+            .get(&url)
+            .header("Authorization", auth_header)
+            .send()
+            .await
+            .context("Failed to fetch flight declaration")?;
+
+        if response.status().as_u16() == 404 {
+            return Ok(false);
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!(
+                "Flight declaration lookup failed: {} {}",
+                status,
+                body
+            ));
+        }
+
+        Ok(true)
+    }
+
     /// Delete a geofence in Flight Blender by ID.
     pub async fn delete_geofence(&self, geofence_id: &str) -> Result<()> {
         let url = format!(

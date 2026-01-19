@@ -1,0 +1,736 @@
+openapi: 3.0.3
+info:
+  title: ATC-Drone API
+  version: "1.0.0"
+  description: REST + WebSocket API for the ATC Drone Traffic Control system.
+servers:
+  - url: http://localhost:3000
+tags:
+  - name: Drones
+  - name: Telemetry
+  - name: Conflicts
+  - name: Geofences
+  - name: Commands
+  - name: Flights
+  - name: Admin
+paths:
+  /health:
+    get:
+      summary: Health check
+      responses:
+        "200":
+          description: OK
+  /v1/drones/register:
+    post:
+      tags: [Drones]
+      summary: Register a drone
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterRequest"
+      responses:
+        "201":
+          description: Registered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegisterResponse"
+  /v1/drones:
+    get:
+      tags: [Drones]
+      summary: List registered drones
+      parameters:
+        - in: query
+          name: owner_id
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Drones
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/DroneState"
+  /v1/traffic:
+    get:
+      tags: [Drones]
+      summary: List traffic (local + optional external)
+      parameters:
+        - in: query
+          name: owner_id
+          schema:
+            type: string
+        - in: query
+          name: include_external
+          schema:
+            type: boolean
+        - in: query
+          name: source
+          schema:
+            type: string
+        - in: query
+          name: external_only
+          schema:
+            type: boolean
+      responses:
+        "200":
+          description: Traffic
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TrafficState"
+  /v1/telemetry:
+    post:
+      tags: [Telemetry]
+      summary: Submit telemetry
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Telemetry"
+      responses:
+        "202":
+          description: Accepted
+  /v1/conflicts:
+    get:
+      tags: [Conflicts]
+      summary: List active conflicts
+      parameters:
+        - in: query
+          name: owner_id
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Conflicts
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Conflict"
+  /v1/geofences:
+    get:
+      tags: [Geofences]
+      summary: List geofences
+      responses:
+        "200":
+          description: Geofences
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Geofence"
+    post:
+      tags: [Geofences]
+      summary: Create geofence
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GeofenceRequest"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Geofence"
+  /v1/geofences/{id}:
+    get:
+      tags: [Geofences]
+      summary: Get geofence
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Geofence
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Geofence"
+    put:
+      tags: [Geofences]
+      summary: Update geofence
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GeofenceRequest"
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Geofence"
+    delete:
+      tags: [Geofences]
+      summary: Delete geofence
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Deleted
+  /v1/geofences/check-route:
+    post:
+      tags: [Geofences]
+      summary: Check route against geofences
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RouteCheckRequest"
+      responses:
+        "200":
+          description: Result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RouteCheckResponse"
+  /v1/commands:
+    get:
+      tags: [Commands]
+      summary: List pending commands
+      responses:
+        "200":
+          description: Commands
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Command"
+    post:
+      tags: [Commands]
+      summary: Issue command
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IssueCommandRequest"
+      responses:
+        "200":
+          description: Queued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IssueCommandResponse"
+  /v1/commands/next:
+    get:
+      tags: [Commands]
+      summary: Poll next command
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: drone_id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Command
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Command"
+  /v1/commands/ack:
+    post:
+      tags: [Commands]
+      summary: Acknowledge command
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AckCommandRequest"
+      responses:
+        "200":
+          description: Acknowledged
+  /v1/commands/ws:
+    get:
+      tags: [Commands]
+      summary: WebSocket command stream
+      description: |
+        WebSocket stream for command push. Pass Authorization: Bearer <session_token>
+        or a token query param plus optional drone_id filter.
+      x-websocket: true
+  /v1/ws:
+    get:
+      summary: WebSocket realtime stream
+      description: WebSocket stream for realtime drone updates.
+      x-websocket: true
+  /v1/flights:
+    get:
+      tags: [Flights]
+      summary: List flight plans
+      parameters:
+        - in: query
+          name: owner_id
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Flight plans
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/FlightPlan"
+    post:
+      tags: [Flights]
+      summary: Create flight plan (compat)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FlightPlanRequest"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FlightPlan"
+  /v1/flights/plan:
+    post:
+      tags: [Flights]
+      summary: Create flight plan
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FlightPlanRequest"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FlightPlan"
+  /v1/rid/view:
+    post:
+      tags: [Drones]
+      summary: Update RID view bounding box
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RidViewRequest"
+      responses:
+        "200":
+          description: Updated
+  /v1/conformance:
+    get:
+      tags: [Drones]
+      summary: List conformance statuses
+      parameters:
+        - in: query
+          name: owner_id
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Conformance statuses
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ConformanceStatus"
+  /v1/daa:
+    get:
+      tags: [Drones]
+      summary: List DAA advisories
+      responses:
+        "200":
+          description: Advisories
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/DaaAdvisory"
+  /v1/admin/reset:
+    post:
+      tags: [Admin]
+      summary: Reset all server state
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminResetRequest"
+      responses:
+        "200":
+          description: Reset complete
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: UUID
+  schemas:
+    RegisterRequest:
+      type: object
+      properties:
+        drone_id:
+          type: string
+        owner_id:
+          type: string
+        drone_type:
+          type: string
+      required: []
+    RegisterResponse:
+      type: object
+      required: [drone_id, session_token]
+      properties:
+        drone_id:
+          type: string
+        session_token:
+          type: string
+    Telemetry:
+      type: object
+      required: [drone_id, lat, lon, altitude_m, timestamp]
+      properties:
+        drone_id:
+          type: string
+        owner_id:
+          type: string
+        lat:
+          type: number
+          format: double
+        lon:
+          type: number
+          format: double
+        altitude_m:
+          type: number
+          format: double
+        heading_deg:
+          type: number
+        speed_mps:
+          type: number
+        velocity_x:
+          type: number
+        velocity_y:
+          type: number
+        velocity_z:
+          type: number
+        timestamp:
+          type: string
+          format: date-time
+    DroneState:
+      type: object
+      properties:
+        drone_id:
+          type: string
+        owner_id:
+          type: string
+        lat:
+          type: number
+        lon:
+          type: number
+        altitude_m:
+          type: number
+        heading_deg:
+          type: number
+        speed_mps:
+          type: number
+        velocity_x:
+          type: number
+        velocity_y:
+          type: number
+        velocity_z:
+          type: number
+        last_update:
+          type: string
+          format: date-time
+        status:
+          type: string
+    TrafficState:
+      type: object
+      properties:
+        drone_id:
+          type: string
+        owner_id:
+          type: string
+        lat:
+          type: number
+        lon:
+          type: number
+        altitude_m:
+          type: number
+        heading_deg:
+          type: number
+        speed_mps:
+          type: number
+        last_update:
+          type: string
+          format: date-time
+        status:
+          type: string
+        traffic_source:
+          type: string
+    Conflict:
+      type: object
+      properties:
+        drone1_id:
+          type: string
+        drone2_id:
+          type: string
+        distance_m:
+          type: number
+        severity:
+          type: string
+        time_to_collision_s:
+          type: number
+    Geofence:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        geofence_type:
+          type: string
+        polygon:
+          type: array
+          items:
+            type: array
+            items:
+              type: number
+        lower_altitude_m:
+          type: number
+        upper_altitude_m:
+          type: number
+        active:
+          type: boolean
+    GeofenceRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        geofence_type:
+          type: string
+        polygon:
+          type: array
+          items:
+            type: array
+            items:
+              type: number
+        lower_altitude_m:
+          type: number
+        upper_altitude_m:
+          type: number
+      required: [name, geofence_type, polygon]
+    RouteCheckRequest:
+      type: object
+      properties:
+        route:
+          type: array
+          items:
+            $ref: "#/components/schemas/Waypoint"
+      required: [route]
+    RouteCheckResponse:
+      type: object
+      properties:
+        blocked:
+          type: boolean
+        intersecting_geofences:
+          type: array
+          items:
+            $ref: "#/components/schemas/Geofence"
+    Waypoint:
+      type: object
+      properties:
+        lat:
+          type: number
+        lon:
+          type: number
+        altitude_m:
+          type: number
+        speed_mps:
+          type: number
+    Command:
+      type: object
+      properties:
+        command_id:
+          type: string
+        drone_id:
+          type: string
+        command_type:
+          type: object
+        issued_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        acknowledged:
+          type: boolean
+    IssueCommandRequest:
+      type: object
+      properties:
+        drone_id:
+          type: string
+        owner_id:
+          type: string
+        expires_in_secs:
+          type: integer
+        command_type:
+          type: object
+      required: [drone_id]
+    IssueCommandResponse:
+      type: object
+      properties:
+        command_id:
+          type: string
+        drone_id:
+          type: string
+        status:
+          type: string
+    AckCommandRequest:
+      type: object
+      properties:
+        command_id:
+          type: string
+      required: [command_id]
+    FlightPlanRequest:
+      type: object
+      properties:
+        drone_id:
+          type: string
+        owner_id:
+          type: string
+        waypoints:
+          type: array
+          items:
+            $ref: "#/components/schemas/Waypoint"
+        trajectory_log:
+          type: array
+          items:
+            $ref: "#/components/schemas/Waypoint"
+        departure_time:
+          type: string
+          format: date-time
+      required: [drone_id]
+    FlightPlan:
+      type: object
+      properties:
+        flight_id:
+          type: string
+        drone_id:
+          type: string
+        owner_id:
+          type: string
+        waypoints:
+          type: array
+          items:
+            $ref: "#/components/schemas/Waypoint"
+        status:
+          type: string
+        departure_time:
+          type: string
+          format: date-time
+        arrival_time:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+    RidViewRequest:
+      type: object
+      properties:
+        min_lat:
+          type: number
+        min_lon:
+          type: number
+        max_lat:
+          type: number
+        max_lon:
+          type: number
+      required: [min_lat, min_lon, max_lat, max_lon]
+    ConformanceStatus:
+      type: object
+      properties:
+        drone_id:
+          type: string
+        owner_id:
+          type: string
+        status:
+          type: string
+        last_checked:
+          type: string
+          format: date-time
+    DaaAdvisory:
+      type: object
+      properties:
+        advisory_id:
+          type: string
+        drone_id:
+          type: string
+        owner_id:
+          type: string
+        source:
+          type: string
+        severity:
+          type: string
+        action:
+          type: string
+        description:
+          type: string
+        related_id:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        resolved:
+          type: boolean
+    AdminResetRequest:
+      type: object
+      properties:
+        confirm:
+          type: string
+        require_idle:
+          type: boolean
+      required: [confirm]

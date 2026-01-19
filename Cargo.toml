@@ -44,3 +44,6 @@ clap = { version = "4", features = ["derive"] }
 atc-core = { path = "crates/atc-core" }
 atc-blender = { path = "crates/atc-blender" }
 atc-sdk = { path = "crates/atc-sdk" }
+
+[patch.crates-io]
+axum-server = { path = "vendor/axum-server-0.6.0" }

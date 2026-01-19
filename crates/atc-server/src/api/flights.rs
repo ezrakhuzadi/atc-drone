@@ -1,5 +1,7 @@
 use crate::state::store::AppState;
+use crate::compliance::{self, ComplianceEvaluation, RoutePoint};
 use atc_core::models::{FlightPlan, FlightPlanMetadata, FlightPlanRequest, FlightStatus, GeofenceType, TrajectoryPoint, Waypoint};
+use atc_blender::BlenderClient;
 use atc_core::routing::generate_random_route;
 use axum::{extract::{State, Query}, http::StatusCode, response::IntoResponse, Json};
 use chrono::Utc;
@@ -15,6 +17,7 @@ pub(crate) struct PlannerWaypoint {
     lon: f64,
     #[serde(alias = "altitude_m")]
     alt: f64,
+    #[allow(dead_code)]
     #[serde(default, alias = "time_offset_s")]
     time_offset: Option<f64>,
 }
@@ -41,6 +44,18 @@ pub(crate) struct PlannerMetadata {
     submitted_at: Option<String>,
     #[serde(default)]
     blender_declaration_id: Option<String>,
+    #[serde(default)]
+    operation_type: Option<u8>,
+    #[serde(default)]
+    battery_capacity_min: Option<f64>,
+    #[serde(default)]
+    battery_reserve_min: Option<f64>,
+    #[serde(default)]
+    clearance_m: Option<f64>,
+    #[serde(default)]
+    compliance_override_enabled: Option<bool>,
+    #[serde(default)]
+    compliance_override_notes: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,28 +82,23 @@ pub struct FlightPlansQuery {
     pub owner_id: Option<String>,
 }
 
-#[derive(Clone, Copy)]
-struct RoutePoint {
-    lat: f64,
-    lon: f64,
-    altitude_m: f64,
-}
-
 pub async fn create_flight_plan(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<FlightPlanRequest>,
 ) -> Result<(StatusCode, Json<FlightPlan>), (StatusCode, Json<serde_json::Value>)> {
+    let mut payload = payload;
     enforce_owner_for_drone(state.as_ref(), &payload.drone_id, payload.owner_id.as_deref())?;
-    let violations = validate_flight_plan(state.as_ref(), &payload);
-    if !violations.is_empty() {
+    let validation = validate_flight_plan(state.as_ref(), &payload).await;
+    if !validation.violations.is_empty() {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(json!({
                 "error": "Flight plan rejected",
-                "violations": violations
+                "violations": validation.violations
             })),
         ));
     }
+    apply_compliance_metadata(&mut payload.metadata, validation.compliance.as_ref());
     let plan = build_plan(state.as_ref(), payload, None);
     Ok((StatusCode::CREATED, Json(plan)))
 }
@@ -97,25 +107,42 @@ pub async fn create_flight_plan_compat(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<FlightPlanSubmission>,
 ) -> Result<(StatusCode, Json<FlightPlan>), (StatusCode, Json<serde_json::Value>)> {
-    let (request, requested_flight_id) = match payload {
-        FlightPlanSubmission::Atc(request) => (request, None),
+    let (mut request, requested_flight_id, requires_trajectory) = match payload {
+        FlightPlanSubmission::Atc(request) => (request, None, false),
         FlightPlanSubmission::Planner(request) => {
             let flight_id = request.flight_id.clone();
-            (planner_to_request(request), Some(flight_id))
+            (planner_to_request(request), Some(flight_id), true)
         }
     };
 
+    if requires_trajectory {
+        let trajectory_len = request.trajectory_log.as_ref().map(|log| log.len()).unwrap_or(0);
+        if trajectory_len < 2 {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "error": "Flight plan rejected",
+                    "violations": [{
+                        "type": "trajectory",
+                        "message": "Trajectory log is required for planner submissions"
+                    }]
+                })),
+            ));
+        }
+    }
+
     enforce_owner_for_drone(state.as_ref(), &request.drone_id, request.owner_id.as_deref())?;
-    let violations = validate_flight_plan(state.as_ref(), &request);
-    if !violations.is_empty() {
+    let validation = validate_flight_plan(state.as_ref(), &request).await;
+    if !validation.violations.is_empty() {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(json!({
                 "error": "Flight plan rejected",
-                "violations": violations
+                "violations": validation.violations
             })),
         ));
     }
+    apply_compliance_metadata(&mut request.metadata, validation.compliance.as_ref());
     let plan = build_plan(state.as_ref(), request, requested_flight_id);
     Ok((StatusCode::CREATED, Json(plan)))
 }
@@ -165,6 +192,13 @@ fn planner_metadata_to_flight_metadata(metadata: PlannerMetadata) -> FlightPlanM
         faa_compliant: metadata.faa_compliant,
         submitted_at: metadata.submitted_at,
         blender_declaration_id: metadata.blender_declaration_id,
+        operation_type: metadata.operation_type,
+        battery_capacity_min: metadata.battery_capacity_min,
+        battery_reserve_min: metadata.battery_reserve_min,
+        clearance_m: metadata.clearance_m,
+        compliance_override_enabled: metadata.compliance_override_enabled,
+        compliance_override_notes: metadata.compliance_override_notes,
+        compliance_report: None,
     }
 }
 
@@ -198,7 +232,7 @@ fn extract_route_points(request: &FlightPlanRequest) -> Vec<RoutePoint> {
         }
     }
 
-    request
+    let mut points = request
         .waypoints
         .as_ref()
         .map(|waypoints| {
@@ -209,16 +243,45 @@ fn extract_route_points(request: &FlightPlanRequest) -> Vec<RoutePoint> {
                     lon: point.lon,
                     altitude_m: point.altitude_m,
                 })
-                .collect()
+                .collect::<Vec<_>>()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+
+    if points.is_empty() {
+        if let (Some(origin), Some(destination)) = (&request.origin, &request.destination) {
+            points.push(RoutePoint {
+                lat: origin.lat,
+                lon: origin.lon,
+                altitude_m: origin.altitude_m,
+            });
+            points.push(RoutePoint {
+                lat: destination.lat,
+                lon: destination.lon,
+                altitude_m: destination.altitude_m,
+            });
+        }
+    }
+
+    points
 }
 
-fn validate_flight_plan(state: &AppState, request: &FlightPlanRequest) -> Vec<serde_json::Value> {
+struct ValidationOutcome {
+    violations: Vec<serde_json::Value>,
+    compliance: Option<ComplianceEvaluation>,
+}
+
+async fn validate_flight_plan(state: &AppState, request: &FlightPlanRequest) -> ValidationOutcome {
     let mut violations = Vec::new();
     let points = extract_route_points(request);
     if points.is_empty() {
-        return violations;
+        violations.push(json!({
+            "type": "route",
+            "message": "Route is required for compliance checks"
+        }));
+        return ValidationOutcome {
+            violations,
+            compliance: None,
+        };
     }
 
     if points.len() < 2 {
@@ -226,11 +289,35 @@ fn validate_flight_plan(state: &AppState, request: &FlightPlanRequest) -> Vec<se
             "type": "route",
             "message": "At least 2 waypoints are required"
         }));
-        return violations;
+        return ValidationOutcome {
+            violations,
+            compliance: None,
+        };
     }
 
     let rules = state.rules();
     for (idx, point) in points.iter().enumerate() {
+        if !point.lat.is_finite() || !point.lon.is_finite() {
+            violations.push(json!({
+                "type": "coordinate",
+                "point_index": idx,
+                "lat": point.lat,
+                "lon": point.lon,
+                "message": "Latitude/longitude must be finite numbers"
+            }));
+            continue;
+        }
+
+        if !( -90.0..=90.0).contains(&point.lat) || !( -180.0..=180.0).contains(&point.lon) {
+            violations.push(json!({
+                "type": "coordinate",
+                "point_index": idx,
+                "lat": point.lat,
+                "lon": point.lon,
+                "message": "Latitude/longitude out of range"
+            }));
+        }
+
         if !point.altitude_m.is_finite() {
             violations.push(json!({
                 "type": "altitude",
@@ -295,7 +382,112 @@ fn validate_flight_plan(state: &AppState, request: &FlightPlanRequest) -> Vec<se
         }
     }
 
-    violations
+    if let Some(log) = request.trajectory_log.as_ref() {
+        let mut last_offset: Option<f64> = None;
+        for (idx, point) in log.iter().enumerate() {
+            if let Some(offset) = point.time_offset_s {
+                if !offset.is_finite() || offset < 0.0 {
+                    violations.push(json!({
+                        "type": "trajectory",
+                        "point_index": idx,
+                        "time_offset_s": offset,
+                        "message": "Trajectory time_offset_s must be a non-negative finite number"
+                    }));
+                }
+                if let Some(prev) = last_offset {
+                    if offset < prev {
+                        violations.push(json!({
+                            "type": "trajectory",
+                            "point_index": idx,
+                            "time_offset_s": offset,
+                            "message": "Trajectory time_offset_s must be non-decreasing"
+                        }));
+                    }
+                }
+                last_offset = Some(offset);
+            }
+        }
+    }
+
+    let require_blender = state.config().require_blender_declaration && request.owner_id.is_some();
+    if violations.is_empty() && require_blender {
+        let blender_id = request
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.blender_declaration_id.as_deref())
+            .map(str::trim)
+            .filter(|id| !id.is_empty());
+
+        match blender_id {
+            Some(declaration_id) => {
+                let blender = BlenderClient::new(
+                    &state.config().blender_url,
+                    &state.config().blender_session_id,
+                    &state.config().blender_auth_token,
+                );
+                match blender.flight_declaration_exists(declaration_id).await {
+                    Ok(true) => {}
+                    Ok(false) => violations.push(json!({
+                        "type": "blender",
+                        "message": "Blender declaration not found",
+                        "blender_declaration_id": declaration_id,
+                    })),
+                    Err(err) => violations.push(json!({
+                        "type": "blender",
+                        "message": format!("Failed to validate Blender declaration: {}", err),
+                        "blender_declaration_id": declaration_id,
+                    })),
+                }
+            }
+            None => violations.push(json!({
+                "type": "blender",
+                "message": "Missing Blender declaration ID for flight plan",
+            })),
+        }
+    }
+
+    if !violations.is_empty() {
+        return ValidationOutcome {
+            violations,
+            compliance: None,
+        };
+    }
+
+    let compliance = compliance::evaluate_compliance(state.config(), request, &points).await;
+    if !compliance.ok {
+        let report = serde_json::to_value(&compliance.report).unwrap_or_else(|_| json!({}));
+        violations.push(json!({
+            "type": "compliance",
+            "message": "Compliance checks failed",
+            "blocking_checks": compliance.blocking.clone(),
+            "report": report
+        }));
+    }
+
+    ValidationOutcome {
+        violations,
+        compliance: Some(compliance),
+    }
+}
+
+fn apply_compliance_metadata(
+    metadata: &mut Option<FlightPlanMetadata>,
+    compliance: Option<&ComplianceEvaluation>,
+) {
+    let compliant = compliance.map(|c| c.ok).unwrap_or(false);
+    if let Some(meta) = metadata.as_mut() {
+        meta.faa_compliant = Some(compliant);
+        if let Some(report) = compliance.map(|c| &c.report) {
+            meta.compliance_report = serde_json::to_value(report).ok();
+        }
+    } else if compliance.is_some() {
+        let report = compliance.and_then(|c| serde_json::to_value(&c.report).ok());
+        *metadata = Some(FlightPlanMetadata {
+            faa_compliant: Some(compliant),
+            compliance_report: report,
+            ..Default::default()
+        });
+    }
 }
 
 fn build_plan(

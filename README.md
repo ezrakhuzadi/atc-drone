@@ -102,17 +102,61 @@ This launches two simulated drones on a collision course. The system will:
 | POST | `/v1/geofences/check-route` | Check if a route conflicts with geofences |
 | POST | `/v1/commands` | Issue a command to a drone |
 | GET | `/v1/commands/next?drone_id=X` | Poll for pending commands |
-| POST | `/v1/commands/{id}/ack` | Acknowledge command receipt |
-| POST | `/v1/admin/reset` | Reset all server state (for demos) |
-| GET | `/ws` | WebSocket for real-time updates |
+| POST | `/v1/commands/ack` | Acknowledge command receipt |
+| GET | `/v1/commands/ws` | WebSocket command stream (auth required) |
+| POST | `/v1/admin/reset` | Reset all server state (requires confirm payload) |
+| GET | `/v1/ws` | WebSocket for real-time updates (supports `token`, `owner_id`, `drone_id` query params) |
+
+Note: `/v1/drones/register` requires `X-Registration-Token` when `ATC_REQUIRE_REGISTRATION_TOKEN` is enabled.
+Drone-facing endpoints (telemetry + command polling/ack) require `Authorization: Bearer <session_token>` from `/v1/drones/register`.
+
+### API Versioning
+- Current stable version: `/v1`
+- Breaking changes will land in a new versioned prefix (e.g., `/v2`).
+- Deprecated endpoints will remain available for at least one release cycle and should emit `Deprecation` + `Sunset` headers when scheduled.
+
+### OpenAPI
+Machine-readable spec: `openapi.yaml`
+
+### Load Testing
+Simple telemetry load script:
+```
+python3 scripts/load_test.py --base-url http://localhost:3000 --drones 20 --duration 60 --interval-ms 500
+```
+
+### Failure/Chaos Smoke Tests
+Basic failure-mode checks:
+```
+python3 scripts/failure_test.py --base-url http://localhost:3000 --registration-token change-me --admin-token <ATC_ADMIN_TOKEN>
+```
 
 ## Configuration
 
 Environment variables:
-- `ATC_HOST` - Server bind address (default: `0.0.0.0`)
 - `ATC_PORT` - Server port (default: `3000`)
 - `BLENDER_URL` - Flight Blender URL (optional)
-- `BLENDER_TOKEN` - Flight Blender auth token (optional)
+- `BLENDER_AUTH_TOKEN` - Flight Blender auth token (optional)
+- `ATC_REGISTRATION_TOKEN` - Shared token for drone registration (required when enabled)
+- `ATC_REQUIRE_REGISTRATION_TOKEN` - Enforce token for `/v1/drones/register` (default: `true`)
+- `ATC_REGISTER_RATE_LIMIT_RPS` - Max registration requests per second per IP (default: `10`)
+- `ATC_DB_MAX_CONNECTIONS` - Max SQLite pool connections (default: `10`)
+- `ATC_WS_TOKEN` - Shared token required for `/v1/ws` when enabled (default: unset)
+- `ATC_REQUIRE_WS_TOKEN` - Enforce token for `/v1/ws` (default: `true` in prod when token set)
+- `ATC_TELEMETRY_MIN_ALT_M` - Minimum accepted telemetry altitude (default: `-100`)
+- `ATC_TELEMETRY_MAX_ALT_M` - Maximum accepted telemetry altitude (default: `20000`)
+- `ATC_TELEMETRY_MAX_SPEED_MPS` - Maximum accepted telemetry speed (default: `150`)
+- `ATC_TELEMETRY_MAX_FUTURE_S` - Max seconds allowed in the future for telemetry timestamps (default: `30`)
+- `ATC_TELEMETRY_MAX_AGE_S` - Max age in seconds for telemetry timestamps (default: `300`)
+- `ATC_PULL_BLENDER_GEOFENCES` - Pull Blender/DSS geofences into ATC (default: `true`)
+- `ATC_ALLOW_ADMIN_RESET` - Enable `/v1/admin/reset` (default: `true` in dev, `false` in prod)
+- `ATC_RULES_MIN_HORIZONTAL_SEPARATION_M` - Minimum horizontal separation (default: `50`)
+- `ATC_RULES_MIN_VERTICAL_SEPARATION_M` - Minimum vertical separation (default: `30`)
+- `ATC_RULES_LOOKAHEAD_SECONDS` - Conflict lookahead window (default: `20`)
+- `ATC_RULES_WARNING_MULTIPLIER` - Warning threshold multiplier (default: `2.0`)
+- `ATC_RULES_DRONE_TIMEOUT_SECS` - Seconds before drone marked lost (default: `10`)
+- `ATC_RULES_MAX_ALTITUDE_M` - Max allowed altitude in meters (default: `121`)
+- `ATC_RULES_MIN_ALTITUDE_M` - Min allowed altitude in meters (default: `10`)
+- `ATC_LOG_FORMAT` - Logging format (`text` or `json`, default: `text`)
 
 ## Project Status
 

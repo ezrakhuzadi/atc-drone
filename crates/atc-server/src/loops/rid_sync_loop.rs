@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
+use tokio::sync::broadcast;
 use tokio::time::interval;
 
 use atc_blender::BlenderClient;
@@ -20,7 +21,11 @@ const RID_SUBSCRIPTION_TTL_SECS: u64 = 20;
 const RID_TRACK_TTL_SECS: i64 = 30;
 
 /// Start RID polling loop.
-pub async fn run_rid_loop(state: Arc<AppState>, config: Config) {
+pub async fn run_rid_loop(
+    state: Arc<AppState>,
+    config: Config,
+    mut shutdown: broadcast::Receiver<()>,
+) {
     let blender = BlenderClient::new(
         &config.blender_url,
         &config.blender_session_id,
@@ -35,46 +40,52 @@ pub async fn run_rid_loop(state: Arc<AppState>, config: Config) {
     let mut last_view = state.get_rid_view_bbox();
 
     loop {
-        ticker.tick().await;
-
-        let current_view = state.get_rid_view_bbox();
-        if current_view != last_view {
-            last_view = current_view.clone();
-            subscription_id = None;
-        }
-
-        if current_view.trim().is_empty() {
-            continue;
-        }
-
-        if subscription_id.is_none() || last_subscription.elapsed().as_secs() >= RID_SUBSCRIPTION_TTL_SECS {
-            match blender.create_rid_subscription(&current_view).await {
-                Ok(id) => {
-                    subscription_id = Some(id);
-                    last_subscription = Instant::now();
-                    tracing::info!("RID subscription refreshed");
+        tokio::select! {
+            _ = shutdown.recv() => {
+                tracing::info!("RID sync loop shutting down");
+                break;
+            }
+            _ = ticker.tick() => {
+                let current_view = state.get_rid_view_bbox();
+                if current_view != last_view {
+                    last_view = current_view.clone();
+                    subscription_id = None;
                 }
-                Err(err) => {
-                    tracing::warn!("RID subscription failed: {}", err);
+
+                if current_view.trim().is_empty() {
                     continue;
                 }
-            }
-        }
 
-        let Some(active_id) = subscription_id.as_deref() else {
-            continue;
-        };
-
-        match blender.fetch_rid_data(active_id).await {
-            Ok(payload) => {
-                let tracks = normalize_rid_payload(payload);
-                for track in tracks {
-                    state.upsert_external_traffic(track);
+                if subscription_id.is_none() || last_subscription.elapsed().as_secs() >= RID_SUBSCRIPTION_TTL_SECS {
+                    match blender.create_rid_subscription(&current_view).await {
+                        Ok(id) => {
+                            subscription_id = Some(id);
+                            last_subscription = Instant::now();
+                            tracing::info!("RID subscription refreshed");
+                        }
+                        Err(err) => {
+                            tracing::warn!("RID subscription failed: {}", err);
+                            continue;
+                        }
+                    }
                 }
-                state.purge_external_traffic(RID_TRACK_TTL_SECS);
-            }
-            Err(err) => {
-                tracing::warn!("RID data fetch failed: {}", err);
+
+                let Some(active_id) = subscription_id.as_deref() else {
+                    continue;
+                };
+
+                match blender.fetch_rid_data(active_id).await {
+                    Ok(payload) => {
+                        let tracks = normalize_rid_payload(payload);
+                        for track in tracks {
+                            state.upsert_external_traffic(track);
+                        }
+                        state.purge_external_traffic(RID_TRACK_TTL_SECS);
+                    }
+                    Err(err) => {
+                        tracing::warn!("RID data fetch failed: {}", err);
+                    }
+                }
             }
         }
     }

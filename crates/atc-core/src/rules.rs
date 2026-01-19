@@ -31,12 +31,12 @@ impl Default for SafetyRules {
             lookahead_seconds: 20.0,
             warning_multiplier: 2.0,
             drone_timeout_secs: 10,
-            max_altitude_m: 120.0, // Typical drone altitude limit
+            max_altitude_m: 121.0, // FAA Part 107 limit (~400ft)
             min_altitude_m: 10.0,
             altitude_bands: vec![
                 AltitudeBand { name: "Low".into(), min_m: 10.0, max_m: 40.0 },
                 AltitudeBand { name: "Medium".into(), min_m: 40.0, max_m: 80.0 },
-                AltitudeBand { name: "High".into(), min_m: 80.0, max_m: 120.0 },
+                AltitudeBand { name: "High".into(), min_m: 80.0, max_m: 121.0 },
             ],
         }
     }

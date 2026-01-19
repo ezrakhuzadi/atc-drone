@@ -12,7 +12,7 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use crate::state::AppState;
-use atc_core::{Geofence, CreateGeofenceRequest, UpdateGeofenceRequest};
+use atc_core::{Geofence, GeofenceType, CreateGeofenceRequest, UpdateGeofenceRequest};
 
 /// Create a new geofence.
 pub async fn create_geofence(
@@ -71,6 +71,16 @@ pub async fn update_geofence(
     Path(id): Path<String>,
     Json(req): Json<UpdateGeofenceRequest>,
 ) -> Result<Json<Geofence>, (StatusCode, Json<serde_json::Value>)> {
+    if state.is_external_geofence(&id) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "External geofences are read-only",
+                "id": id
+            }))
+        ));
+    }
+
     let mut geofence = match state.get_geofence(&id) {
         Some(existing) => existing,
         None => {
@@ -125,6 +135,10 @@ pub async fn delete_geofence(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> StatusCode {
+    if state.is_external_geofence(&id) {
+        return StatusCode::FORBIDDEN;
+    }
+
     if state.remove_geofence(&id) {
         tracing::info!("Deleted geofence {}", id);
         StatusCode::NO_CONTENT
@@ -197,7 +211,10 @@ pub async fn check_route(
         let wp1 = &req.waypoints[i];
         let wp2 = &req.waypoints[i + 1];
         
-        for geofence in geofences.iter().filter(|g| g.active) {
+        for geofence in geofences
+            .iter()
+            .filter(|g| g.active && g.geofence_type != GeofenceType::Advisory)
+        {
             if geofence.intersects_segment(
                 wp1.lat, wp1.lon, wp1.altitude_m,
                 wp2.lat, wp2.lon, wp2.altitude_m,

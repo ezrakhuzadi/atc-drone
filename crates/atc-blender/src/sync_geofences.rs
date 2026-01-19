@@ -3,10 +3,11 @@
 //! When conflicts are detected, we push them as temporary
 //! geofences so they appear as red zones in Spotlight.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use atc_core::{Conflict, ConflictSeverity};
 use chrono::{Duration as ChronoDuration, Utc};
 use serde::Serialize;
+use serde_json::Value;
 use std::f64::consts::PI;
 
 /// GeoJSON Feature for a conflict zone geofence.
@@ -102,6 +103,12 @@ pub fn conflict_to_geofence(
     drone1_pos: Option<(f64, f64, f64)>, // (lat, lon, alt)
     drone2_pos: Option<(f64, f64, f64)>,
 ) -> ConflictGeofence {
+    let (id_a, id_b) = if conflict.drone1_id <= conflict.drone2_id {
+        (conflict.drone1_id.as_str(), conflict.drone2_id.as_str())
+    } else {
+        (conflict.drone2_id.as_str(), conflict.drone1_id.as_str())
+    };
+
     // Calculate midpoint between the two drones (if positions known)
     let (center_lat, center_lon, center_alt) = match (drone1_pos, drone2_pos) {
         (Some((lat1, lon1, alt1)), Some((lat2, lon2, alt2))) => {
@@ -124,8 +131,8 @@ pub fn conflict_to_geofence(
     // Create unique ID
     let geofence_id = format!(
         "CONFLICT_{}_{}",
-        conflict.drone1_id.replace("DRONE", ""),
-        conflict.drone2_id.replace("DRONE", "")
+        id_a.replace("DRONE", ""),
+        id_b.replace("DRONE", "")
     );
 
     let severity_str = match conflict.severity {
@@ -136,7 +143,7 @@ pub fn conflict_to_geofence(
 
     ConflictGeofence {
         id: geofence_id.clone(),
-        name: format!("Conflict: {} vs {}", conflict.drone1_id, conflict.drone2_id),
+        name: format!("Conflict: {} vs {}", id_a, id_b),
         upper_limit: (center_alt + 50.0) as i32, // 50m above
         lower_limit: (center_alt - 50.0).max(0.0) as i32, // 50m below or ground
         raw_geo_fence: GeoJsonFeature {
@@ -148,8 +155,8 @@ pub fn conflict_to_geofence(
             properties: GeoJsonProperties {
                 name: geofence_id,
                 severity: severity_str.to_string(),
-                drone1_id: conflict.drone1_id.clone(),
-                drone2_id: conflict.drone2_id.clone(),
+                drone1_id: id_a.to_string(),
+                drone2_id: id_b.to_string(),
                 distance_m: conflict.distance_m,
                 time_to_closest: conflict.time_to_closest,
             },
@@ -157,6 +164,11 @@ pub fn conflict_to_geofence(
         geozone_type: "conflict".to_string(),
         status: "active".to_string(),
     }
+}
+
+pub fn conflict_payload(geofence: &ConflictGeofence) -> Result<Value> {
+    let payload = build_blender_payload(geofence);
+    serde_json::to_value(payload).context("Failed to serialize conflict geofence payload")
 }
 
 use super::client::BlenderClient;

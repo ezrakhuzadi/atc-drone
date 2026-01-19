@@ -2,28 +2,46 @@
 
 use axum::{
     extract::{State, Query},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
+    middleware,
+    response::IntoResponse,
     routing::{get, post, delete, put},
     Json, Router,
 };
+use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::api::{commands, flights, geofences, daa, ws};
+use crate::api::auth::{self, AdminToken, RateLimiter};
+use crate::compliance::{self, ComplianceReport, RoutePoint};
+use crate::config::Config;
 use crate::state::{AppState, ExternalTraffic};
-use atc_core::models::{Telemetry, ConformanceStatus, DroneStatus};
+use atc_core::models::{Telemetry, ConformanceStatus, DroneStatus, FlightPlanRequest, FlightPlanMetadata, TrajectoryPoint, Waypoint, GeofenceType};
 
 /// Create the API router.
-pub fn create_router() -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/v1/drones/register", post(register_drone))
-        .route("/v1/telemetry", post(receive_telemetry))
+pub fn create_router(config: &Config) -> Router<Arc<AppState>> {
+    // Create rate limiter for telemetry
+    let rate_limiter = RateLimiter::new(config.rate_limit_rps, config.rate_limit_enabled);
+    let registration_limiter = RateLimiter::new(
+        config.registration_rate_limit_rps,
+        config.rate_limit_enabled,
+    );
+    
+    // Create admin token extractor
+    let admin_token = AdminToken(Arc::new(config.admin_token.clone()));
+    
+    // Public routes (no auth required)
+    let public_routes = Router::new()
         .route("/v1/drones", get(list_drones))
         .route("/v1/traffic", get(list_traffic))
         .route("/v1/conflicts", get(list_conflicts))
         .route("/v1/conformance", get(list_conformance))
         .route("/v1/daa", get(daa::list_daa))
+        .route("/v1/compliance/limits", get(get_compliance_limits))
+        .route("/v1/compliance/evaluate", post(evaluate_compliance))
         .route("/v1/rid/view", post(update_rid_view))
         .route("/v1/flights/plan", post(flights::create_flight_plan))
         .route("/v1/flights", get(flights::get_flight_plans).post(flights::create_flight_plan_compat))
@@ -32,6 +50,7 @@ pub fn create_router() -> Router<Arc<AppState>> {
         .route("/v1/commands", get(commands::get_all_commands))
         .route("/v1/commands/next", get(commands::get_next_command))
         .route("/v1/commands/ack", post(commands::ack_command))
+        .route("/v1/commands/ws", get(commands::command_stream_ws))
         // Geofence routes
         .route("/v1/geofences", post(geofences::create_geofence))
         .route("/v1/geofences", get(geofences::list_geofences))
@@ -41,9 +60,26 @@ pub fn create_router() -> Router<Arc<AppState>> {
         .route("/v1/geofences/check", get(geofences::check_point))
         .route("/v1/geofences/check-route", post(geofences::check_route))
         // WebSocket streaming
-        .route("/v1/ws", get(ws::ws_handler))
-        // Admin routes
+        .route("/v1/ws", get(ws::ws_handler));
+
+    let registration_routes = Router::new()
+        .route("/v1/drones/register", post(register_drone))
+        .layer(middleware::from_fn_with_state(registration_limiter, auth::rate_limit));
+    
+    // Rate-limited telemetry route
+    let telemetry_route = Router::new()
+        .route("/v1/telemetry", post(receive_telemetry))
+        .layer(middleware::from_fn_with_state(rate_limiter, auth::rate_limit));
+    
+    // Admin routes (require admin token)
+    let admin_routes = Router::new()
         .route("/v1/admin/reset", post(admin_reset))
+        .layer(middleware::from_fn_with_state(admin_token, auth::require_admin));
+    
+    public_routes
+        .merge(registration_routes)
+        .merge(telemetry_route)
+        .merge(admin_routes)
 }
 
 // === Request/Response types ===
@@ -75,6 +111,10 @@ pub struct TrafficQuery {
     pub owner_id: Option<String>,
     /// Include external RID/DSS tracks
     pub include_external: Option<bool>,
+    /// Filter by traffic source (local, rid, external, etc.)
+    pub source: Option<String>,
+    /// Return only external traffic
+    pub external_only: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -105,6 +145,28 @@ pub struct RidViewRequest {
     pub max_lon: f64,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ComplianceEvaluateRequest {
+    pub drone_id: Option<String>,
+    pub owner_id: Option<String>,
+    pub waypoints: Option<Vec<Waypoint>>,
+    #[serde(default)]
+    pub trajectory_log: Option<Vec<TrajectoryPoint>>,
+    #[serde(default)]
+    pub metadata: Option<FlightPlanMetadata>,
+    pub origin: Option<Waypoint>,
+    pub destination: Option<Waypoint>,
+    pub departure_time: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ComplianceEvaluateResponse {
+    pub ok: bool,
+    pub blocking: Vec<String>,
+    pub violations: Vec<serde_json::Value>,
+    pub report: Option<ComplianceReport>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct RidViewResponse {
     pub view: String,
@@ -120,29 +182,80 @@ pub struct RegisterResponse {
 
 async fn register_drone(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<RegisterRequest>,
-) -> (StatusCode, Json<RegisterResponse>) {
+) -> impl IntoResponse {
+    let config = state.config();
+    if config.require_registration_token {
+        let expected = match config.registration_token.as_deref() {
+            Some(token) => token,
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": "Registration is temporarily unavailable",
+                        "hint": "ATC_REGISTRATION_TOKEN is not configured"
+                    })),
+                );
+            }
+        };
+
+        match auth::extract_registration_token(&headers) {
+            Some(token) if token == expected => {}
+            Some(_) => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": "Invalid registration token"
+                    })),
+                );
+            }
+            None => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({
+                        "error": "Registration token required",
+                        "hint": "Set X-Registration-Token header"
+                    })),
+                );
+            }
+        }
+    }
+
     let drone_id = req.drone_id.unwrap_or_else(|| {
         format!("DRONE{:04}", state.next_drone_id())
     });
 
     state.register_drone(&drone_id, req.owner_id.clone());
 
+    // Generate real session token
+    let session_token = uuid::Uuid::new_v4().to_string();
+    state.set_drone_token(&drone_id, session_token.clone());
+    
+    tracing::info!("Registered drone {} with token {}", drone_id, &session_token[..8]);
+    
     (
         StatusCode::CREATED,
-        Json(RegisterResponse {
-            drone_id,
-            session_token: "dummy-token".to_string(),
-        }),
+        Json(serde_json::json!({
+            "drone_id": drone_id,
+            "session_token": session_token,
+        })),
     )
 }
 
 async fn receive_telemetry(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(telemetry): Json<Telemetry>,
-) -> StatusCode {
+) -> (StatusCode, Json<serde_json::Value>) {
+    if let Err(status) = auth::authorize_drone_for(state.as_ref(), &telemetry.drone_id, &headers) {
+        return (status, Json(serde_json::json!({"error": "Authorization failed"})));
+    }
+    if let Err(response) = validate_telemetry(&telemetry, state.config()) {
+        return response;
+    }
     state.update_telemetry(telemetry);
-    StatusCode::ACCEPTED
+    (StatusCode::ACCEPTED, Json(serde_json::json!({})))
 }
 
 async fn list_drones(
@@ -169,35 +282,128 @@ async fn list_traffic(
 ) -> Json<Vec<TrafficState>> {
     let mut traffic: Vec<TrafficState> = Vec::new();
 
-    let drones = state.get_all_drones();
-    let filtered = if let Some(owner_id) = query.owner_id.clone() {
-        drones
-            .into_iter()
-            .filter(|d| d.owner_id.as_ref() == Some(&owner_id))
-            .collect::<Vec<_>>()
-    } else {
-        drones
-    };
+    let source_filter = query.source.as_ref().map(|s| s.to_lowercase());
+    let external_only = query.external_only.unwrap_or(false);
+    let mut include_local = !external_only;
+    let mut include_external = query.include_external.unwrap_or(false);
 
-    traffic.extend(filtered.into_iter().map(|drone| TrafficState {
-        drone_id: drone.drone_id,
-        owner_id: drone.owner_id,
-        lat: drone.lat,
-        lon: drone.lon,
-        altitude_m: drone.altitude_m,
-        heading_deg: drone.heading_deg,
-        speed_mps: drone.speed_mps,
-        last_update: drone.last_update,
-        status: drone.status,
-        traffic_source: "local".to_string(),
-    }));
+    if let Some(source) = source_filter.as_deref() {
+        match source {
+            "local" => {
+                include_local = true;
+                include_external = false;
+            }
+            "external" | "rid" => {
+                include_local = false;
+                include_external = true;
+            }
+            _ => {}
+        }
+    }
 
-    if query.include_external.unwrap_or(false) {
+    if include_local {
+        let drones = state.get_all_drones();
+        let filtered = if let Some(owner_id) = query.owner_id.clone() {
+            drones
+                .into_iter()
+                .filter(|d| d.owner_id.as_ref() == Some(&owner_id))
+                .collect::<Vec<_>>()
+        } else {
+            drones
+        };
+
+        traffic.extend(filtered.into_iter().map(|drone| TrafficState {
+            drone_id: drone.drone_id,
+            owner_id: drone.owner_id,
+            lat: drone.lat,
+            lon: drone.lon,
+            altitude_m: drone.altitude_m,
+            heading_deg: drone.heading_deg,
+            speed_mps: drone.speed_mps,
+            last_update: drone.last_update,
+            status: drone.status,
+            traffic_source: "local".to_string(),
+        }));
+    }
+
+    if include_external {
         let external = state.get_external_traffic();
         traffic.extend(external.into_iter().map(external_to_traffic));
     }
 
+    if let Some(source) = source_filter {
+        if source == "external" {
+            traffic.retain(|entry| entry.traffic_source.to_lowercase() != "local");
+        } else {
+            traffic.retain(|entry| entry.traffic_source.eq_ignore_ascii_case(&source));
+        }
+    }
+
     Json(traffic)
+}
+
+fn bad_request(message: &str, field: Option<&str>) -> (StatusCode, Json<serde_json::Value>) {
+    let mut payload = serde_json::json!({ "error": message });
+    if let Some(field) = field {
+        payload["field"] = serde_json::Value::String(field.to_string());
+    }
+    (StatusCode::BAD_REQUEST, Json(payload))
+}
+
+fn validate_telemetry(
+    telemetry: &Telemetry,
+    config: &Config,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let lat = telemetry.lat;
+    let lon = telemetry.lon;
+    if !lat.is_finite() {
+        return Err(bad_request("Latitude must be a finite number", Some("lat")));
+    }
+    if !lon.is_finite() {
+        return Err(bad_request("Longitude must be a finite number", Some("lon")));
+    }
+    if lat < -90.0 || lat > 90.0 {
+        return Err(bad_request("Latitude out of range", Some("lat")));
+    }
+    if lon < -180.0 || lon > 180.0 {
+        return Err(bad_request("Longitude out of range", Some("lon")));
+    }
+
+    let altitude = telemetry.altitude_m;
+    if !altitude.is_finite() {
+        return Err(bad_request("Altitude must be a finite number", Some("altitude_m")));
+    }
+    if altitude < config.telemetry_min_alt_m || altitude > config.telemetry_max_alt_m {
+        return Err(bad_request("Altitude out of allowed range", Some("altitude_m")));
+    }
+
+    let speed = telemetry.speed_mps;
+    if !speed.is_finite() {
+        return Err(bad_request("Speed must be a finite number", Some("speed_mps")));
+    }
+    if speed < 0.0 || speed > config.telemetry_max_speed_mps {
+        return Err(bad_request("Speed out of allowed range", Some("speed_mps")));
+    }
+
+    let heading = telemetry.heading_deg;
+    if !heading.is_finite() {
+        return Err(bad_request("Heading must be a finite number", Some("heading_deg")));
+    }
+    if heading < 0.0 || heading >= 360.0 {
+        return Err(bad_request("Heading out of range", Some("heading_deg")));
+    }
+
+    let now = Utc::now();
+    let max_future = Duration::seconds(config.telemetry_max_future_s);
+    let max_age = Duration::seconds(config.telemetry_max_age_s);
+    if telemetry.timestamp > now + max_future {
+        return Err(bad_request("Telemetry timestamp is too far in the future", Some("timestamp")));
+    }
+    if telemetry.timestamp < now - max_age {
+        return Err(bad_request("Telemetry timestamp is too old", Some("timestamp")));
+    }
+
+    Ok(())
 }
 
 fn external_to_traffic(external: ExternalTraffic) -> TrafficState {
@@ -253,6 +459,221 @@ async fn list_conformance(
     Json(statuses)
 }
 
+async fn get_compliance_limits(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let config = state.config();
+    Json(serde_json::json!({
+        "maxWindMps": config.compliance_max_wind_mps,
+        "maxGustMps": config.compliance_max_gust_mps,
+        "maxPrecipMm": config.compliance_max_precip_mm,
+        "windWarnRatio": config.compliance_wind_warn_ratio,
+        "batteryWarnMarginMin": config.compliance_battery_warn_margin_min,
+        "populationBvlosMax": config.compliance_population_bvlos_max,
+        "populationWarn": config.compliance_population_warn,
+        "populationAbsoluteMax": config.compliance_population_absolute_max,
+        "defaultClearanceM": config.compliance_default_clearance_m
+    }))
+}
+
+async fn evaluate_compliance(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ComplianceEvaluateRequest>,
+) -> Json<ComplianceEvaluateResponse> {
+    let request = FlightPlanRequest {
+        drone_id: req
+            .drone_id
+            .unwrap_or_else(|| "COMPLIANCE-REQUEST".to_string()),
+        owner_id: req.owner_id,
+        waypoints: req.waypoints,
+        trajectory_log: req.trajectory_log,
+        metadata: req.metadata,
+        origin: req.origin,
+        destination: req.destination,
+        departure_time: req.departure_time,
+    };
+
+    let points = extract_route_points(&request);
+    let mut violations: Vec<serde_json::Value> = Vec::new();
+
+    if points.is_empty() {
+        violations.push(json!({
+            "type": "route",
+            "message": "Route is required for compliance checks"
+        }));
+        return Json(ComplianceEvaluateResponse {
+            ok: false,
+            blocking: Vec::new(),
+            violations,
+            report: None,
+        });
+    }
+
+    if points.len() < 2 {
+        violations.push(json!({
+            "type": "route",
+            "message": "At least 2 waypoints are required"
+        }));
+        return Json(ComplianceEvaluateResponse {
+            ok: false,
+            blocking: Vec::new(),
+            violations,
+            report: None,
+        });
+    }
+
+    let rules = state.rules();
+    for (idx, point) in points.iter().enumerate() {
+        if !point.lat.is_finite() || !point.lon.is_finite() {
+            violations.push(json!({
+                "type": "coordinate",
+                "point_index": idx,
+                "lat": point.lat,
+                "lon": point.lon,
+                "message": "Latitude/longitude must be finite numbers"
+            }));
+            continue;
+        }
+
+        if !( -90.0..=90.0).contains(&point.lat) || !( -180.0..=180.0).contains(&point.lon) {
+            violations.push(json!({
+                "type": "coordinate",
+                "point_index": idx,
+                "lat": point.lat,
+                "lon": point.lon,
+                "message": "Latitude/longitude out of range"
+            }));
+        }
+
+        if !point.altitude_m.is_finite() {
+            violations.push(json!({
+                "type": "altitude",
+                "point_index": idx,
+                "altitude_m": point.altitude_m,
+                "message": "Altitude must be a finite number"
+            }));
+            continue;
+        }
+
+        if point.altitude_m > rules.max_altitude_m {
+            violations.push(json!({
+                "type": "altitude",
+                "point_index": idx,
+                "altitude_m": point.altitude_m,
+                "max_m": rules.max_altitude_m,
+                "message": format!(
+                    "Altitude {:.1}m exceeds max altitude {:.1}m",
+                    point.altitude_m,
+                    rules.max_altitude_m
+                )
+            }));
+        }
+
+        if point.altitude_m < rules.min_altitude_m {
+            violations.push(json!({
+                "type": "altitude",
+                "point_index": idx,
+                "altitude_m": point.altitude_m,
+                "min_m": rules.min_altitude_m,
+                "message": format!(
+                    "Altitude {:.1}m is below min altitude {:.1}m",
+                    point.altitude_m,
+                    rules.min_altitude_m
+                )
+            }));
+        }
+    }
+
+    let geofences = state.get_geofences();
+    for i in 0..points.len().saturating_sub(1) {
+        let start = points[i];
+        let end = points[i + 1];
+        for geofence in geofences.iter().filter(|g| g.active && g.geofence_type != GeofenceType::Advisory) {
+            if geofence.intersects_segment(
+                start.lat,
+                start.lon,
+                start.altitude_m,
+                end.lat,
+                end.lon,
+                end.altitude_m,
+            ) {
+                violations.push(json!({
+                    "type": "geofence",
+                    "segment_index": i,
+                    "geofence_id": geofence.id,
+                    "geofence_name": geofence.name,
+                    "geofence_type": geofence.geofence_type,
+                    "message": format!("Route intersects geofence '{}'", geofence.name)
+                }));
+            }
+        }
+    }
+
+    if !violations.is_empty() {
+        return Json(ComplianceEvaluateResponse {
+            ok: false,
+            blocking: Vec::new(),
+            violations,
+            report: None,
+        });
+    }
+
+    let compliance = compliance::evaluate_compliance(state.config(), &request, &points).await;
+    Json(ComplianceEvaluateResponse {
+        ok: compliance.ok,
+        blocking: compliance.blocking,
+        violations,
+        report: Some(compliance.report),
+    })
+}
+
+fn extract_route_points(request: &FlightPlanRequest) -> Vec<RoutePoint> {
+    if let Some(log) = request.trajectory_log.as_ref() {
+        if log.len() >= 2 {
+            return log
+                .iter()
+                .map(|point| RoutePoint {
+                    lat: point.lat,
+                    lon: point.lon,
+                    altitude_m: point.altitude_m,
+                })
+                .collect();
+        }
+    }
+
+    let mut points = request
+        .waypoints
+        .as_ref()
+        .map(|waypoints| {
+            waypoints
+                .iter()
+                .map(|point| RoutePoint {
+                    lat: point.lat,
+                    lon: point.lon,
+                    altitude_m: point.altitude_m,
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if points.is_empty() {
+        if let (Some(origin), Some(destination)) = (&request.origin, &request.destination) {
+            points.push(RoutePoint {
+                lat: origin.lat,
+                lon: origin.lon,
+                altitude_m: origin.altitude_m,
+            });
+            points.push(RoutePoint {
+                lat: destination.lat,
+                lon: destination.lon,
+                altitude_m: destination.altitude_m,
+            });
+        }
+    }
+
+    points
+}
+
 async fn update_rid_view(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RidViewRequest>,
@@ -285,9 +706,69 @@ async fn update_rid_view(
 // === Admin Handlers ===
 
 /// Reset all state for demo purposes.
+#[derive(Debug, Deserialize)]
+struct AdminResetRequest {
+    /// Explicit confirmation string, must be "RESET".
+    confirm: Option<String>,
+    /// Require that no active/holding drones exist before reset.
+    #[serde(default)]
+    require_idle: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminResetResponse {
+    cleared: bool,
+    active_drones: usize,
+    message: String,
+}
+
 async fn admin_reset(
     State(state): State<Arc<AppState>>,
-) -> StatusCode {
+    Json(req): Json<AdminResetRequest>,
+) -> impl IntoResponse {
+    let config = state.config();
+    if !config.allow_admin_reset {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "Admin reset disabled",
+                "hint": "Set ATC_ALLOW_ADMIN_RESET=1 to enable"
+            })),
+        );
+    }
+
+    if req.confirm.as_deref() != Some("RESET") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Reset requires confirm=RESET"
+            })),
+        );
+    }
+
+    let active_drones = state.get_all_drones()
+        .into_iter()
+        .filter(|drone| drone.status != DroneStatus::Inactive)
+        .count();
+
+    if req.require_idle.unwrap_or(true) && active_drones > 0 {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "Active drones present",
+                "active_drones": active_drones,
+                "hint": "Stop all drones or set require_idle=false"
+            })),
+        );
+    }
+
     state.clear_all();
-    StatusCode::OK
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "cleared": true,
+            "active_drones": active_drones,
+            "message": "State reset",
+        })),
+    )
 }

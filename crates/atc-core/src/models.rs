@@ -171,6 +171,43 @@ pub struct FlightPlanMetadata {
     pub submitted_at: Option<String>,
     #[serde(default)]
     pub blender_declaration_id: Option<String>,
+    #[serde(default)]
+    pub operation_type: Option<u8>,
+    #[serde(default)]
+    pub battery_capacity_min: Option<f64>,
+    #[serde(default)]
+    pub battery_reserve_min: Option<f64>,
+    #[serde(default)]
+    pub clearance_m: Option<f64>,
+    #[serde(default)]
+    pub compliance_override_enabled: Option<bool>,
+    #[serde(default)]
+    pub compliance_override_notes: Option<String>,
+    #[serde(default)]
+    pub compliance_report: Option<serde_json::Value>,
+}
+
+impl Default for FlightPlanMetadata {
+    fn default() -> Self {
+        Self {
+            drone_speed_mps: None,
+            total_distance_m: None,
+            total_flight_time_s: None,
+            trajectory_points: None,
+            planned_altitude_m: None,
+            max_obstacle_height_m: None,
+            faa_compliant: None,
+            submitted_at: None,
+            blender_declaration_id: None,
+            operation_type: None,
+            battery_capacity_min: None,
+            battery_reserve_min: None,
+            clearance_m: None,
+            compliance_override_enabled: None,
+            compliance_override_notes: None,
+            compliance_report: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -409,9 +446,13 @@ impl Geofence {
     /// Check if a route segment intersects this geofence.
     /// Returns true if any point along the segment is inside the geofence.
     pub fn intersects_segment(&self, lat1: f64, lon1: f64, alt1: f64, lat2: f64, lon2: f64, alt2: f64) -> bool {
-        // Sample points along the segment
-        for i in 0..=10 {
-            let t = i as f64 / 10.0;
+        let distance_m = crate::spatial::haversine_distance(lat1, lon1, lat2, lon2);
+        let step_m = 25.0_f64;
+        let steps = ((distance_m / step_m).ceil() as usize).max(1).min(200);
+
+        // Sample points along the segment based on distance
+        for i in 0..=steps {
+            let t = i as f64 / steps as f64;
             let lat = lat1 + t * (lat2 - lat1);
             let lon = lon1 + t * (lon2 - lon1);
             let alt = alt1 + t * (alt2 - alt1);

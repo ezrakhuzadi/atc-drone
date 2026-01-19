@@ -3,8 +3,12 @@
 //! Allows ATC to issue commands to drones and drones to poll/ack them.
 
 use axum::{
-    extract::{Query, State},
-    http::StatusCode,
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Query, State,
+    },
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
     Json,
 };
 use chrono::{Duration, Utc};
@@ -12,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use atc_core::models::{Command, CommandType};
+use crate::api::auth;
 use crate::state::AppState;
 
 /// Request to issue a new command.
@@ -44,6 +49,13 @@ pub struct NextCommandQuery {
 #[derive(Debug, Deserialize)]
 pub struct AckCommandRequest {
     pub command_id: String,
+}
+
+/// Query params for command streaming.
+#[derive(Debug, Deserialize)]
+pub struct CommandStreamQuery {
+    pub drone_id: Option<String>,
+    pub token: Option<String>,
 }
 
 /// Issue a new command to a drone.
@@ -88,8 +100,10 @@ pub async fn issue_command(
 /// GET /v1/commands/next?drone_id=DRONE001
 pub async fn get_next_command(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(query): Query<NextCommandQuery>,
 ) -> Result<Json<Option<Command>>, StatusCode> {
+    auth::authorize_drone_for(state.as_ref(), &query.drone_id, &headers)?;
     let command = state.peek_command(&query.drone_id);
     Ok(Json(command))
 }
@@ -98,8 +112,15 @@ pub async fn get_next_command(
 /// POST /v1/commands/ack
 pub async fn ack_command(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(request): Json<AckCommandRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    let token_drone_id = auth::authorize_drone_from_headers(state.as_ref(), &headers)?;
+    if let Some(command_drone_id) = state.command_drone_id(&request.command_id) {
+        if command_drone_id != token_drone_id {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
     let found = state.ack_command(&request.command_id);
     
     if found {
@@ -122,4 +143,55 @@ pub async fn get_all_commands(
     State(state): State<Arc<AppState>>,
 ) -> Json<Vec<Command>> {
     Json(state.get_all_pending_commands())
+}
+
+/// WebSocket stream of commands for a single drone.
+/// GET /v1/commands/ws
+pub async fn command_stream_ws(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<CommandStreamQuery>,
+) -> impl IntoResponse {
+    let token = auth::extract_drone_token(&headers).or(query.token);
+    let Some(token) = token else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(drone_id) = state.drone_id_for_token(&token) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    if let Some(requested) = query.drone_id.as_deref() {
+        if requested != drone_id {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+    }
+
+    ws.on_upgrade(move |socket| handle_command_socket(socket, state, drone_id))
+}
+
+async fn handle_command_socket(
+    mut socket: WebSocket,
+    state: Arc<AppState>,
+    drone_id: String,
+) {
+    let pending = state.get_pending_commands(&drone_id);
+    for command in pending {
+        if let Ok(payload) = serde_json::to_string(&command) {
+            if socket.send(Message::Text(payload)).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    let mut rx = state.subscribe_commands();
+    while let Ok(command) = rx.recv().await {
+        if command.drone_id != drone_id {
+            continue;
+        }
+        if let Ok(payload) = serde_json::to_string(&command) {
+            if socket.send(Message::Text(payload)).await.is_err() {
+                break;
+            }
+        }
+    }
 }
