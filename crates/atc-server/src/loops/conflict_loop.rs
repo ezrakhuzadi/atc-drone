@@ -12,11 +12,12 @@ use tokio::time::interval;
 use chrono::{Duration as ChronoDuration, Utc};
 
 use crate::config::Config;
+use crate::route_planner::plan_airborne_route;
 use crate::state::AppState;
 use atc_blender::{BlenderClient, conflict_payload, conflict_to_geofence};
 use atc_core::{
-    ConflictSeverity, 
-    models::{Command, CommandType, DaaAdvisory, DaaSeverity, Waypoint},
+    Conflict, ConflictSeverity, 
+    models::{Command, CommandType, DaaAdvisory, DaaSeverity, Geofence, GeofenceType, Waypoint},
     generate_avoidance_route, select_avoidance_type,
 };
 
@@ -80,6 +81,7 @@ pub async fn run_conflict_loop(
 
                 let conflicts = state.get_conflicts();
                 let loop_now = Utc::now();
+                state.purge_conflict_geofences(loop_now.timestamp());
                 let refresh_deadline = loop_now.timestamp() + CONFLICT_REFRESH_GRACE_SECS;
                 let mut active_daa_ids: HashSet<String> = HashSet::new();
                 if conflicts.is_empty() {
@@ -88,6 +90,7 @@ pub async fn run_conflict_loop(
                             if let Err(err) = blender.delete_geofence(&existing.blender_id).await {
                                 tracing::warn!("Failed to delete conflict geofence: {}", err);
                             }
+                            state.clear_conflict_geofence(&existing.blender_id);
                         }
                     }
                     resolve_inactive_conflict_advisories(state.as_ref(), &active_daa_ids);
@@ -243,12 +246,23 @@ pub async fn run_conflict_loop(
                                         gw.altitude_m > 100.0,
                                     );
 
-                                    let avoidance_waypoints = generate_avoidance_route(
-                                        &current_pos,
-                                        &destination,
-                                        &conflict_point,
-                                        avoidance_type,
-                                    );
+                                    let conflict_geofence = build_conflict_geofence(conflict);
+                                    let planned = plan_airborne_route(
+                                        state.as_ref(),
+                                        &config,
+                                        &[current_pos.clone(), destination.clone()],
+                                        config.compliance_default_clearance_m,
+                                        std::slice::from_ref(&conflict_geofence),
+                                    )
+                                    .await;
+                                    let avoidance_waypoints = planned.unwrap_or_else(|| {
+                                        generate_avoidance_route(
+                                            &current_pos,
+                                            &destination,
+                                            &conflict_point,
+                                            avoidance_type,
+                                        )
+                                    });
 
                                     let cmd = Command {
                                         command_id: format!("REROUTE-{}-{}", give_way_id, now.timestamp()),
@@ -365,12 +379,23 @@ pub async fn run_conflict_loop(
                                 );
                                 
                                 // Generate avoidance route
-                                let avoidance_waypoints = generate_avoidance_route(
-                                    &current_pos,
-                                    &destination,
-                                    &conflict_point,
-                                    avoidance_type,
-                                );
+                                let conflict_geofence = build_conflict_geofence(conflict);
+                                let planned = plan_airborne_route(
+                                    state.as_ref(),
+                                    &config,
+                                    &[current_pos.clone(), destination.clone()],
+                                    config.compliance_default_clearance_m,
+                                    std::slice::from_ref(&conflict_geofence),
+                                )
+                                .await;
+                                let avoidance_waypoints = planned.unwrap_or_else(|| {
+                                    generate_avoidance_route(
+                                        &current_pos,
+                                        &destination,
+                                        &conflict_point,
+                                        avoidance_type,
+                                    )
+                                });
                                 
                                 let cmd = Command {
                                     command_id: format!("REROUTE-{}-{}", give_way_id, now.timestamp()),
@@ -427,6 +452,7 @@ pub async fn run_conflict_loop(
                         if let Err(err) = blender.delete_geofence(&existing.blender_id).await {
                             tracing::warn!("Failed to delete conflict geofence {}: {}", conflict_id, err);
                         }
+                        state.clear_conflict_geofence(&existing.blender_id);
                     }
                 }
 
@@ -443,6 +469,7 @@ pub async fn run_conflict_loop(
                         if let Err(err) = blender.delete_geofence(&existing.blender_id).await {
                             tracing::warn!("Failed to delete conflict geofence {}: {}", geofence.id, err);
                         }
+                        state.clear_conflict_geofence(&existing.blender_id);
                     }
 
                     let payload = match conflict_payload(geofence) {
@@ -455,13 +482,16 @@ pub async fn run_conflict_loop(
 
                     match blender.create_geofence(&payload).await {
                         Ok(blender_id) => {
+                            let expires_at = loop_now.timestamp() + CONFLICT_TTL_SECS;
+                            let blender_id_clone = blender_id.clone();
                             tracked_conflicts.insert(
                                 geofence.id.clone(),
                                 BlenderConflictState {
                                     blender_id,
-                                    expires_at: loop_now.timestamp() + CONFLICT_TTL_SECS,
+                                    expires_at,
                                 },
                             );
+                            state.mark_conflict_geofence(blender_id_clone, expires_at);
                         }
                         Err(err) => {
                             tracing::warn!("Failed to sync conflict geofence {}: {}", geofence.id, err);
@@ -486,5 +516,34 @@ fn resolve_inactive_conflict_advisories(state: &AppState, active_ids: &HashSet<S
         if !advisory.resolved {
             state.resolve_daa_advisory(&advisory.advisory_id);
         }
+    }
+}
+
+fn build_conflict_geofence(conflict: &Conflict) -> Geofence {
+    use atc_core::spatial::offset_by_bearing;
+
+    const NUM_POINTS: usize = 32;
+    let radius_m = match conflict.severity {
+        ConflictSeverity::Critical => 100.0,
+        ConflictSeverity::Warning => 75.0,
+        ConflictSeverity::Info => 50.0,
+    };
+
+    let mut polygon = Vec::with_capacity(NUM_POINTS + 1);
+    for i in 0..=NUM_POINTS {
+        let bearing = (i as f64) * (std::f64::consts::TAU / NUM_POINTS as f64);
+        let (lat, lon) = offset_by_bearing(conflict.cpa_lat, conflict.cpa_lon, radius_m, bearing);
+        polygon.push([lat, lon]);
+    }
+
+    Geofence {
+        id: format!("conflict:{}-{}", conflict.drone1_id, conflict.drone2_id),
+        name: format!("Conflict {} vs {}", conflict.drone1_id, conflict.drone2_id),
+        geofence_type: GeofenceType::TemporaryRestriction,
+        polygon,
+        lower_altitude_m: (conflict.cpa_altitude_m - 50.0).max(0.0),
+        upper_altitude_m: conflict.cpa_altitude_m + 50.0,
+        active: true,
+        created_at: Utc::now(),
     }
 }

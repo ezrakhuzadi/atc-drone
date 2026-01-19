@@ -175,6 +175,7 @@ async fn sync_external_geofences(
         .values()
         .map(|entry| entry.blender_id.clone())
         .collect();
+    let conflict_ids = state.get_conflict_geofence_ids();
     let now = Utc::now();
     let mut external_geofences = Vec::new();
 
@@ -184,6 +185,9 @@ async fn sync_external_geofences(
             None => continue,
         };
         if ignored_ids.contains(&parsed.blender_id) {
+            continue;
+        }
+        if conflict_ids.contains(&parsed.blender_id) {
             continue;
         }
         if is_conflict_geofence(&parsed.geofence) {

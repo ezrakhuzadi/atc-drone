@@ -6,7 +6,9 @@ use chrono::Utc;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+use dashmap::DashMap;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RoutePoint {
@@ -107,6 +109,17 @@ pub struct ObstacleHazard {
     pub distance_m: Option<f64>,
 }
 
+pub(crate) async fn fetch_obstacle_hazards(
+    client: &Client,
+    config: &Config,
+    points: &[RoutePoint],
+    clearance_m: f64,
+) -> Result<Vec<ObstacleHazard>, String> {
+    fetch_obstacles(client, config, points, clearance_m, None)
+        .await
+        .map(|analysis| analysis.hazards)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ObstacleConflict {
     pub id: String,
@@ -130,15 +143,50 @@ struct Bounds {
     max_lon: f64,
 }
 
-#[derive(Debug)]
-struct ObstacleAnalysis {
-    hazards: Vec<ObstacleHazard>,
-    obstacle_count: usize,
-    truncated: bool,
-    building_count: usize,
-    estimated_population: f64,
-    density: f64,
-    area_km2: f64,
+#[derive(Debug, Clone)]
+pub(crate) struct ObstacleAnalysis {
+    pub(crate) candidates: Vec<ObstacleCandidate>,
+    pub(crate) hazards: Vec<ObstacleHazard>,
+    pub(crate) footprints: Vec<ObstacleFootprint>,
+    pub(crate) obstacle_count: usize,
+    pub(crate) truncated: bool,
+    pub(crate) building_count: usize,
+    pub(crate) estimated_population: f64,
+    pub(crate) density: f64,
+    pub(crate) area_km2: f64,
+}
+
+#[derive(Debug, Clone)]
+struct ObstacleCacheEntry {
+    fetched_at: Instant,
+    analysis: ObstacleAnalysis,
+}
+
+fn obstacle_cache() -> &'static DashMap<String, ObstacleCacheEntry> {
+    static CACHE: OnceLock<DashMap<String, ObstacleCacheEntry>> = OnceLock::new();
+    CACHE.get_or_init(DashMap::new)
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ObstacleCandidate {
+    pub id: String,
+    pub name: String,
+    pub lat: f64,
+    pub lon: f64,
+    pub radius_m: f64,
+    pub height_m: f64,
+    pub hazard_type: String,
+    pub distance_m: Option<f64>,
+    pub polygon: Option<Vec<[f64; 2]>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ObstacleFootprint {
+    pub id: String,
+    pub name: String,
+    pub polygon: Vec<[f64; 2]>,
+    pub height_m: f64,
+    pub hazard_type: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -152,11 +200,18 @@ struct OverpassElement {
     lat: Option<f64>,
     lon: Option<f64>,
     center: Option<OverpassCenter>,
+    geometry: Option<Vec<OverpassGeometryPoint>>,
     tags: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct OverpassCenter {
+    lat: f64,
+    lon: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct OverpassGeometryPoint {
     lat: f64,
     lon: f64,
 }
@@ -209,7 +264,7 @@ pub async fn evaluate_compliance(
 
     let (weather_result, obstacle_result) = tokio::join!(
         fetch_weather(&client, config, points),
-        fetch_obstacles(&client, config, points, clearance_m)
+        fetch_obstacles(&client, config, points, clearance_m, None)
     );
 
     let weather_check = match weather_result {
@@ -594,18 +649,45 @@ async fn fetch_weather(
     }
 }
 
-async fn fetch_obstacles(
+pub(crate) async fn fetch_obstacles(
     client: &Client,
     config: &Config,
     points: &[RoutePoint],
     clearance_m: f64,
+    corridor_radius_m: Option<f64>,
 ) -> Result<ObstacleAnalysis, String> {
     let base_bounds = compute_bounds(points).ok_or("invalid route bounds")?;
-    let bounds = expand_bounds(&base_bounds);
+    let bounds = corridor_radius_m
+        .and_then(|radius| {
+            if radius.is_finite() && radius > 0.0 {
+                Some(expand_bounds_by_meters(&base_bounds, radius * 1.2))
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| expand_bounds(&base_bounds));
+    let cache_key = obstacle_cache_key(
+        &bounds,
+        clearance_m,
+        corridor_radius_m,
+        config.compliance_max_overpass_elements,
+    );
+    let cache_ttl = Duration::from_secs(config.obstacle_cache_ttl_s.max(30));
+    let cache = obstacle_cache();
+    let mut stale_cache: Option<ObstacleAnalysis> = None;
+    if let Some(entry) = cache.get(&cache_key) {
+        let age = entry.fetched_at.elapsed();
+        if age <= cache_ttl {
+            return Ok(entry.analysis.clone());
+        }
+        if age <= cache_ttl.saturating_mul(2) {
+            stale_cache = Some(entry.analysis.clone());
+        }
+    }
     let area_km2 = bounds_area_km2(&bounds);
     let bbox = format!("{},{},{},{}", bounds.min_lat, bounds.min_lon, bounds.max_lat, bounds.max_lon);
     let query = format!(
-        "[out:json][timeout:25];\n(\n  node[\"man_made\"~\"tower|mast|chimney\"]({bbox});\n  node[\"power\"=\"tower\"]({bbox});\n  node[\"aeroway\"~\"helipad|heliport\"]({bbox});\n  way[\"man_made\"~\"tower|mast|chimney\"]({bbox});\n  way[\"power\"=\"tower\"]({bbox});\n  way[\"aeroway\"~\"helipad|heliport\"]({bbox});\n  way[\"building\"]({bbox});\n);\nout center tags;"
+        "[out:json][timeout:25];\n(\n  node[\"man_made\"~\"tower|mast|chimney\"]({bbox});\n  node[\"power\"=\"tower\"]({bbox});\n  node[\"aeroway\"~\"helipad|heliport\"]({bbox});\n  way[\"man_made\"~\"tower|mast|chimney\"]({bbox});\n  way[\"power\"=\"tower\"]({bbox});\n  way[\"aeroway\"~\"helipad|heliport\"]({bbox});\n  way[\"building\"]({bbox});\n  way[\"building:part\"]({bbox});\n  relation[\"building\"]({bbox});\n  relation[\"building:part\"]({bbox});\n);\nout center geom tags;"
     );
 
     let response = client
@@ -614,48 +696,63 @@ async fn fetch_obstacles(
         .body(query)
         .send()
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| err.to_string());
+
+    let response = match response {
+        Ok(response) => response,
+        Err(err) => {
+            if let Some(stale) = stale_cache {
+                tracing::warn!("Obstacle fetch failed, using stale cache: {}", err);
+                return Ok(stale);
+            }
+            return Err(err);
+        }
+    };
 
     if !response.status().is_success() {
+        if let Some(stale) = stale_cache {
+            tracing::warn!(
+                "OSM provider HTTP {}, using stale cache",
+                response.status()
+            );
+            return Ok(stale);
+        }
         return Err(format!("OSM provider HTTP {}", response.status()));
     }
 
-    let payload: OverpassResponse = response.json().await.map_err(|err| err.to_string())?;
-    let elements = payload.elements;
-    let truncated = elements.len() > config.compliance_max_overpass_elements;
-    let sample: Vec<OverpassElement> = if truncated {
-        elements.into_iter().take(config.compliance_max_overpass_elements).collect()
-    } else {
-        elements
-    };
-
-    let mut building_count = 0usize;
-    let mut hazards = Vec::new();
-    let mut seen = HashSet::new();
-    let max_distance = 400.0_f64.max(clearance_m * 4.0);
-
-    for element in sample {
-        let tags = element.tags.clone().unwrap_or_default();
-        let center = element_center(&element).or_else(|| element.center.as_ref().map(|c| (c.lat, c.lon)));
-        let Some((lat, lon)) = center else { continue };
-
-        let is_building = tags.get("building").is_some();
-        if is_building {
-            building_count += 1;
+    let payload: OverpassResponse = match response.json().await {
+        Ok(payload) => payload,
+        Err(err) => {
+            if let Some(stale) = stale_cache {
+                tracing::warn!("OSM parse failed, using stale cache: {}", err);
+                return Ok(stale);
+            }
+            return Err(err.to_string());
         }
+    };
+    let elements = payload.elements;
 
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    let mut building_count = 0usize;
+    let mut max_distance = 400.0_f64.max(clearance_m * 4.0);
+    if let Some(radius) = corridor_radius_m {
+        if radius.is_finite() {
+            max_distance = max_distance.max(radius.max(clearance_m * 1.5));
+        }
+    }
+    let default_height = config.compliance_default_building_height_m.max(1.0);
+
+    for element in elements {
+        let tags = element.tags.clone().unwrap_or_default();
         let man_made = tags.get("man_made").map(String::as_str);
         let aeroway = tags.get("aeroway").map(String::as_str);
         let power = tags.get("power").map(String::as_str);
-        let levels = tags.get("building:levels").and_then(|v| v.parse::<f64>().ok());
-        let height_m = parse_height(tags.get("height"))
-            .or_else(|| parse_height(tags.get("height:roof")))
-            .or_else(|| levels.map(|lvl| lvl * 3.0));
+        let is_building = tags.get("building").is_some() || tags.get("building:part").is_some();
 
         let is_tower = matches!(man_made, Some("tower") | Some("mast") | Some("chimney"));
         let is_power_tower = matches!(power, Some("tower"));
         let is_helipad = matches!(aeroway, Some("helipad") | Some("heliport"));
-        let is_tall_building = is_building && height_m.unwrap_or(0.0) >= clearance_m.max(20.0);
 
         let obstacle_type = if is_tower {
             man_made.unwrap_or("tower")
@@ -663,8 +760,8 @@ async fn fetch_obstacles(
             "power_tower"
         } else if is_helipad {
             aeroway.unwrap_or("helipad")
-        } else if is_tall_building {
-            "tall_building"
+        } else if is_building {
+            "building"
         } else {
             ""
         };
@@ -673,22 +770,51 @@ async fn fetch_obstacles(
             continue;
         }
 
+        let Some((lat, lon)) = element_center(&element) else { continue };
         let distance_m = distance_to_route_meters(lat, lon, points);
         if distance_m.is_finite() && distance_m > max_distance {
             continue;
         }
 
+        if is_building {
+            building_count += 1;
+        }
+
+        let levels = tags
+            .get("building:levels")
+            .or_else(|| tags.get("levels"))
+            .and_then(|v| v.parse::<f64>().ok());
+        let mut height_m = parse_height(tags.get("height"))
+            .or_else(|| parse_height(tags.get("building:height")))
+            .or_else(|| parse_height(tags.get("height:roof")))
+            .or_else(|| parse_height(tags.get("roof:height")))
+            .or_else(|| levels.map(|lvl| lvl * 3.0))
+            .unwrap_or(default_height);
+        if !height_m.is_finite() || height_m <= 0.0 {
+            height_m = default_height;
+        }
+
         let base_radius = clearance_m.max(50.0);
-        let radius_m = height_m
-            .map(|h| base_radius.max(200.0_f64.min(h * 1.2)))
-            .unwrap_or(base_radius);
+        let mut radius_m = base_radius.max(200.0_f64.min(height_m * 1.2));
+        let mut polygon = None;
+        if is_building {
+            if let Some(geometry) = element.geometry.as_ref() {
+                if let Some(footprint) = geometry_to_polygon(geometry) {
+                    let footprint_radius = footprint_radius_m(lat, lon, &footprint);
+                    if footprint_radius.is_finite() {
+                        radius_m = radius_m.max(footprint_radius + clearance_m);
+                    }
+                    polygon = Some(footprint);
+                }
+            }
+        }
 
         let key = format!("{obstacle_type}:{:.5}:{:.5}", lat, lon);
         if !seen.insert(key) {
             continue;
         }
 
-        hazards.push(ObstacleHazard {
+        candidates.push(ObstacleCandidate {
             id: format!("{obstacle_type}-{}", element.id),
             name: tags
                 .get("name")
@@ -699,16 +825,51 @@ async fn fetch_obstacles(
             radius_m,
             height_m,
             hazard_type: obstacle_type.to_string(),
-            source: "OpenStreetMap".to_string(),
             distance_m: distance_m.is_finite().then_some(distance_m),
+            polygon,
         });
     }
 
-    hazards.sort_by(|a, b| a.distance_m.partial_cmp(&b.distance_m).unwrap_or(std::cmp::Ordering::Equal));
-    let obstacle_count = hazards.len();
-    let trimmed: Vec<ObstacleHazard> = hazards
-        .into_iter()
+    candidates.sort_by(|a, b| a.distance_m.partial_cmp(&b.distance_m).unwrap_or(std::cmp::Ordering::Equal));
+    let obstacle_count = candidates.len();
+    let truncated = obstacle_count > config.compliance_max_overpass_elements;
+    let route_candidates: Vec<ObstacleCandidate> = if truncated {
+        candidates
+            .into_iter()
+            .take(config.compliance_max_overpass_elements)
+            .collect()
+    } else {
+        candidates
+    };
+
+    let hazards: Vec<ObstacleHazard> = route_candidates
+        .iter()
         .take(config.compliance_max_obstacles_response)
+        .map(|candidate| ObstacleHazard {
+            id: candidate.id.clone(),
+            name: candidate.name.clone(),
+            lat: candidate.lat,
+            lon: candidate.lon,
+            radius_m: candidate.radius_m,
+            height_m: Some(candidate.height_m),
+            hazard_type: candidate.hazard_type.clone(),
+            source: "OpenStreetMap".to_string(),
+            distance_m: candidate.distance_m,
+        })
+        .collect();
+
+    let footprints: Vec<ObstacleFootprint> = route_candidates
+        .iter()
+        .filter_map(|candidate| {
+            let polygon = candidate.polygon.clone()?;
+            Some(ObstacleFootprint {
+                id: candidate.id.clone(),
+                name: candidate.name.clone(),
+                polygon,
+                height_m: candidate.height_m,
+                hazard_type: candidate.hazard_type.clone(),
+            })
+        })
         .collect();
 
     let estimated_population = building_count as f64 * config.compliance_population_per_building;
@@ -718,15 +879,27 @@ async fn fetch_obstacles(
         0.0
     };
 
-    Ok(ObstacleAnalysis {
-        hazards: trimmed,
+    let analysis = ObstacleAnalysis {
+        candidates: route_candidates,
+        hazards,
+        footprints,
         obstacle_count,
         truncated,
         building_count,
         estimated_population,
         density,
         area_km2,
-    })
+    };
+
+    cache.insert(
+        cache_key,
+        ObstacleCacheEntry {
+            fetched_at: Instant::now(),
+            analysis: analysis.clone(),
+        },
+    );
+
+    Ok(analysis)
 }
 
 fn route_center(points: &[RoutePoint]) -> Option<(f64, f64)> {
@@ -783,6 +956,20 @@ fn expand_bounds(bounds: &Bounds) -> Bounds {
     }
 }
 
+fn expand_bounds_by_meters(bounds: &Bounds, padding_m: f64) -> Bounds {
+    let mean_lat = ((bounds.min_lat + bounds.max_lat) / 2.0).to_radians();
+    let meters_per_deg_lat = 111_320.0;
+    let meters_per_deg_lon = 111_320.0 * mean_lat.cos().max(0.01);
+    let pad_lat = (padding_m / meters_per_deg_lat).max(0.002);
+    let pad_lon = (padding_m / meters_per_deg_lon).max(0.002);
+    Bounds {
+        min_lat: bounds.min_lat - pad_lat,
+        max_lat: bounds.max_lat + pad_lat,
+        min_lon: bounds.min_lon - pad_lon,
+        max_lon: bounds.max_lon + pad_lon,
+    }
+}
+
 fn bounds_area_km2(bounds: &Bounds) -> f64 {
     let mean_lat = ((bounds.min_lat + bounds.max_lat) / 2.0).to_radians();
     let meters_per_deg_lat = 111_320.0;
@@ -791,6 +978,25 @@ fn bounds_area_km2(bounds: &Bounds) -> f64 {
     let height_m = (bounds.max_lat - bounds.min_lat) * meters_per_deg_lat;
     let area_km2 = (width_m.max(0.0) * height_m.max(0.0)) / 1_000_000.0;
     area_km2.max(0.15)
+}
+
+fn obstacle_cache_key(
+    bounds: &Bounds,
+    clearance_m: f64,
+    corridor_radius_m: Option<f64>,
+    max_elements: usize,
+) -> String {
+    let radius = corridor_radius_m.unwrap_or(0.0);
+    format!(
+        "obs:{:.4}:{:.4}:{:.4}:{:.4}:{:.0}:{:.0}:{}",
+        bounds.min_lat,
+        bounds.min_lon,
+        bounds.max_lat,
+        bounds.max_lon,
+        clearance_m,
+        radius,
+        max_elements
+    )
 }
 
 fn parse_height(value: Option<&String>) -> Option<f64> {
@@ -810,10 +1016,65 @@ fn parse_height(value: Option<&String>) -> Option<f64> {
 }
 
 fn element_center(element: &OverpassElement) -> Option<(f64, f64)> {
-    match (element.lat, element.lon) {
-        (Some(lat), Some(lon)) => Some((lat, lon)),
-        _ => None,
+    if let (Some(lat), Some(lon)) = (element.lat, element.lon) {
+        return Some((lat, lon));
     }
+    if let Some(center) = element.center.as_ref() {
+        return Some((center.lat, center.lon));
+    }
+    if let Some(geometry) = element.geometry.as_ref() {
+        if geometry.is_empty() {
+            return None;
+        }
+        let mut sum_lat = 0.0;
+        let mut sum_lon = 0.0;
+        for point in geometry {
+            sum_lat += point.lat;
+            sum_lon += point.lon;
+        }
+        let count = geometry.len() as f64;
+        return Some((sum_lat / count, sum_lon / count));
+    }
+    None
+}
+
+fn geometry_to_polygon(geometry: &[OverpassGeometryPoint]) -> Option<Vec<[f64; 2]>> {
+    if geometry.len() < 3 {
+        return None;
+    }
+    let mut polygon: Vec<[f64; 2]> = geometry
+        .iter()
+        .map(|point| [point.lat, point.lon])
+        .collect();
+    if let (Some(first), Some(last)) = (polygon.first().copied(), polygon.last().copied()) {
+        if (first[0] - last[0]).abs() > 1e-6 || (first[1] - last[1]).abs() > 1e-6 {
+            polygon.push(first);
+        }
+    }
+    Some(polygon)
+}
+
+fn footprint_radius_m(center_lat: f64, center_lon: f64, polygon: &[[f64; 2]]) -> f64 {
+    let mut max = 0.0;
+    for vertex in polygon {
+        let distance = haversine_distance_latlon(center_lat, center_lon, vertex[0], vertex[1]);
+        if distance > max {
+            max = distance;
+        }
+    }
+    max
+}
+
+fn haversine_distance_latlon(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let r = 6_371_000.0_f64;
+    let lat1 = lat1.to_radians();
+    let lat2 = lat2.to_radians();
+    let dlat = lat2 - lat1;
+    let dlon = (lon2 - lon1).to_radians();
+    let a = (dlat / 2.0).sin().powi(2)
+        + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
+    let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+    r * c
 }
 
 fn classify_density(density: f64) -> String {

@@ -4,7 +4,7 @@ use atc_core::models::{Command, DroneState, FlightPlan, Telemetry, Geofence, Con
 use atc_core::rules::SafetyRules;
 use atc_core::{Conflict, ConflictDetector};
 use dashmap::DashMap;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{atomic::{AtomicU32, Ordering}, RwLock};
 use std::future::Future;
 use chrono::Utc;
@@ -38,6 +38,8 @@ pub struct AppState {
     geofences: DashMap<String, Geofence>,
     /// External geofences pulled from Blender/DSS (not persisted)
     external_geofences: DashMap<String, Geofence>,
+    /// Conflict geofence IDs pushed to Blender (avoid re-ingest)
+    conflict_geofences: DashMap<String, i64>,
     /// Latest conformance status per drone
     conformance: DashMap<String, ConformanceStatus>,
     /// Latest DAA advisories per drone
@@ -111,6 +113,7 @@ impl AppState {
             rules,
             geofences: DashMap::new(),
             external_geofences: DashMap::new(),
+            conflict_geofences: DashMap::new(),
             conformance: DashMap::new(),
             daa_advisories: DashMap::new(),
             rid_view_bbox: RwLock::new(String::new()),
@@ -710,6 +713,37 @@ impl AppState {
         }
     }
 
+    /// Track a Blender conflict geofence ID to avoid re-ingest.
+    pub fn mark_conflict_geofence(&self, blender_id: String, expires_at: i64) {
+        self.conflict_geofences.insert(blender_id, expires_at);
+    }
+
+    /// Remove a Blender conflict geofence from tracking.
+    pub fn clear_conflict_geofence(&self, blender_id: &str) {
+        self.conflict_geofences.remove(blender_id);
+    }
+
+    /// Purge expired conflict geofence IDs.
+    pub fn purge_conflict_geofences(&self, now_ts: i64) {
+        let expired: Vec<String> = self
+            .conflict_geofences
+            .iter()
+            .filter(|entry| *entry.value() <= now_ts)
+            .map(|entry| entry.key().clone())
+            .collect();
+        for blender_id in expired {
+            self.conflict_geofences.remove(&blender_id);
+        }
+    }
+
+    /// Get conflict Blender IDs currently tracked.
+    pub fn get_conflict_geofence_ids(&self) -> HashSet<String> {
+        self.conflict_geofences
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect()
+    }
+
     /// Get all local geofences (ATC-managed only).
     pub fn get_local_geofences(&self) -> Vec<Geofence> {
         self.geofences.iter().map(|e| e.value().clone()).collect()
@@ -781,6 +815,7 @@ impl AppState {
         self.flight_plans.clear();
         self.geofences.clear();
         self.external_geofences.clear();
+        self.conflict_geofences.clear();
         self.conformance.clear();
         self.daa_advisories.clear();
         

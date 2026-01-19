@@ -6,6 +6,8 @@ mod state;
 mod loops;
 mod config;
 mod persistence;
+mod route_planner;
+mod terrain;
 
 use anyhow::{Result, bail};
 use axum::routing::get;

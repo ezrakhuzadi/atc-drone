@@ -47,6 +47,22 @@ pub struct Config {
     pub compliance_population_warn: f64,
     pub compliance_population_absolute_max: f64,
     pub compliance_default_clearance_m: f64,
+    pub compliance_default_building_height_m: f64,
+    pub compliance_overpass_timeout_s: u64,
+    pub compliance_overpass_retries: u32,
+    pub compliance_overpass_retry_backoff_ms: u64,
+    pub obstacle_cache_ttl_s: u64,
+    pub terrain_provider_url: String,
+    pub terrain_sample_spacing_m: f64,
+    pub terrain_max_points_per_request: usize,
+    pub terrain_max_grid_points: usize,
+    pub terrain_request_timeout_s: u64,
+    pub terrain_request_retries: u32,
+    pub terrain_request_backoff_ms: u64,
+    pub terrain_request_min_interval_ms: u64,
+    pub terrain_require: bool,
+    pub terrain_cache_ttl_s: u64,
+    pub terrain_max_requests: usize,
     pub telemetry_min_alt_m: f64,
     pub telemetry_max_alt_m: f64,
     pub telemetry_max_speed_mps: f64,
@@ -102,7 +118,7 @@ impl Config {
             blender_auth_token: env::var("BLENDER_AUTH_TOKEN").unwrap_or_default(),
             allowed_origins: env::var("ATC_ALLOWED_ORIGINS")
                 .unwrap_or_else(|_| if is_dev {
-                    "http://localhost:5000,http://localhost:3000,http://127.0.0.1:5000".to_string()
+                    "http://localhost:5000,http://localhost:3000,http://localhost:5050,http://127.0.0.1:5000,http://127.0.0.1:5050".to_string()
                 } else {
                     "".to_string() // Must be explicitly set in production
                 })
@@ -191,6 +207,39 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(60.0),
+            compliance_default_building_height_m: env::var("ATC_COMPLIANCE_DEFAULT_BUILDING_HEIGHT_M")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30.0),
+            obstacle_cache_ttl_s: env::var("ATC_OBSTACLE_CACHE_TTL_S")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(900),
+            terrain_provider_url: env::var("ATC_TERRAIN_PROVIDER_URL")
+                .unwrap_or_else(|_| "https://api.open-meteo.com/v1/elevation".to_string()),
+            terrain_sample_spacing_m: env::var("ATC_TERRAIN_SAMPLE_SPACING_M")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30.0),
+            terrain_max_points_per_request: env::var("ATC_TERRAIN_MAX_POINTS_PER_REQUEST")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(100),
+            terrain_max_grid_points: env::var("ATC_TERRAIN_MAX_GRID_POINTS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(50000),
+            terrain_request_timeout_s: env::var("ATC_TERRAIN_REQUEST_TIMEOUT_S")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(15),
+            terrain_require: env::var("ATC_TERRAIN_REQUIRE")
+                .map(|v| v != "0" && v.to_lowercase() != "false")
+                .unwrap_or(!is_dev),
+            terrain_cache_ttl_s: env::var("ATC_TERRAIN_CACHE_TTL_S")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(900),
             telemetry_min_alt_m: env::var("ATC_TELEMETRY_MIN_ALT_M")
                 .ok()
                 .and_then(|s| s.parse().ok())

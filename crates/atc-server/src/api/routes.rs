@@ -18,6 +18,7 @@ use crate::api::{commands, flights, geofences, daa, ws};
 use crate::api::auth::{self, AdminToken, RateLimiter};
 use crate::compliance::{self, ComplianceReport, RoutePoint};
 use crate::config::Config;
+use crate::route_planner::{plan_route, RoutePlanRequest, RoutePlanResponse};
 use crate::state::{AppState, ExternalTraffic};
 use atc_core::models::{Telemetry, ConformanceStatus, DroneStatus, FlightPlanRequest, FlightPlanMetadata, TrajectoryPoint, Waypoint, GeofenceType};
 
@@ -43,6 +44,7 @@ pub fn create_router(config: &Config) -> Router<Arc<AppState>> {
         .route("/v1/compliance/limits", get(get_compliance_limits))
         .route("/v1/compliance/evaluate", post(evaluate_compliance))
         .route("/v1/rid/view", post(update_rid_view))
+        .route("/v1/routes/plan", post(plan_route_handler))
         .route("/v1/flights/plan", post(flights::create_flight_plan))
         .route("/v1/flights", get(flights::get_flight_plans).post(flights::create_flight_plan_compat))
         // Command dispatch routes
@@ -672,6 +674,15 @@ fn extract_route_points(request: &FlightPlanRequest) -> Vec<RoutePoint> {
     }
 
     points
+}
+
+async fn plan_route_handler(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<RoutePlanRequest>,
+) -> impl IntoResponse {
+    let response: RoutePlanResponse = plan_route(state.as_ref(), state.config(), request).await;
+    let status = if response.ok { StatusCode::OK } else { StatusCode::BAD_REQUEST };
+    (status, Json(response))
 }
 
 async fn update_rid_view(
