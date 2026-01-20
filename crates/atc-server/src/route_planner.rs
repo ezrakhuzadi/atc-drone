@@ -2,7 +2,7 @@
 
 use atc_core::models::{Geofence, GeofenceType, Waypoint};
 use atc_core::route_engine::{
-    RouteEngineConfig, RouteEngineResult, RouteEngineWaypoint, RouteGrid, RouteObstacle,
+    RouteEngineConfig, RouteEngineResult, RouteEngineWaypoint, RouteObstacle,
     apply_obstacles, build_lane_offsets, generate_grid_samples, optimize_airborne_path,
     optimize_flight_path, resolve_grid_spacing,
 };
@@ -10,7 +10,7 @@ use atc_core::spatial::{bearing, haversine_distance, offset_by_bearing};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::compliance::{fetch_obstacles, ObstacleFootprint, ObstacleHazard, RoutePoint};
+use crate::compliance::{fetch_obstacles, ObstacleAnalysis, ObstacleFootprint, ObstacleHazard, RoutePoint};
 use crate::config::Config;
 use crate::state::AppState;
 use crate::terrain::{fetch_terrain_grid, TerrainGrid};
@@ -150,6 +150,27 @@ async fn plan_route_single(
     {
         Ok(result) => result,
         Err(err) => {
+            if config.route_planner_require_obstacles {
+                return RoutePlanResponse {
+                    ok: false,
+                    waypoints: Vec::new(),
+                    stats: None,
+                    nodes_visited: 0,
+                    optimized_points: 0,
+                    sample_points: 0,
+                    hazards: Vec::new(),
+                    errors: vec![format!("obstacle fetch failed: {}", err)],
+                };
+            }
+            tracing::warn!("Obstacle fetch failed, continuing without obstacles: {}", err);
+            empty_obstacle_analysis()
+        }
+    };
+
+    if analysis.truncated {
+        if config.route_planner_allow_truncated_obstacles {
+            tracing::warn!("Obstacle dataset truncated; continuing with partial data");
+        } else {
             return RoutePlanResponse {
                 ok: false,
                 waypoints: Vec::new(),
@@ -158,25 +179,12 @@ async fn plan_route_single(
                 optimized_points: 0,
                 sample_points: 0,
                 hazards: Vec::new(),
-                errors: vec![format!("obstacle fetch failed: {}", err)],
+                errors: vec![
+                    "obstacle dataset truncated; increase ATC_COMPLIANCE_MAX_OVERPASS_ELEMENTS"
+                        .to_string(),
+                ],
             };
         }
-    };
-
-    if analysis.truncated {
-        return RoutePlanResponse {
-            ok: false,
-            waypoints: Vec::new(),
-            stats: None,
-            nodes_visited: 0,
-            optimized_points: 0,
-            sample_points: 0,
-            hazards: Vec::new(),
-            errors: vec![
-                "obstacle dataset truncated; increase ATC_COMPLIANCE_MAX_OVERPASS_ELEMENTS"
-                    .to_string(),
-            ],
-        };
     }
 
     let hazards = analysis.hazards.clone();
@@ -535,7 +543,7 @@ async fn plan_airborne_segment(
         .collect();
 
     let client = Client::new();
-    let analysis = fetch_obstacles(
+    let analysis = match fetch_obstacles(
         &client,
         config,
         &points,
@@ -543,9 +551,22 @@ async fn plan_airborne_segment(
         Some(max_lane_radius + safety_buffer_m),
     )
     .await
-    .map_err(SegmentError::Obstacle)?;
+    {
+        Ok(result) => result,
+        Err(err) => {
+            if config.route_planner_require_obstacles {
+                return Err(SegmentError::Obstacle(err));
+            }
+            tracing::warn!("Obstacle fetch failed, continuing without obstacles: {}", err);
+            empty_obstacle_analysis()
+        }
+    };
     if analysis.truncated {
-        return Err(SegmentError::Truncated);
+        if config.route_planner_allow_truncated_obstacles {
+            tracing::warn!("Obstacle dataset truncated; continuing with partial data");
+        } else {
+            return Err(SegmentError::Truncated);
+        }
     }
 
     let hazards = analysis.hazards.clone();
@@ -581,7 +602,6 @@ async fn plan_airborne_segment(
     let route_distance_m = route_distance_m(waypoints);
     let mut lane_radius = lane_radius;
     let mut last_errors = Vec::new();
-    let mut last_sample_points = 0usize;
 
     while lane_radius <= max_lane_radius + f64::EPSILON {
         let lane_offsets = build_lane_offsets(lane_radius, lane_spacing);
@@ -590,7 +610,7 @@ async fn plan_airborne_segment(
             last_errors = vec!["failed to generate grid".to_string()];
             break;
         };
-        last_sample_points = grid
+        let last_sample_points = grid
             .lanes
             .first()
             .map(|lane| lane.len() * grid.lanes.len())
@@ -635,16 +655,6 @@ async fn plan_airborne_segment(
     Err(SegmentError::Path(errors))
 }
 
-pub fn plan_reroute(
-    grid: &RouteGrid,
-    waypoints: &[Waypoint],
-    geofences: &[Geofence],
-    safety_buffer_m: f64,
-) -> RouteEngineResult {
-    let mut engine_config = RouteEngineConfig::default();
-    engine_config.safety_buffer_m = safety_buffer_m;
-    optimize_flight_path(waypoints, grid, geofences, &engine_config)
-}
 
 fn build_obstacle_geofences(
     footprints: &[ObstacleFootprint],
@@ -678,6 +688,20 @@ fn build_obstacle_geofences(
     geofences
 }
 
+fn empty_obstacle_analysis() -> ObstacleAnalysis {
+    ObstacleAnalysis {
+        candidates: Vec::new(),
+        hazards: Vec::new(),
+        footprints: Vec::new(),
+        obstacle_count: 0,
+        truncated: false,
+        building_count: 0,
+        estimated_population: 0.0,
+        density: 0.0,
+        area_km2: 0.0,
+    }
+}
+
 pub async fn plan_airborne_route(
     state: &AppState,
     config: &Config,
@@ -706,7 +730,7 @@ pub async fn plan_airborne_route(
     let max_lane_radius = resolve_max_lane_radius(route_distance_m, lane_radius, None);
 
     let client = Client::new();
-    let analysis = fetch_obstacles(
+    let analysis = match fetch_obstacles(
         &client,
         config,
         &points,
@@ -714,9 +738,22 @@ pub async fn plan_airborne_route(
         Some(max_lane_radius + safety_buffer_m),
     )
     .await
-    .ok()?;
+    {
+        Ok(result) => result,
+        Err(err) => {
+            if config.route_planner_require_obstacles {
+                return None;
+            }
+            tracing::warn!("Obstacle fetch failed, continuing without obstacles: {}", err);
+            empty_obstacle_analysis()
+        }
+    };
     if analysis.truncated {
-        return None;
+        if config.route_planner_allow_truncated_obstacles {
+            tracing::warn!("Obstacle dataset truncated; continuing with partial data");
+        } else {
+            return None;
+        }
     }
 
     let obstacles: Vec<RouteObstacle> = analysis
@@ -964,7 +1001,8 @@ fn wrap_with_takeoff_landing(
     }
 
     let first = &cruise_path[0];
-    let last = cruise_path.last().unwrap();
+    // SAFETY: cruise_path is non-empty (checked above on line 999)
+    let last = &cruise_path[cruise_path.len() - 1];
     let start_ground = sample_ground(
         terrain,
         start_fallback,

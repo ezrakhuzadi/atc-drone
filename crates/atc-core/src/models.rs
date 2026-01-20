@@ -411,9 +411,7 @@ impl Geofence {
         }
         
         // Check polygon is closed (first == last)
-        if self.polygon.len() >= 3 {
-            let first = self.polygon.first().unwrap();
-            let last = self.polygon.last().unwrap();
+        if let (Some(first), Some(last)) = (self.polygon.first(), self.polygon.last()) {
             if (first[0] - last[0]).abs() > 0.0001 || (first[1] - last[1]).abs() > 0.0001 {
                 errors.push("Polygon must be closed (first vertex must equal last)".to_string());
             }
