@@ -224,25 +224,15 @@ fn segment_to_segment_distance(
     a1_lat: f64, a1_lon: f64, a2_lat: f64, a2_lon: f64,
     b1_lat: f64, b1_lon: f64, b2_lat: f64, b2_lon: f64,
 ) -> f64 {
-    let mut min_dist = f64::MAX;
+    // Check distance from A's endpoints to segment B
+    let d1 = distance_to_segment_m(a1_lat, a1_lon, b1_lat, b1_lon, b2_lat, b2_lon);
+    let d2 = distance_to_segment_m(a2_lat, a2_lon, b1_lat, b1_lon, b2_lat, b2_lon);
     
-    // Sample 5 points along each segment
-    for i in 0..=4 {
-        let t = i as f64 / 4.0;
-        let a_lat = a1_lat + t * (a2_lat - a1_lat);
-        let a_lon = a1_lon + t * (a2_lon - a1_lon);
-        
-        for j in 0..=4 {
-            let s = j as f64 / 4.0;
-            let b_lat = b1_lat + s * (b2_lat - b1_lat);
-            let b_lon = b1_lon + s * (b2_lon - b1_lon);
-            
-            let dist = haversine_distance(a_lat, a_lon, b_lat, b_lon);
-            min_dist = min_dist.min(dist);
-        }
-    }
+    // Check distance from B's endpoints to segment A
+    let d3 = distance_to_segment_m(b1_lat, b1_lon, a1_lat, a1_lon, a2_lat, a2_lon);
+    let d4 = distance_to_segment_m(b2_lat, b2_lon, a1_lat, a1_lon, a2_lat, a2_lon);
     
-    min_dist
+    d1.min(d2).min(d3).min(d4)
 }
 
 /// Calculate distance between two points in meters using Haversine formula.

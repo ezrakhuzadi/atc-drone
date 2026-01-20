@@ -12,6 +12,7 @@
 //!   cargo run -p atc-cli --bin demo_scenario
 
 use atc_core::models::CommandType;
+use atc_core::spatial::haversine_distance;
 use atc_sdk::AtcClient;
 use clap::Parser;
 use std::time::Duration;
@@ -139,7 +140,7 @@ impl DemoState {
     }
 
     /// Update phase based on elapsed time and current state
-    fn update_phase(&mut self, elapsed: f64, cruise_duration: f64) {
+    fn update_phase(&mut self, elapsed: f64, _cruise_duration: f64) {
         let phase_elapsed = elapsed - self.phase_start_time;
         
         match self.phase {
@@ -181,7 +182,7 @@ impl DemoState {
     }
 
     /// Get current position based on phase and progress
-    fn get_position(&self, cruise_elapsed: f64, cruise_duration: f64) -> (f64, f64) {
+    fn get_position(&self, cruise_elapsed: f64, _cruise_duration: f64) -> (f64, f64) {
         match self.phase {
             FlightPhase::Preflight | FlightPhase::Takeoff => {
                 // Stay at start position
@@ -211,7 +212,7 @@ impl DemoState {
                         self.current_lat, self.current_lon,
                         self.end_lat, self.end_lon
                     );
-                    let total_distance = haversine_distance(
+                    let _total_distance = haversine_distance(
                         self.start_lat, self.start_lon,
                         self.end_lat, self.end_lon
                     );
@@ -462,12 +463,4 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    const R: f64 = 6_371_000.0;
-    let phi1 = lat1.to_radians();
-    let phi2 = lat2.to_radians();
-    let dphi = (lat2 - lat1).to_radians();
-    let dlambda = (lon2 - lon1).to_radians();
-    let a = (dphi / 2.0).sin().powi(2) + phi1.cos() * phi2.cos() * (dlambda / 2.0).sin().powi(2);
-    2.0 * R * a.sqrt().atan2((1.0 - a).sqrt())
-}
+// Removed local haversine_distance. Using atc_core::spatial::haversine_distance instead.

@@ -103,7 +103,6 @@ struct NodeKey {
 }
 
 struct PathResult {
-    path_nodes: Vec<Node>,
     smoothed_path: Vec<Node>,
     nodes_visited: usize,
     max_cruise_alt: f64,
@@ -343,7 +342,6 @@ pub fn optimize_flight_path(
                             altitude_m: segment_cruise_alt,
                             phase: Some("CRUISE_CORNER".to_string()),
                         });
-                        last_output_node = Some(prev.clone());
                     }
                     final_waypoints.push(RouteEngineWaypoint {
                         lat: node_point.lat,
@@ -621,7 +619,6 @@ fn compute_path_nodes(
     }
 
     Ok(PathResult {
-        path_nodes,
         smoothed_path,
         nodes_visited,
         max_cruise_alt,

@@ -41,23 +41,7 @@ pub async fn ack_command(pool: &SqlitePool, command_id: &str) -> Result<bool> {
     Ok(result.rows_affected() > 0)
 }
 
-/// Load pending commands for a drone.
-pub async fn load_pending_commands(pool: &SqlitePool, drone_id: &str) -> Result<Vec<Command>> {
-    let rows = sqlx::query_as::<_, CommandRow>(
-        r#"
-        SELECT command_id, drone_id, command_type, issued_at, expires_at, acknowledged
-        FROM commands
-        WHERE drone_id = ?1 AND acknowledged = 0
-        AND (expires_at IS NULL OR expires_at > datetime('now'))
-        ORDER BY issued_at ASC
-        "#
-    )
-    .bind(drone_id)
-    .fetch_all(pool)
-    .await?;
-    
-    rows.into_iter().map(|r| r.try_into()).collect()
-}
+
 
 /// Load all pending commands (for all drones).
 pub async fn load_all_pending_commands(pool: &SqlitePool) -> Result<Vec<Command>> {
@@ -87,15 +71,7 @@ pub async fn delete_expired_commands(pool: &SqlitePool) -> Result<u64> {
     Ok(result.rows_affected())
 }
 
-/// Delete a specific command.
-pub async fn delete_command(pool: &SqlitePool, command_id: &str) -> Result<bool> {
-    let result = sqlx::query("DELETE FROM commands WHERE command_id = ?1")
-        .bind(command_id)
-        .execute(pool)
-        .await?;
-    
-    Ok(result.rows_affected() > 0)
-}
+
 
 // Internal row type for SQLx
 #[derive(sqlx::FromRow)]

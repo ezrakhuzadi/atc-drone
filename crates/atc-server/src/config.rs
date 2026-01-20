@@ -52,6 +52,8 @@ pub struct Config {
     pub compliance_overpass_retries: u32,
     pub compliance_overpass_retry_backoff_ms: u64,
     pub obstacle_cache_ttl_s: u64,
+    pub route_planner_require_obstacles: bool,
+    pub route_planner_allow_truncated_obstacles: bool,
     pub terrain_provider_url: String,
     pub terrain_sample_spacing_m: f64,
     pub terrain_max_points_per_request: usize,
@@ -211,10 +213,28 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(30.0),
+            compliance_overpass_timeout_s: env::var("ATC_COMPLIANCE_OVERPASS_TIMEOUT_S")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(25),
+            compliance_overpass_retries: env::var("ATC_COMPLIANCE_OVERPASS_RETRIES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2),
+            compliance_overpass_retry_backoff_ms: env::var("ATC_COMPLIANCE_OVERPASS_RETRY_BACKOFF_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(500),
             obstacle_cache_ttl_s: env::var("ATC_OBSTACLE_CACHE_TTL_S")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(900),
+            route_planner_require_obstacles: env::var("ATC_ROUTE_PLANNER_REQUIRE_OBSTACLES")
+                .map(|v| v != "0" && v.to_lowercase() != "false")
+                .unwrap_or(!is_dev),
+            route_planner_allow_truncated_obstacles: env::var("ATC_ROUTE_PLANNER_ALLOW_TRUNCATED_OBSTACLES")
+                .map(|v| v != "0" && v.to_lowercase() != "false")
+                .unwrap_or(is_dev),
             terrain_provider_url: env::var("ATC_TERRAIN_PROVIDER_URL")
                 .unwrap_or_else(|_| "https://api.open-meteo.com/v1/elevation".to_string()),
             terrain_sample_spacing_m: env::var("ATC_TERRAIN_SAMPLE_SPACING_M")
@@ -233,6 +253,18 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(15),
+            terrain_request_retries: env::var("ATC_TERRAIN_REQUEST_RETRIES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2),
+            terrain_request_backoff_ms: env::var("ATC_TERRAIN_REQUEST_BACKOFF_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(250),
+            terrain_request_min_interval_ms: env::var("ATC_TERRAIN_REQUEST_MIN_INTERVAL_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(100),
             terrain_require: env::var("ATC_TERRAIN_REQUIRE")
                 .map(|v| v != "0" && v.to_lowercase() != "false")
                 .unwrap_or(!is_dev),
@@ -240,6 +272,10 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(900),
+            terrain_max_requests: env::var("ATC_TERRAIN_MAX_REQUESTS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(600),
             telemetry_min_alt_m: env::var("ATC_TELEMETRY_MIN_ALT_M")
                 .ok()
                 .and_then(|s| s.parse().ok())

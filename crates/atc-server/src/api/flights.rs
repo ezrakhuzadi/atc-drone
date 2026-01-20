@@ -103,7 +103,7 @@ pub async fn create_flight_plan(
     Ok((StatusCode::CREATED, Json(plan)))
 }
 
-pub async fn create_flight_plan_compat(
+pub(crate) async fn create_flight_plan_compat(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<FlightPlanSubmission>,
 ) -> Result<(StatusCode, Json<FlightPlan>), (StatusCode, Json<serde_json::Value>)> {

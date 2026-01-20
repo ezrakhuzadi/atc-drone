@@ -264,8 +264,9 @@ fn build_ws_url(base: &str, path: &str, drone_id: &str) -> Result<Url> {
         "http" => "ws",
         "https" => "wss",
         other => other,
-    };
-    url.set_scheme(scheme)
+    }.to_string();
+    
+    url.set_scheme(&scheme)
         .map_err(|_| anyhow::anyhow!("Invalid base URL scheme"))?;
     url.set_path(path);
     url.query_pairs_mut().append_pair("drone_id", drone_id);

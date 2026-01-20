@@ -174,11 +174,7 @@ pub struct RidViewResponse {
     pub view: String,
 }
 
-#[derive(Debug, Serialize)]
-pub struct RegisterResponse {
-    pub drone_id: String,
-    pub session_token: String,
-}
+
 
 // === Handlers ===
 
@@ -726,12 +722,8 @@ struct AdminResetRequest {
     require_idle: Option<bool>,
 }
 
-#[derive(Debug, Serialize)]
-struct AdminResetResponse {
-    cleared: bool,
-    active_drones: usize,
-    message: String,
-}
+
+
 
 async fn admin_reset(
     State(state): State<Arc<AppState>>,

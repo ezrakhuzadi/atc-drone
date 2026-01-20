@@ -1,5 +1,6 @@
 //! Flight path implementations.
 
+use atc_core::spatial::haversine_distance;
 use std::f64::consts::PI;
 
 /// Trait for flight path implementations.
@@ -185,19 +186,7 @@ impl FlightPath for LinearPath {
     }
 }
 
-/// Calculate distance between two points in meters (Haversine formula).
-fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    const R: f64 = 6_371_000.0; // Earth radius in meters
-
-    let phi1 = lat1.to_radians();
-    let phi2 = lat2.to_radians();
-    let dphi = (lat2 - lat1).to_radians();
-    let dlambda = (lon2 - lon1).to_radians();
-
-    let a = (dphi / 2.0).sin().powi(2) + phi1.cos() * phi2.cos() * (dlambda / 2.0).sin().powi(2);
-
-    2.0 * R * a.sqrt().atan2((1.0 - a).sqrt())
-}
+// Removed local haversine_distance. Using atc_core::spatial::haversine_distance.
 
 #[cfg(test)]
 mod tests {

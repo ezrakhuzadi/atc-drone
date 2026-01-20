@@ -1,8 +1,3 @@
-//! ATC Core - Pure logic for conflict detection and routing
-//!
-//! This crate contains the domain models and business logic
-//! with NO networking dependencies.
-
 pub mod conflict;
 pub mod models;
 pub mod route_engine;

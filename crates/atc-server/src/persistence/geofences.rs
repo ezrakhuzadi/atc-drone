@@ -44,20 +44,7 @@ pub async fn load_all_geofences(pool: &SqlitePool) -> Result<Vec<Geofence>> {
     rows.into_iter().map(|r| r.try_into()).collect()
 }
 
-/// Load a single geofence by ID.
-pub async fn load_geofence(pool: &SqlitePool, id: &str) -> Result<Option<Geofence>> {
-    let row = sqlx::query_as::<_, GeofenceRow>(
-        "SELECT id, name, geofence_type, vertices, lower_altitude_m, upper_altitude_m, active, created_at FROM geofences WHERE id = ?1"
-    )
-    .bind(id)
-    .fetch_optional(pool)
-    .await?;
-    
-    match row {
-        Some(r) => Ok(Some(r.try_into()?)),
-        None => Ok(None),
-    }
-}
+
 
 /// Delete a geofence by ID.
 pub async fn delete_geofence(pool: &SqlitePool, id: &str) -> Result<bool> {

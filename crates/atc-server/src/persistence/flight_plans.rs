@@ -74,42 +74,7 @@ pub async fn load_all_flight_plans(pool: &SqlitePool) -> Result<Vec<FlightPlan>>
     rows.into_iter().map(|r| r.try_into()).collect()
 }
 
-/// Load flight plans by owner.
-pub async fn load_flight_plans_by_owner(pool: &SqlitePool, owner_id: &str) -> Result<Vec<FlightPlan>> {
-    let rows = sqlx::query_as::<_, FlightPlanRow>(
-        "SELECT flight_id, drone_id, owner_id, waypoints, trajectory_log, metadata, status, start_time, end_time, created_at FROM flight_plans WHERE owner_id = ?1"
-    )
-    .bind(owner_id)
-    .fetch_all(pool)
-    .await?;
-    
-    rows.into_iter().map(|r| r.try_into()).collect()
-}
 
-/// Load a single flight plan by ID.
-pub async fn load_flight_plan(pool: &SqlitePool, flight_id: &str) -> Result<Option<FlightPlan>> {
-    let row = sqlx::query_as::<_, FlightPlanRow>(
-        "SELECT flight_id, drone_id, owner_id, waypoints, trajectory_log, metadata, status, start_time, end_time, created_at FROM flight_plans WHERE flight_id = ?1"
-    )
-    .bind(flight_id)
-    .fetch_optional(pool)
-    .await?;
-    
-    match row {
-        Some(r) => Ok(Some(r.try_into()?)),
-        None => Ok(None),
-    }
-}
-
-/// Delete a flight plan by ID.
-pub async fn delete_flight_plan(pool: &SqlitePool, flight_id: &str) -> Result<bool> {
-    let result = sqlx::query("DELETE FROM flight_plans WHERE flight_id = ?1")
-        .bind(flight_id)
-        .execute(pool)
-        .await?;
-    
-    Ok(result.rows_affected() > 0)
-}
 
 // Internal row type for SQLx
 #[derive(sqlx::FromRow)]

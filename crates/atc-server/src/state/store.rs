@@ -65,10 +65,7 @@ pub struct ExternalTraffic {
 }
 
 impl AppState {
-    /// Create new AppState with default safety rules (no database).
-    pub fn new() -> Self {
-        Self::with_rules(SafetyRules::default())
-    }
+
     
     /// Create new AppState with database for persistence.
     pub fn with_database(db: Database, config: Config) -> Self {
@@ -79,10 +76,7 @@ impl AppState {
     }
 
     /// Create new AppState with custom safety rules.
-    pub fn with_rules(rules: SafetyRules) -> Self {
-        let config = Config::from_env();
-        Self::with_rules_and_config(rules, config)
-    }
+
 
     /// Create new AppState with custom rules and config.
     pub fn with_rules_and_config(rules: SafetyRules, config: Config) -> Self {
@@ -749,10 +743,7 @@ impl AppState {
         self.geofences.iter().map(|e| e.value().clone()).collect()
     }
 
-    /// Get all external geofences (Blender/DSS).
-    pub fn get_external_geofences(&self) -> Vec<Geofence> {
-        self.external_geofences.iter().map(|e| e.value().clone()).collect()
-    }
+
 
     /// Get all geofences.
     pub fn get_geofences(&self) -> Vec<Geofence> {

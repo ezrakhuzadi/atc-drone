@@ -109,16 +109,7 @@ pub struct ObstacleHazard {
     pub distance_m: Option<f64>,
 }
 
-pub(crate) async fn fetch_obstacle_hazards(
-    client: &Client,
-    config: &Config,
-    points: &[RoutePoint],
-    clearance_m: f64,
-) -> Result<Vec<ObstacleHazard>, String> {
-    fetch_obstacles(client, config, points, clearance_m, None)
-        .await
-        .map(|analysis| analysis.hazards)
-}
+
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ObstacleConflict {
@@ -186,7 +177,6 @@ pub(crate) struct ObstacleFootprint {
     pub name: String,
     pub polygon: Vec<[f64; 2]>,
     pub height_m: f64,
-    pub hazard_type: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -867,7 +857,6 @@ pub(crate) async fn fetch_obstacles(
                 name: candidate.name.clone(),
                 polygon,
                 height_m: candidate.height_m,
-                hazard_type: candidate.hazard_type.clone(),
             })
         })
         .collect();

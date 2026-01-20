@@ -48,27 +48,7 @@ pub async fn load_all_drones(pool: &SqlitePool) -> Result<Vec<DroneState>> {
     Ok(rows.into_iter().map(|r| r.into()).collect())
 }
 
-/// Load a single drone by ID.
-pub async fn load_drone(pool: &SqlitePool, drone_id: &str) -> Result<Option<DroneState>> {
-    let row = sqlx::query_as::<_, DroneRow>(
-        "SELECT drone_id, owner_id, lat, lon, altitude_m, heading_deg, speed_mps, velocity_x, velocity_y, velocity_z, status, last_update FROM drones WHERE drone_id = ?1"
-    )
-    .bind(drone_id)
-    .fetch_optional(pool)
-    .await?;
-    
-    Ok(row.map(|r| r.into()))
-}
 
-/// Delete a drone by ID.
-pub async fn delete_drone(pool: &SqlitePool, drone_id: &str) -> Result<bool> {
-    let result = sqlx::query("DELETE FROM drones WHERE drone_id = ?1")
-        .bind(drone_id)
-        .execute(pool)
-        .await?;
-    
-    Ok(result.rows_affected() > 0)
-}
 
 // Internal row type for SQLx
 #[derive(sqlx::FromRow)]

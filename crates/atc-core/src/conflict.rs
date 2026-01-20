@@ -154,20 +154,7 @@ impl ConflictDetector {
         self.drones.len()
     }
 
-    /// Calculate horizontal distance between two points in meters (Haversine formula).
-    fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-        const R: f64 = 6_371_000.0; // Earth radius in meters
-
-        let phi1 = lat1.to_radians();
-        let phi2 = lat2.to_radians();
-        let dphi = (lat2 - lat1).to_radians();
-        let dlambda = (lon2 - lon1).to_radians();
-
-        let a = (dphi / 2.0).sin().powi(2)
-            + phi1.cos() * phi2.cos() * (dlambda / 2.0).sin().powi(2);
-
-        2.0 * R * a.sqrt().atan2((1.0 - a).sqrt())
-    }
+    // Removed duplicate haversine_distance. Using crate::spatial::haversine_distance instead.
 
     /// Predict drone position after time_offset_s seconds.
     fn predict_position(drone: &DronePosition, time_offset_s: f64) -> (f64, f64, f64) {
@@ -202,7 +189,7 @@ impl ConflictDetector {
         pos1: (f64, f64, f64),
         pos2: (f64, f64, f64),
     ) -> (f64, f64) {
-        let horizontal = Self::haversine_distance(pos1.0, pos1.1, pos2.0, pos2.1);
+        let horizontal = crate::spatial::haversine_distance(pos1.0, pos1.1, pos2.0, pos2.1);
         let vertical = (pos1.2 - pos2.2).abs();
         (horizontal, vertical)
     }
@@ -338,8 +325,9 @@ mod tests {
 
     #[test]
     fn test_haversine_distance() {
+        use crate::spatial::haversine_distance;
         // Test known distance: approx 111km per degree of latitude
-        let dist = ConflictDetector::haversine_distance(0.0, 0.0, 1.0, 0.0);
+        let dist = haversine_distance(0.0, 0.0, 1.0, 0.0);
         assert!((dist - 111_320.0).abs() < 1000.0); // Within 1km tolerance
     }
 

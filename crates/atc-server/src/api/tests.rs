@@ -9,7 +9,7 @@ use tower::ServiceExt;
 
 use crate::{api, config::Config, persistence, state::AppState};
 
-async fn setup_app() -> (axum::Router<Arc<AppState>>, Arc<AppState>) {
+async fn setup_app() -> (axum::Router, Arc<AppState>) {
     let mut config = Config::from_env();
     config.database_path = std::env::temp_dir()
         .join(format!("atc-test-{}.db", uuid::Uuid::new_v4()))
@@ -35,7 +35,7 @@ async fn setup_app() -> (axum::Router<Arc<AppState>>, Arc<AppState>) {
 }
 
 async fn read_json(response: axum::response::Response) -> Value {
-    let bytes = hyper::body::to_bytes(response.into_body())
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read body");
     serde_json::from_slice(&bytes).expect("parse json")
