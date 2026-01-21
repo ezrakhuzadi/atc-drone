@@ -71,6 +71,23 @@ pub async fn delete_expired_commands(pool: &SqlitePool) -> Result<u64> {
     Ok(result.rows_affected())
 }
 
+/// Delete commands that never received an acknowledgement within the timeout.
+pub async fn delete_stale_commands(pool: &SqlitePool, ack_timeout_secs: i64) -> Result<u64> {
+    if ack_timeout_secs <= 0 {
+        return Ok(0);
+    }
+
+    let modifier = format!("-{} seconds", ack_timeout_secs);
+    let result = sqlx::query(
+        "DELETE FROM commands WHERE acknowledged = 0 AND datetime(issued_at) < datetime('now', ?1)"
+    )
+    .bind(modifier)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
 
 
 // Internal row type for SQLx

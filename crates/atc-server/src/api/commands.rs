@@ -84,7 +84,10 @@ pub async fn issue_command(
     };
 
     let command_id = command.command_id.clone();
-    state.enqueue_command(command);
+    if let Err(err) = state.enqueue_command(command).await {
+        tracing::error!("Failed to persist command for drone {}: {}", request.drone_id, err);
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
     state.mark_command_issued(&request.drone_id);
 
     tracing::info!("Issued command {} to drone {}", command_id, request.drone_id);
@@ -121,7 +124,13 @@ pub async fn ack_command(
             return Err(StatusCode::FORBIDDEN);
         }
     }
-    let found = state.ack_command(&request.command_id);
+    let found = match state.ack_command(&request.command_id).await {
+        Ok(found) => found,
+        Err(err) => {
+            tracing::error!("Failed to acknowledge command {}: {}", request.command_id, err);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
     
     if found {
         tracing::info!("Command {} acknowledged", request.command_id);

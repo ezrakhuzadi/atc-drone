@@ -9,6 +9,8 @@ tags:
   - name: Drones
   - name: Telemetry
   - name: Conflicts
+  - name: Compliance
+  - name: Routes
   - name: Geofences
   - name: Commands
   - name: Flights
@@ -55,6 +57,25 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/DroneState"
+  /v1/drones/{drone_id}:
+    get:
+      tags: [Drones]
+      summary: Get a registered drone
+      parameters:
+        - in: path
+          name: drone_id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Drone
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DroneState"
+        "404":
+          description: Not found
   /v1/traffic:
     get:
       tags: [Drones]
@@ -118,6 +139,51 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/Conflict"
+  /v1/compliance/limits:
+    get:
+      tags: [Compliance]
+      summary: Get compliance thresholds
+      responses:
+        "200":
+          description: Limits
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ComplianceLimits"
+  /v1/compliance/evaluate:
+    post:
+      tags: [Compliance]
+      summary: Evaluate route compliance
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ComplianceEvaluateRequest"
+      responses:
+        "200":
+          description: Evaluation result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ComplianceEvaluateResponse"
+  /v1/routes/plan:
+    post:
+      tags: [Routes]
+      summary: Plan a route with obstacle avoidance
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RoutePlanRequest"
+      responses:
+        "200":
+          description: Planned route
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RoutePlanResponse"
   /v1/geofences:
     get:
       tags: [Geofences]
@@ -198,6 +264,33 @@ paths:
       responses:
         "204":
           description: Deleted
+  /v1/geofences/check:
+    get:
+      tags: [Geofences]
+      summary: Check a point against active geofences
+      parameters:
+        - in: query
+          name: lat
+          required: true
+          schema:
+            type: number
+        - in: query
+          name: lon
+          required: true
+          schema:
+            type: number
+        - in: query
+          name: altitude_m
+          required: false
+          schema:
+            type: number
+      responses:
+        "200":
+          description: Result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PointCheckResponse"
   /v1/geofences/check-route:
     post:
       tags: [Geofences]
@@ -263,6 +356,7 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Command"
+                nullable: true
   /v1/commands/ack:
     post:
       tags: [Commands]
@@ -285,11 +379,33 @@ paths:
       description: |
         WebSocket stream for command push. Pass Authorization: Bearer <session_token>
         or a token query param plus optional drone_id filter.
+      parameters:
+        - in: query
+          name: token
+          schema:
+            type: string
+        - in: query
+          name: drone_id
+          schema:
+            type: string
       x-websocket: true
   /v1/ws:
     get:
       summary: WebSocket realtime stream
       description: WebSocket stream for realtime drone updates.
+      parameters:
+        - in: query
+          name: token
+          schema:
+            type: string
+        - in: query
+          name: owner_id
+          schema:
+            type: string
+        - in: query
+          name: drone_id
+          schema:
+            type: string
       x-websocket: true
   /v1/flights:
     get:
@@ -317,7 +433,9 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/FlightPlanRequest"
+              oneOf:
+                - $ref: "#/components/schemas/FlightPlanRequest"
+                - $ref: "#/components/schemas/PlannerFlightRequest"
       responses:
         "201":
           description: Created
@@ -355,6 +473,10 @@ paths:
       responses:
         "200":
           description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RidViewResponse"
   /v1/conformance:
     get:
       tags: [Drones]
@@ -377,6 +499,15 @@ paths:
     get:
       tags: [Drones]
       summary: List DAA advisories
+      parameters:
+        - in: query
+          name: owner_id
+          schema:
+            type: string
+        - in: query
+          name: active_only
+          schema:
+            type: boolean
       responses:
         "200":
           description: Advisories
@@ -519,7 +650,17 @@ components:
           type: number
         severity:
           type: string
-        time_to_collision_s:
+        time_to_closest:
+          type: number
+        closest_distance_m:
+          type: number
+        cpa_lat:
+          type: number
+        cpa_lon:
+          type: number
+        cpa_altitude_m:
+          type: number
+        timestamp:
           type: number
     Geofence:
       type: object
@@ -563,20 +704,38 @@ components:
     RouteCheckRequest:
       type: object
       properties:
-        route:
+        waypoints:
           type: array
           items:
             $ref: "#/components/schemas/Waypoint"
-      required: [route]
+      required: [waypoints]
     RouteCheckResponse:
       type: object
       properties:
-        blocked:
+        conflicts:
           type: boolean
-        intersecting_geofences:
+        conflicting_geofences:
           type: array
           items:
-            $ref: "#/components/schemas/Geofence"
+            $ref: "#/components/schemas/GeofenceConflict"
+    GeofenceConflict:
+      type: object
+      properties:
+        geofence_id:
+          type: string
+        geofence_name:
+          type: string
+        segment_index:
+          type: integer
+    PointCheckResponse:
+      type: object
+      properties:
+        inside_geofence:
+          type: boolean
+        geofence_ids:
+          type: array
+          items:
+            type: string
     Waypoint:
       type: object
       properties:
@@ -588,6 +747,17 @@ components:
           type: number
         speed_mps:
           type: number
+    TrajectoryPoint:
+      type: object
+      properties:
+        lat:
+          type: number
+        lon:
+          type: number
+        altitude_m:
+          type: number
+        time_offset_s:
+          type: number
     Command:
       type: object
       properties:
@@ -596,7 +766,7 @@ components:
         drone_id:
           type: string
         command_type:
-          type: object
+          $ref: "#/components/schemas/CommandType"
         issued_at:
           type: string
           format: date-time
@@ -605,18 +775,64 @@ components:
           format: date-time
         acknowledged:
           type: boolean
-    IssueCommandRequest:
+    CommandType:
+      oneOf:
+        - $ref: "#/components/schemas/CommandHold"
+        - $ref: "#/components/schemas/CommandAltitudeChange"
+        - $ref: "#/components/schemas/CommandReroute"
+        - $ref: "#/components/schemas/CommandResume"
+      discriminator:
+        propertyName: type
+    CommandHold:
       type: object
+      required: [type, duration_secs]
       properties:
-        drone_id:
+        type:
           type: string
-        owner_id:
-          type: string
-        expires_in_secs:
+          enum: [HOLD]
+        duration_secs:
           type: integer
-        command_type:
-          type: object
-      required: [drone_id]
+    CommandAltitudeChange:
+      type: object
+      required: [type, target_altitude_m]
+      properties:
+        type:
+          type: string
+          enum: [ALTITUDE_CHANGE]
+        target_altitude_m:
+          type: number
+    CommandReroute:
+      type: object
+      required: [type, waypoints]
+      properties:
+        type:
+          type: string
+          enum: [REROUTE]
+        waypoints:
+          type: array
+          items:
+            $ref: "#/components/schemas/Waypoint"
+        reason:
+          type: string
+    CommandResume:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [RESUME]
+    IssueCommandRequest:
+      allOf:
+        - type: object
+          required: [drone_id]
+          properties:
+            drone_id:
+              type: string
+            owner_id:
+              type: string
+            expires_in_secs:
+              type: integer
+        - $ref: "#/components/schemas/CommandType"
     IssueCommandResponse:
       type: object
       properties:
@@ -632,6 +848,73 @@ components:
         command_id:
           type: string
       required: [command_id]
+    PlannerWaypoint:
+      type: object
+      properties:
+        lat:
+          type: number
+        lon:
+          type: number
+        alt:
+          type: number
+          description: Altitude in meters (altitude_m also accepted).
+        time_offset:
+          type: number
+          description: Seconds from start (time_offset_s also accepted).
+      required: [lat, lon, alt]
+    PlannerMetadata:
+      type: object
+      properties:
+        drone_speed_mps:
+          type: number
+        drone_id:
+          type: string
+        total_distance_m:
+          type: number
+        total_flight_time_s:
+          type: number
+        trajectory_points:
+          type: integer
+        planned_altitude_m:
+          type: number
+        max_obstacle_height_m:
+          type: number
+        faa_compliant:
+          type: boolean
+        submitted_at:
+          type: string
+        blender_declaration_id:
+          type: string
+        operation_type:
+          type: integer
+        battery_capacity_min:
+          type: number
+        battery_reserve_min:
+          type: number
+        clearance_m:
+          type: number
+        compliance_override_enabled:
+          type: boolean
+        compliance_override_notes:
+          type: string
+    PlannerFlightRequest:
+      type: object
+      properties:
+        flight_id:
+          type: string
+        waypoints:
+          type: array
+          items:
+            $ref: "#/components/schemas/PlannerWaypoint"
+        trajectory_log:
+          type: array
+          items:
+            $ref: "#/components/schemas/PlannerWaypoint"
+        owner_id:
+          type: string
+        metadata:
+          $ref: "#/components/schemas/PlannerMetadata"
+      required: [flight_id, waypoints, trajectory_log]
     FlightPlanRequest:
       type: object
       properties:
@@ -646,7 +929,13 @@ components:
         trajectory_log:
           type: array
           items:
-            $ref: "#/components/schemas/Waypoint"
+            $ref: "#/components/schemas/TrajectoryPoint"
+        metadata:
+          $ref: "#/components/schemas/FlightPlanMetadata"
+        origin:
+          $ref: "#/components/schemas/Waypoint"
+        destination:
+          $ref: "#/components/schemas/Waypoint"
         departure_time:
           type: string
           format: date-time
@@ -664,6 +953,12 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/Waypoint"
+        trajectory_log:
+          type: array
+          items:
+            $ref: "#/components/schemas/TrajectoryPoint"
+        metadata:
+          $ref: "#/components/schemas/FlightPlanMetadata"
         status:
           type: string
         departure_time:
@@ -675,6 +970,312 @@ components:
         created_at:
           type: string
           format: date-time
+    FlightPlanMetadata:
+      type: object
+      properties:
+        drone_speed_mps:
+          type: number
+        total_distance_m:
+          type: number
+        total_flight_time_s:
+          type: number
+        trajectory_points:
+          type: integer
+        planned_altitude_m:
+          type: number
+        max_obstacle_height_m:
+          type: number
+        faa_compliant:
+          type: boolean
+        submitted_at:
+          type: string
+        blender_declaration_id:
+          type: string
+        operation_type:
+          type: integer
+        battery_capacity_min:
+          type: number
+        battery_reserve_min:
+          type: number
+        clearance_m:
+          type: number
+        compliance_override_enabled:
+          type: boolean
+        compliance_override_notes:
+          type: string
+        compliance_report:
+          type: object
+    ComplianceLimits:
+      type: object
+      properties:
+        maxWindMps:
+          type: number
+        maxGustMps:
+          type: number
+        maxPrecipMm:
+          type: number
+        windWarnRatio:
+          type: number
+        batteryWarnMarginMin:
+          type: number
+        populationBvlosMax:
+          type: number
+        populationWarn:
+          type: number
+        populationAbsoluteMax:
+          type: number
+        defaultClearanceM:
+          type: number
+    ComplianceEvaluateRequest:
+      type: object
+      properties:
+        drone_id:
+          type: string
+        owner_id:
+          type: string
+        waypoints:
+          type: array
+          items:
+            $ref: "#/components/schemas/Waypoint"
+        trajectory_log:
+          type: array
+          items:
+            $ref: "#/components/schemas/TrajectoryPoint"
+        metadata:
+          $ref: "#/components/schemas/FlightPlanMetadata"
+        origin:
+          $ref: "#/components/schemas/Waypoint"
+        destination:
+          $ref: "#/components/schemas/Waypoint"
+        departure_time:
+          type: string
+          format: date-time
+    ComplianceEvaluateResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        blocking:
+          type: array
+          items:
+            type: string
+        violations:
+          type: array
+          items:
+            type: object
+        report:
+          $ref: "#/components/schemas/ComplianceReport"
+          nullable: true
+    ComplianceReport:
+      type: object
+      properties:
+        generated_at:
+          type: string
+        overall_status:
+          $ref: "#/components/schemas/ComplianceStatus"
+        route:
+          $ref: "#/components/schemas/RouteMetrics"
+        checks:
+          $ref: "#/components/schemas/ComplianceChecks"
+    ComplianceStatus:
+      type: string
+      enum: [pass, warn, fail, pending]
+    RouteMetrics:
+      type: object
+      properties:
+        distance_m:
+          type: number
+        estimated_minutes:
+          type: number
+        has_route:
+          type: boolean
+    ComplianceChecks:
+      type: object
+      properties:
+        weather:
+          $ref: "#/components/schemas/WeatherCheck"
+        battery:
+          $ref: "#/components/schemas/BatteryCheck"
+        population:
+          $ref: "#/components/schemas/PopulationCheck"
+        obstacles:
+          $ref: "#/components/schemas/ObstaclesCheck"
+    WeatherCheck:
+      type: object
+      properties:
+        status:
+          $ref: "#/components/schemas/ComplianceStatus"
+        message:
+          type: string
+        wind_mps:
+          type: number
+        gust_mps:
+          type: number
+        precip_mm:
+          type: number
+        max_wind_mps:
+          type: number
+        max_gust_mps:
+          type: number
+        max_precip_mm:
+          type: number
+        source:
+          type: string
+    BatteryCheck:
+      type: object
+      properties:
+        status:
+          $ref: "#/components/schemas/ComplianceStatus"
+        message:
+          type: string
+        estimated_minutes:
+          type: number
+        capacity_min:
+          type: number
+        reserve_min:
+          type: number
+        remaining_min:
+          type: number
+        cruise_speed_mps:
+          type: number
+    PopulationCheck:
+      type: object
+      properties:
+        status:
+          $ref: "#/components/schemas/ComplianceStatus"
+        message:
+          type: string
+        density:
+          type: number
+        classification:
+          type: string
+        building_count:
+          type: integer
+        estimated_population:
+          type: number
+        area_km2:
+          type: number
+        source:
+          type: string
+    ObstaclesCheck:
+      type: object
+      properties:
+        status:
+          $ref: "#/components/schemas/ComplianceStatus"
+        message:
+          type: string
+        clearance_m:
+          type: number
+        conflicts:
+          type: array
+          items:
+            $ref: "#/components/schemas/ObstacleConflict"
+        hazards:
+          type: array
+          items:
+            $ref: "#/components/schemas/ObstacleHazard"
+        obstacle_count:
+          type: integer
+        truncated:
+          type: boolean
+    ObstacleConflict:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        distance_m:
+          type: number
+        severity:
+          type: string
+    ObstacleHazard:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        lat:
+          type: number
+        lon:
+          type: number
+        radius_m:
+          type: number
+        height_m:
+          type: number
+        hazard_type:
+          type: string
+        source:
+          type: string
+        distance_m:
+          type: number
+    RoutePlanRequest:
+      type: object
+      properties:
+        waypoints:
+          type: array
+          items:
+            $ref: "#/components/schemas/Waypoint"
+        lane_radius_m:
+          type: number
+        lane_spacing_m:
+          type: number
+        sample_spacing_m:
+          type: number
+        safety_buffer_m:
+          type: number
+        max_lane_radius_m:
+          type: number
+        lane_expansion_step_m:
+          type: number
+      required: [waypoints]
+    RoutePlanResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        waypoints:
+          type: array
+          items:
+            $ref: "#/components/schemas/RouteEngineWaypoint"
+        stats:
+          $ref: "#/components/schemas/RouteEngineStats"
+          nullable: true
+        nodes_visited:
+          type: integer
+        optimized_points:
+          type: integer
+        sample_points:
+          type: integer
+        hazards:
+          type: array
+          items:
+            $ref: "#/components/schemas/ObstacleHazard"
+        errors:
+          type: array
+          items:
+            type: string
+    RouteEngineWaypoint:
+      type: object
+      properties:
+        lat:
+          type: number
+        lon:
+          type: number
+        altitude_m:
+          type: number
+        phase:
+          type: string
+    RouteEngineStats:
+      type: object
+      properties:
+        avg_agl:
+          type: number
+        max_agl:
+          type: number
+        max_altitude:
+          type: number
     RidViewRequest:
       type: object
       properties:
@@ -687,6 +1288,11 @@ components:
         max_lon:
           type: number
       required: [min_lat, min_lon, max_lat, max_lon]
+    RidViewResponse:
+      type: object
+      properties:
+        view:
+          type: string
     ConformanceStatus:
       type: object
       properties:
@@ -699,6 +1305,39 @@ components:
         last_checked:
           type: string
           format: date-time
+        record:
+          $ref: "#/components/schemas/ConformanceRecord"
+    ConformanceRecord:
+      type: object
+      properties:
+        id:
+          type: string
+        flight_declaration_id:
+          type: string
+        aircraft_id:
+          type: string
+        conformance_state:
+          type: integer
+        conformance_state_label:
+          type: string
+        conformance_state_code:
+          type: string
+        timestamp:
+          type: string
+        description:
+          type: string
+        event_type:
+          type: string
+        geofence_breach:
+          type: boolean
+        geofence_id:
+          type: string
+        resolved:
+          type: boolean
+        created_at:
+          type: string
+        updated_at:
+          type: string
     DaaAdvisory:
       type: object
       properties:
@@ -718,6 +1357,8 @@ components:
           type: string
         related_id:
           type: string
+        record:
+          $ref: "#/components/schemas/ConformanceRecord"
         created_at:
           type: string
           format: date-time

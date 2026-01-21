@@ -103,6 +103,13 @@ impl BlenderClient {
         format!("Bearer {}", token)
     }
 
+    /// Update auth token at runtime (OAuth refresh, rotation, etc.).
+    pub fn set_auth_token(&mut self, token: Option<String>) {
+        self.auth_token = token
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+    }
+
     /// Send telemetry observation to Blender.
     pub async fn send_observation(
         &self,

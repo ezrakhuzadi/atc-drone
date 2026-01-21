@@ -9,22 +9,30 @@ use atc_core::route_engine::{
 use atc_core::spatial::{bearing, haversine_distance, offset_by_bearing};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::task;
+use tokio::sync::Semaphore;
 
-use crate::compliance::{fetch_obstacles, ObstacleAnalysis, ObstacleFootprint, ObstacleHazard, RoutePoint};
+use crate::altitude::altitude_to_amsl;
+use crate::compliance::{fetch_obstacles, ObstacleAnalysis, ObstacleHazard, ObstacleQueryMode, RoutePoint};
 use crate::config::Config;
 use crate::state::AppState;
 use crate::terrain::{fetch_terrain_grid, TerrainGrid};
-use chrono::Utc;
 
 const DEFAULT_LANE_RADIUS_M: f64 = 90.0;
 const DEFAULT_LANE_SPACING_M: f64 = 15.0;
+const MIN_LANE_SPACING_M: f64 = 5.0;
 const DEFAULT_SAMPLE_SPACING_M: f64 = 5.0;
-const DEFAULT_MAX_LANE_RADIUS_M: f64 = 500.0;
+const DEFAULT_MAX_LANE_RADIUS_M: f64 = 800.0;
 const DEFAULT_LANE_EXPANSION_STEP_M: f64 = 50.0;
 const MAX_ROUTE_GRID_POINTS: usize = 500_000;
 const DEFAULT_SEGMENT_LENGTH_M: f64 = 8_000.0;
-const MIN_SEGMENT_LENGTH_M: f64 = 2_000.0;
+const MIN_SEGMENT_LENGTH_M: f64 = 1_000.0;
 const MAX_SAMPLE_SPACING_M: f64 = 75.0;
+const SEGMENT_PREFETCH_CONCURRENCY: usize = 4;
+const HARD_MAX_LANE_RADIUS_M: f64 = 5_000.0;
+const HARD_MAX_SAFETY_BUFFER_M: f64 = 500.0;
 
 #[derive(Debug)]
 enum SegmentError {
@@ -43,7 +51,14 @@ struct SegmentPlan {
     optimized_points: usize,
     sample_points: usize,
     hazards: Vec<ObstacleHazard>,
-    terrain: Option<TerrainGrid>,
+    terrain: Option<Arc<TerrainGrid>>,
+}
+
+#[derive(Debug)]
+struct SegmentInputs {
+    hazards: Vec<ObstacleHazard>,
+    obstacles: Vec<RouteObstacle>,
+    terrain: Option<Arc<TerrainGrid>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -72,7 +87,7 @@ pub struct RoutePlanResponse {
 pub async fn plan_route(
     state: &AppState,
     config: &Config,
-    request: RoutePlanRequest,
+    mut request: RoutePlanRequest,
 ) -> RoutePlanResponse {
     if request.waypoints.len() < 2 {
         return RoutePlanResponse {
@@ -86,7 +101,93 @@ pub async fn plan_route(
             errors: vec!["need at least 2 waypoints".to_string()],
         };
     }
+
+    let mut validation_errors = Vec::new();
+    for (idx, wp) in request.waypoints.iter().enumerate() {
+        if !wp.lat.is_finite() || !wp.lon.is_finite() {
+            validation_errors.push(format!("waypoint[{idx}] lat/lon must be finite"));
+            continue;
+        }
+        if !( -90.0..=90.0).contains(&wp.lat) || !( -180.0..=180.0).contains(&wp.lon) {
+            validation_errors.push(format!("waypoint[{idx}] lat/lon out of range"));
+        }
+        if !wp.altitude_m.is_finite() {
+            validation_errors.push(format!("waypoint[{idx}] altitude_m must be finite"));
+        }
+        if let Some(speed) = wp.speed_mps {
+            if !speed.is_finite() || speed < 0.0 {
+                validation_errors.push(format!("waypoint[{idx}] speed_mps must be a non-negative finite number"));
+            }
+        }
+    }
+
+    let clamp_opt = |value: Option<f64>, min: f64, max: f64| -> Option<f64> {
+        value.map(|v| v.clamp(min, max))
+    };
+
+    if let Some(radius) = request.lane_radius_m {
+        if !radius.is_finite() || radius <= 0.0 {
+            validation_errors.push("lane_radius_m must be a positive finite number".to_string());
+        }
+    }
+    if let Some(radius) = request.max_lane_radius_m {
+        if !radius.is_finite() || radius <= 0.0 {
+            validation_errors.push("max_lane_radius_m must be a positive finite number".to_string());
+        }
+    }
+    if let Some(spacing) = request.lane_spacing_m {
+        if !spacing.is_finite() || spacing <= 0.0 {
+            validation_errors.push("lane_spacing_m must be a positive finite number".to_string());
+        }
+    }
+    if let Some(spacing) = request.sample_spacing_m {
+        if !spacing.is_finite() || spacing <= 0.0 {
+            validation_errors.push("sample_spacing_m must be a positive finite number".to_string());
+        }
+    }
+    if let Some(buffer) = request.safety_buffer_m {
+        if !buffer.is_finite() || buffer < 0.0 {
+            validation_errors.push("safety_buffer_m must be a non-negative finite number".to_string());
+        }
+    }
+    if let Some(step) = request.lane_expansion_step_m {
+        if !step.is_finite() || step <= 0.0 {
+            validation_errors.push("lane_expansion_step_m must be a positive finite number".to_string());
+        }
+    }
+
+    if !validation_errors.is_empty() {
+        return RoutePlanResponse {
+            ok: false,
+            waypoints: Vec::new(),
+            stats: None,
+            nodes_visited: 0,
+            optimized_points: 0,
+            sample_points: 0,
+            hazards: Vec::new(),
+            errors: validation_errors,
+        };
+    }
+
+    request.lane_radius_m = clamp_opt(request.lane_radius_m, 1.0, HARD_MAX_LANE_RADIUS_M);
+    request.max_lane_radius_m = clamp_opt(request.max_lane_radius_m, DEFAULT_MAX_LANE_RADIUS_M, HARD_MAX_LANE_RADIUS_M);
+    request.lane_spacing_m = clamp_opt(request.lane_spacing_m, MIN_LANE_SPACING_M, 250.0);
+    request.sample_spacing_m = clamp_opt(request.sample_spacing_m, 1.0, MAX_SAMPLE_SPACING_M);
+    request.safety_buffer_m = clamp_opt(request.safety_buffer_m, 0.0, HARD_MAX_SAFETY_BUFFER_M);
+    request.lane_expansion_step_m = clamp_opt(request.lane_expansion_step_m, 5.0, 2_000.0);
     let route_distance_total = route_distance_m(&request.waypoints);
+    if route_distance_total <= f64::EPSILON {
+        return RoutePlanResponse {
+            ok: false,
+            waypoints: Vec::new(),
+            stats: None,
+            nodes_visited: 0,
+            optimized_points: 0,
+            sample_points: 0,
+            hazards: Vec::new(),
+            errors: vec!["route distance is zero (start and end waypoints must differ)".to_string()],
+        };
+    }
     let use_segments = route_distance_total > DEFAULT_SEGMENT_LENGTH_M;
 
     if !use_segments {
@@ -110,11 +211,13 @@ async fn plan_route_single(
     config: &Config,
     request: &RoutePlanRequest,
 ) -> RoutePlanResponse {
+    let started_at = Instant::now();
     let lane_radius = request.lane_radius_m.unwrap_or(DEFAULT_LANE_RADIUS_M);
     let lane_spacing = request.lane_spacing_m.unwrap_or(DEFAULT_LANE_SPACING_M);
     let default_spacing = request.sample_spacing_m.unwrap_or(DEFAULT_SAMPLE_SPACING_M);
-    let route_distance_total = route_distance_m(&request.waypoints);
-    let base_spacing = resolve_grid_spacing(&request.waypoints, default_spacing);
+    let waypoints = normalize_waypoints(&request.waypoints, config);
+    let route_distance_total = route_distance_m(&waypoints);
+    let base_spacing = resolve_grid_spacing(&waypoints, default_spacing);
     let max_lane_radius = resolve_max_lane_radius(
         route_distance_total,
         lane_radius,
@@ -125,8 +228,7 @@ async fn plan_route_single(
         .unwrap_or(DEFAULT_LANE_EXPANSION_STEP_M)
         .max(5.0);
 
-    let points: Vec<RoutePoint> = request
-        .waypoints
+    let points: Vec<RoutePoint> = waypoints
         .iter()
         .map(|wp| RoutePoint {
             lat: wp.lat,
@@ -139,12 +241,14 @@ async fn plan_route_single(
         .safety_buffer_m
         .unwrap_or(config.compliance_default_clearance_m);
     let client = Client::new();
+    let obstacles_started_at = Instant::now();
     let analysis = match fetch_obstacles(
         &client,
         config,
         &points,
         clearance_m,
         Some(max_lane_radius + clearance_m),
+        ObstacleQueryMode::RoutePlanner,
     )
     .await
     {
@@ -166,6 +270,13 @@ async fn plan_route_single(
             empty_obstacle_analysis()
         }
     };
+    tracing::info!(
+        "RoutePlan obstacles: {} candidate(s), {} footprint(s), truncated={}, {} ms",
+        analysis.obstacle_count,
+        analysis.footprints.len(),
+        analysis.truncated,
+        obstacles_started_at.elapsed().as_millis()
+    );
 
     if analysis.truncated {
         if config.route_planner_allow_truncated_obstacles {
@@ -199,8 +310,9 @@ async fn plan_route_single(
         })
         .collect();
 
+    let terrain_started_at = Instant::now();
     let terrain = match fetch_terrain_grid(&client, config, &points, base_spacing).await {
-        Ok(grid) => grid,
+        Ok(grid) => grid.map(Arc::new),
         Err(err) => {
             if config.terrain_require {
                 return RoutePlanResponse {
@@ -218,58 +330,141 @@ async fn plan_route_single(
             None
         }
     };
+    tracing::info!(
+        "RoutePlan terrain: enabled={}, {} ms",
+        terrain.is_some(),
+        terrain_started_at.elapsed().as_millis()
+    );
 
-    let mut geofences = state.get_geofences();
-    geofences.extend(build_obstacle_geofences(&analysis.footprints, terrain.as_ref()));
-    let geofences: Vec<Geofence> = geofences
-        .into_iter()
-        .filter(|fence| fence.active && fence.geofence_type != GeofenceType::Advisory)
-        .collect();
+    let geofences: Arc<Vec<Geofence>> = Arc::new(
+        state
+            .get_geofences()
+            .into_iter()
+            .filter(|fence| fence.active && fence.geofence_type != GeofenceType::Advisory)
+            .collect(),
+    );
 
-    let mut lane_radius = lane_radius;
+    let waypoints: Arc<Vec<Waypoint>> = Arc::new(waypoints);
+    let obstacles: Arc<Vec<RouteObstacle>> = Arc::new(obstacles);
+
     let mut last_errors = Vec::new();
     let mut last_sample_points = 0usize;
     let mut last_result = None;
+    let spacing_candidates = lane_spacing_candidates(lane_spacing);
+    let wind_mps = config.route_planner_wind_mps.max(0.0);
+    let radius_candidates = lane_radius_candidates(lane_radius, max_lane_radius, expansion_step);
+    let phase_all = grid_phase_candidates();
 
-    while lane_radius <= max_lane_radius + f64::EPSILON {
-        let lane_offsets = build_lane_offsets(lane_radius, lane_spacing);
-        let spacing = resolve_spacing_for_grid(route_distance_total, base_spacing, lane_offsets.len());
-        let Some(mut grid) = generate_grid_samples(&request.waypoints, spacing, &lane_offsets) else {
-            last_errors = vec!["failed to generate grid".to_string()];
-            break;
+    for (radius_idx, lane_radius) in radius_candidates.iter().copied().enumerate() {
+        let is_last_radius = radius_idx + 1 == radius_candidates.len();
+        let primary_spacing = spacing_candidates.first().copied().unwrap_or(lane_spacing);
+        let spacing_single = [primary_spacing];
+        let phases_single = [0.0_f64];
+        let phases = if is_last_radius { &phase_all[..] } else { &phases_single[..] };
+        let spacings = if is_last_radius {
+            &spacing_candidates[..]
+        } else {
+            &spacing_single[..]
         };
-        last_sample_points = grid
-            .lanes
-            .first()
-            .map(|lane| lane.len() * grid.lanes.len())
-            .unwrap_or(0);
-        if last_sample_points > MAX_ROUTE_GRID_POINTS {
-            last_errors = vec![format!(
-                "route grid too large ({} points)",
-                last_sample_points
-            )];
-            break;
+
+        let mut attempted = false;
+        for lane_spacing in spacings.iter().copied() {
+            let lane_offsets = build_lane_offsets(lane_radius, lane_spacing);
+            let spacing = resolve_spacing_for_grid(route_distance_total, base_spacing, lane_offsets.len());
+            let estimated_points = estimate_grid_points(route_distance_total, spacing, lane_offsets.len());
+            if estimated_points > MAX_ROUTE_GRID_POINTS {
+                last_errors = vec![format!("route grid too large (estimated {} points)", estimated_points)];
+                continue;
+            }
+
+            for phase in phases.iter().copied() {
+                attempted = true;
+                let waypoints = waypoints.clone();
+                let obstacles = obstacles.clone();
+                let geofences = geofences.clone();
+                let terrain = terrain.clone();
+                let lane_offsets = lane_offsets.clone();
+                let attempt_started_at = Instant::now();
+                let engine_config = {
+                    let mut engine_config = RouteEngineConfig::default();
+                    engine_config.safety_buffer_m = clearance_m;
+                    engine_config.wind_mps = wind_mps;
+                    engine_config.geofence_sample_step_m = spacing.clamp(5.0, 25.0);
+                    engine_config
+                };
+
+                let handle = task::spawn_blocking(move || {
+                    let Some(mut grid) = generate_grid_samples(&waypoints, spacing, &lane_offsets, phase) else {
+                        return Err(vec!["failed to generate grid".to_string()]);
+                    };
+                    let sample_points = grid
+                        .lanes
+                        .first()
+                        .map(|lane| lane.len() * grid.lanes.len())
+                        .unwrap_or(0);
+                    if sample_points > MAX_ROUTE_GRID_POINTS {
+                        return Err(vec![format!("route grid too large ({} points)", sample_points)]);
+                    }
+                    apply_obstacles(&mut grid, &obstacles, |lat, lon| {
+                        terrain
+                            .as_ref()
+                            .map(|grid| grid.sample(lat, lon))
+                            .unwrap_or(0.0)
+                    });
+                    let result = optimize_flight_path(&waypoints, &grid, &geofences, &engine_config);
+                    Ok((result, sample_points))
+                });
+
+                let attempt = match handle.await {
+                    Ok(Ok(value)) => value,
+                    Ok(Err(errors)) => {
+                        last_errors = errors;
+                        continue;
+                    }
+                    Err(err) => {
+                        last_errors = vec![format!("planner task failed: {}", err)];
+                        continue;
+                    }
+                };
+
+                let (result, sample_points) = attempt;
+                last_sample_points = sample_points;
+                let attempt_ms = attempt_started_at.elapsed().as_millis();
+                if attempt_ms >= 250 {
+                    tracing::info!(
+                        lane_radius_m = lane_radius,
+                        lane_spacing_m = lane_spacing,
+                        grid_spacing_m = spacing,
+                        grid_phase = phase,
+                        success = result.success,
+                        nodes_visited = result.nodes_visited,
+                        optimized_points = result.optimized_points,
+                        elapsed_ms = attempt_ms as u64,
+                        errors = ?result.errors,
+                        "RoutePlan A* attempt"
+                    );
+                }
+                if result.success {
+                    let response = build_response(result, hazards, last_sample_points);
+                    tracing::info!(
+                        ok = response.ok,
+                        nodes_visited = response.nodes_visited,
+                        optimized_points = response.optimized_points,
+                        sample_points = response.sample_points,
+                        elapsed_ms = started_at.elapsed().as_millis() as u64,
+                        "RoutePlan completed"
+                    );
+                    return response;
+                }
+
+                last_errors = result.errors.clone();
+                last_result = Some(result);
+            }
         }
 
-        let terrain_ref = terrain.as_ref();
-        apply_obstacles(&mut grid, &obstacles, |lat, lon| {
-            terrain_ref
-                .map(|grid| grid.sample(lat, lon))
-                .unwrap_or(0.0)
-        });
-
-        let mut engine_config = RouteEngineConfig::default();
-        engine_config.safety_buffer_m = clearance_m;
-        engine_config.geofence_sample_step_m = spacing.clamp(5.0, 25.0);
-
-        let result = optimize_flight_path(&request.waypoints, &grid, &geofences, &engine_config);
-        if result.success {
-            return build_response(result, hazards, last_sample_points);
+        if !attempted && last_errors.is_empty() {
+            last_errors = vec!["failed to generate grid".to_string()];
         }
-
-        last_errors = result.errors.clone();
-        last_result = Some(result);
-        lane_radius += expansion_step;
     }
 
     let mut errors = last_errors;
@@ -286,7 +481,7 @@ async fn plan_route_single(
         None => (None, 0, 0),
     };
 
-    RoutePlanResponse {
+    let response = RoutePlanResponse {
         ok: false,
         waypoints: Vec::new(),
         stats,
@@ -295,7 +490,17 @@ async fn plan_route_single(
         sample_points: last_sample_points,
         hazards,
         errors,
-    }
+    };
+    tracing::info!(
+        ok = response.ok,
+        nodes_visited = response.nodes_visited,
+        optimized_points = response.optimized_points,
+        sample_points = response.sample_points,
+        elapsed_ms = started_at.elapsed().as_millis() as u64,
+        errors = ?response.errors,
+        "RoutePlan completed"
+    );
+    response
 }
 
 async fn plan_route_segmented(
@@ -309,7 +514,8 @@ async fn plan_route_segmented(
     let clearance_m = request
         .safety_buffer_m
         .unwrap_or(config.compliance_default_clearance_m);
-    let route_distance_total = route_distance_m(&request.waypoints);
+    let normalized_waypoints = normalize_waypoints(&request.waypoints, config);
+    let route_distance_total = route_distance_m(&normalized_waypoints);
     let expansion_step = request
         .lane_expansion_step_m
         .unwrap_or(DEFAULT_LANE_EXPANSION_STEP_M)
@@ -317,9 +523,18 @@ async fn plan_route_segmented(
 
     let mut segment_length = DEFAULT_SEGMENT_LENGTH_M.min(route_distance_total);
     let mut last_error: Option<Vec<String>> = None;
+    let wind_mps = config.route_planner_wind_mps.max(0.0);
+    let geofences: Arc<Vec<Geofence>> = Arc::new(
+        state
+            .get_geofences()
+            .into_iter()
+            .filter(|fence| fence.active && fence.geofence_type != GeofenceType::Advisory)
+            .collect(),
+    );
+    let client = Client::new();
 
-    for _attempt in 0..3 {
-        let segments = build_segments(&request.waypoints, segment_length);
+    for _attempt in 0..4 {
+        let segments = build_segments(&normalized_waypoints, segment_length);
         let segment_count = segments.len();
         if segment_count == 0 {
             return RoutePlanResponse {
@@ -341,13 +556,87 @@ async fn plan_route_segmented(
         let mut optimized_points = 0usize;
         let mut sample_points = 0usize;
         let mut stats = None;
-        let mut start_terrain: Option<TerrainGrid> = None;
-        let mut end_terrain: Option<TerrainGrid> = None;
+        let mut start_terrain: Option<Arc<TerrainGrid>> = None;
+        let mut end_terrain: Option<Arc<TerrainGrid>> = None;
         let mut truncated = false;
 
-        let mut previous_altitude: Option<f64> = None;
+        let semaphore = Arc::new(Semaphore::new(SEGMENT_PREFETCH_CONCURRENCY.max(1)));
+        let mut join_set = task::JoinSet::new();
+        let mut segment_params: Vec<(f64, f64)> = Vec::with_capacity(segment_count);
+
         for (idx, segment) in segments.iter().enumerate() {
-            let mut segment = segment.clone();
+            let base_spacing = resolve_grid_spacing(segment, default_spacing);
+            let max_lane_radius = resolve_max_lane_radius(
+                route_distance_m(segment),
+                lane_radius,
+                request.max_lane_radius_m,
+            );
+            segment_params.push((base_spacing, max_lane_radius));
+
+            let permit = match semaphore.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    return RoutePlanResponse {
+                        ok: false,
+                        waypoints: Vec::new(),
+                        stats: None,
+                        nodes_visited: 0,
+                        optimized_points: 0,
+                        sample_points: 0,
+                        hazards: Vec::new(),
+                        errors: vec!["failed to acquire segment prefetch permit".to_string()],
+                    };
+                }
+            };
+
+            let client = client.clone();
+            let config = config.clone();
+            let segment = segment.clone();
+            let base_spacing = base_spacing;
+            let max_lane_radius = max_lane_radius;
+            join_set.spawn(async move {
+                let _permit = permit;
+                let inputs = fetch_segment_inputs(
+                    &client,
+                    &config,
+                    &segment,
+                    clearance_m,
+                    base_spacing,
+                    max_lane_radius,
+                )
+                .await;
+                (idx, inputs)
+            });
+        }
+
+        let mut prefetched: Vec<Option<Result<SegmentInputs, SegmentError>>> =
+            Vec::with_capacity(segment_count);
+        prefetched.resize_with(segment_count, || None);
+        while let Some(res) = join_set.join_next().await {
+            match res {
+                Ok((idx, inputs)) => {
+                    if idx < prefetched.len() {
+                        prefetched[idx] = Some(inputs);
+                    }
+                }
+                Err(err) => {
+                    return RoutePlanResponse {
+                        ok: false,
+                        waypoints: Vec::new(),
+                        stats: None,
+                        nodes_visited: 0,
+                        optimized_points: 0,
+                        sample_points: 0,
+                        hazards: Vec::new(),
+                        errors: vec![format!("segment prefetch task failed: {}", err)],
+                    };
+                }
+            }
+        }
+
+        let mut previous_altitude: Option<f64> = None;
+        for idx in 0..segment_count {
+            let mut segment = segments[idx].clone();
             if let Some(prev_alt) = previous_altitude {
                 if let Some(first) = segment.first_mut() {
                     first.altitude_m = prev_alt;
@@ -359,25 +648,13 @@ async fn plan_route_segmented(
                 }
             }
 
-            let base_spacing = resolve_grid_spacing(&segment, default_spacing);
-            let plan = match plan_airborne_segment(
-                state,
-                config,
-                &segment,
-                lane_radius,
-                lane_spacing,
-                base_spacing,
-                resolve_max_lane_radius(
-                    route_distance_m(&segment),
-                    lane_radius,
-                    request.max_lane_radius_m,
-                ),
-                expansion_step,
-                clearance_m,
-            )
-            .await
+            let (base_spacing, max_lane_radius) = segment_params[idx];
+            let inputs = match prefetched
+                .get_mut(idx)
+                .and_then(|entry| entry.take())
+                .unwrap_or_else(|| Err(SegmentError::Obstacle("missing segment data".to_string())))
             {
-                Ok(plan) => plan,
+                Ok(inputs) => inputs,
                 Err(SegmentError::Truncated) => {
                     truncated = true;
                     break;
@@ -406,6 +683,35 @@ async fn plan_route_segmented(
                         errors: vec![format!("terrain fetch failed: {}", err)],
                     };
                 }
+                Err(err) => {
+                    return RoutePlanResponse {
+                        ok: false,
+                        waypoints: Vec::new(),
+                        stats: None,
+                        nodes_visited: 0,
+                        optimized_points: 0,
+                        sample_points: 0,
+                        hazards: Vec::new(),
+                        errors: vec![format!("segment prefetch failed: {:?}", err)],
+                    };
+                }
+            };
+
+            let plan = match solve_airborne_segment(
+                &segment,
+                lane_radius,
+                lane_spacing,
+                base_spacing,
+                max_lane_radius,
+                expansion_step,
+                clearance_m,
+                wind_mps,
+                inputs,
+                geofences.clone(),
+            )
+            .await
+            {
+                Ok(plan) => plan,
                 Err(SegmentError::GridTooLarge(count)) => {
                     return RoutePlanResponse {
                         ok: false,
@@ -428,6 +734,18 @@ async fn plan_route_segmented(
                         sample_points: 0,
                         hazards: Vec::new(),
                         errors,
+                    };
+                }
+                Err(err) => {
+                    return RoutePlanResponse {
+                        ok: false,
+                        waypoints: Vec::new(),
+                        stats: None,
+                        nodes_visited: 0,
+                        optimized_points: 0,
+                        sample_points: 0,
+                        hazards: Vec::new(),
+                errors: vec![format!("segment planning failed: {:?}", err)],
                     };
                 }
             };
@@ -475,8 +793,7 @@ async fn plan_route_segmented(
             };
         }
 
-        let full_points: Vec<RoutePoint> = request
-            .waypoints
+        let full_points: Vec<RoutePoint> = normalized_waypoints
             .iter()
             .map(|wp| RoutePoint {
                 lat: wp.lat,
@@ -488,15 +805,16 @@ async fn plan_route_segmented(
         let full_terrain = fetch_terrain_grid(&client, config, &full_points, default_spacing)
             .await
             .ok()
-            .flatten();
+            .flatten()
+            .map(Arc::new);
 
         let final_waypoints = wrap_with_takeoff_landing(
             &combined_waypoints,
-            full_terrain.as_ref(),
-            start_terrain.as_ref(),
-            end_terrain.as_ref(),
+            full_terrain.as_deref(),
+            start_terrain.as_deref(),
+            end_terrain.as_deref(),
         );
-        let stats = stats.or_else(|| compute_stats_with_terrain(&final_waypoints, full_terrain.as_ref()));
+        let stats = stats.or_else(|| compute_stats_with_terrain(&final_waypoints, full_terrain.as_deref()));
 
         return RoutePlanResponse {
             ok: true,
@@ -522,17 +840,14 @@ async fn plan_route_segmented(
     }
 }
 
-async fn plan_airborne_segment(
-    state: &AppState,
+async fn fetch_segment_inputs(
+    client: &Client,
     config: &Config,
     waypoints: &[Waypoint],
-    lane_radius: f64,
-    lane_spacing: f64,
+    safety_buffer_m: f64,
     base_spacing: f64,
     max_lane_radius: f64,
-    expansion_step: f64,
-    safety_buffer_m: f64,
-) -> Result<SegmentPlan, SegmentError> {
+) -> Result<SegmentInputs, SegmentError> {
     let points: Vec<RoutePoint> = waypoints
         .iter()
         .map(|wp| RoutePoint {
@@ -542,13 +857,14 @@ async fn plan_airborne_segment(
         })
         .collect();
 
-    let client = Client::new();
+    let obstacles_started_at = Instant::now();
     let analysis = match fetch_obstacles(
-        &client,
+        client,
         config,
         &points,
         safety_buffer_m,
         Some(max_lane_radius + safety_buffer_m),
+        ObstacleQueryMode::RoutePlanner,
     )
     .await
     {
@@ -561,6 +877,13 @@ async fn plan_airborne_segment(
             empty_obstacle_analysis()
         }
     };
+    tracing::info!(
+        "RoutePlan segment obstacles: {} candidate(s), {} footprint(s), truncated={}, {} ms",
+        analysis.obstacle_count,
+        analysis.footprints.len(),
+        analysis.truncated,
+        obstacles_started_at.elapsed().as_millis()
+    );
     if analysis.truncated {
         if config.route_planner_allow_truncated_obstacles {
             tracing::warn!("Obstacle dataset truncated; continuing with partial data");
@@ -581,8 +904,9 @@ async fn plan_airborne_segment(
         })
         .collect();
 
-    let terrain = match fetch_terrain_grid(&client, config, &points, base_spacing).await {
-        Ok(grid) => grid,
+    let terrain_started_at = Instant::now();
+    let terrain = match fetch_terrain_grid(client, config, &points, base_spacing).await {
+        Ok(grid) => grid.map(Arc::new),
         Err(err) => {
             if config.terrain_require {
                 return Err(SegmentError::Terrain(err));
@@ -591,60 +915,155 @@ async fn plan_airborne_segment(
             None
         }
     };
+    tracing::info!(
+        "RoutePlan segment terrain: enabled={}, {} ms",
+        terrain.is_some(),
+        terrain_started_at.elapsed().as_millis()
+    );
 
-    let mut geofences = state.get_geofences();
-    geofences.extend(build_obstacle_geofences(&analysis.footprints, terrain.as_ref()));
-    let geofences: Vec<Geofence> = geofences
-        .into_iter()
-        .filter(|fence| fence.active && fence.geofence_type != GeofenceType::Advisory)
-        .collect();
+    Ok(SegmentInputs {
+        hazards,
+        obstacles,
+        terrain,
+    })
+}
 
+async fn solve_airborne_segment(
+    waypoints: &[Waypoint],
+    lane_radius: f64,
+    lane_spacing: f64,
+    base_spacing: f64,
+    max_lane_radius: f64,
+    expansion_step: f64,
+    safety_buffer_m: f64,
+    wind_mps: f64,
+    inputs: SegmentInputs,
+    geofences: Arc<Vec<Geofence>>,
+) -> Result<SegmentPlan, SegmentError> {
     let route_distance_m = route_distance_m(waypoints);
-    let mut lane_radius = lane_radius;
+    let waypoints: Arc<Vec<Waypoint>> = Arc::new(waypoints.to_vec());
+    let hazards = inputs.hazards;
+    let obstacles: Arc<Vec<RouteObstacle>> = Arc::new(inputs.obstacles);
+    let terrain = inputs.terrain;
+
     let mut last_errors = Vec::new();
+    let spacing_candidates = lane_spacing_candidates(lane_spacing);
+    let radius_candidates = lane_radius_candidates(lane_radius, max_lane_radius, expansion_step);
+    let phase_all = grid_phase_candidates();
 
-    while lane_radius <= max_lane_radius + f64::EPSILON {
-        let lane_offsets = build_lane_offsets(lane_radius, lane_spacing);
-        let spacing = resolve_spacing_for_grid(route_distance_m, base_spacing, lane_offsets.len());
-        let Some(mut grid) = generate_grid_samples(waypoints, spacing, &lane_offsets) else {
-            last_errors = vec!["failed to generate grid".to_string()];
-            break;
+    for (radius_idx, lane_radius) in radius_candidates.iter().copied().enumerate() {
+        let is_last_radius = radius_idx + 1 == radius_candidates.len();
+        let primary_spacing = spacing_candidates.first().copied().unwrap_or(lane_spacing);
+        let spacing_single = [primary_spacing];
+        let phases_single = [0.0_f64];
+        let phases = if is_last_radius { &phase_all[..] } else { &phases_single[..] };
+        let spacings = if is_last_radius {
+            &spacing_candidates[..]
+        } else {
+            &spacing_single[..]
         };
-        let last_sample_points = grid
-            .lanes
-            .first()
-            .map(|lane| lane.len() * grid.lanes.len())
-            .unwrap_or(0);
-        if last_sample_points > MAX_ROUTE_GRID_POINTS {
-            return Err(SegmentError::GridTooLarge(last_sample_points));
+
+        let mut attempted = false;
+        for lane_spacing in spacings.iter().copied() {
+            let lane_offsets = build_lane_offsets(lane_radius, lane_spacing);
+            let spacing = resolve_spacing_for_grid(route_distance_m, base_spacing, lane_offsets.len());
+            let estimated_points = estimate_grid_points(route_distance_m, spacing, lane_offsets.len());
+            if estimated_points > MAX_ROUTE_GRID_POINTS {
+                last_errors = vec![format!("route grid too large (estimated {} points)", estimated_points)];
+                continue;
+            }
+
+            for phase in phases.iter().copied() {
+                attempted = true;
+                let waypoints = waypoints.clone();
+                let obstacles = obstacles.clone();
+                let geofences = geofences.clone();
+                let terrain_for_task = terrain.clone();
+                let lane_offsets = lane_offsets.clone();
+                let engine_config = {
+                    let mut engine_config = RouteEngineConfig::default();
+                    engine_config.safety_buffer_m = safety_buffer_m;
+                    engine_config.wind_mps = wind_mps;
+                    engine_config.geofence_sample_step_m = spacing.clamp(5.0, 25.0);
+                    engine_config
+                };
+
+                let attempt_started_at = Instant::now();
+                let handle = task::spawn_blocking(move || {
+                    let Some(mut grid) = generate_grid_samples(&waypoints, spacing, &lane_offsets, phase) else {
+                        return Err(SegmentError::Path(vec!["failed to generate grid".to_string()]));
+                    };
+                    let sample_points = grid
+                        .lanes
+                        .first()
+                        .map(|lane| lane.len() * grid.lanes.len())
+                        .unwrap_or(0);
+                    if sample_points > MAX_ROUTE_GRID_POINTS {
+                        return Err(SegmentError::GridTooLarge(sample_points));
+                    }
+                    apply_obstacles(&mut grid, &obstacles, |lat, lon| {
+                        terrain_for_task
+                            .as_ref()
+                            .map(|grid| grid.sample(lat, lon))
+                            .unwrap_or(0.0)
+                    });
+                    let result = optimize_airborne_path(&waypoints, &grid, &geofences, &engine_config);
+                    Ok((result, sample_points))
+                });
+
+                let attempt = match handle.await {
+                    Ok(Ok(value)) => value,
+                    Ok(Err(SegmentError::GridTooLarge(count))) => {
+                        return Err(SegmentError::GridTooLarge(count));
+                    }
+                    Ok(Err(SegmentError::Path(errors))) => {
+                        last_errors = errors;
+                        continue;
+                    }
+                    Ok(Err(err)) => {
+                        last_errors = vec![format!("segment planner failed: {:?}", err)];
+                        continue;
+                    }
+                    Err(err) => {
+                        last_errors = vec![format!("planner task failed: {}", err)];
+                        continue;
+                    }
+                };
+
+                let (result, sample_points) = attempt;
+                let attempt_ms = attempt_started_at.elapsed().as_millis();
+                if attempt_ms >= 250 {
+                    tracing::info!(
+                        lane_radius_m = lane_radius,
+                        lane_spacing_m = lane_spacing,
+                        grid_spacing_m = spacing,
+                        grid_phase = phase,
+                        success = result.success,
+                        nodes_visited = result.nodes_visited,
+                        optimized_points = result.optimized_points,
+                        elapsed_ms = attempt_ms as u64,
+                        errors = ?result.errors,
+                        "RoutePlan segment A* attempt"
+                    );
+                }
+                if result.success && !result.waypoints.is_empty() {
+                    return Ok(SegmentPlan {
+                        waypoints: result.waypoints,
+                        stats: result.stats,
+                        nodes_visited: result.nodes_visited,
+                        optimized_points: result.optimized_points,
+                        sample_points,
+                        hazards,
+                        terrain,
+                    });
+                }
+
+                last_errors = result.errors.clone();
+            }
         }
-
-        let terrain_ref = terrain.as_ref();
-        apply_obstacles(&mut grid, &obstacles, |lat, lon| {
-            terrain_ref
-                .map(|grid| grid.sample(lat, lon))
-                .unwrap_or(0.0)
-        });
-
-        let mut engine_config = RouteEngineConfig::default();
-        engine_config.safety_buffer_m = safety_buffer_m;
-        engine_config.geofence_sample_step_m = spacing.clamp(5.0, 25.0);
-
-        let result = optimize_airborne_path(waypoints, &grid, &geofences, &engine_config);
-        if result.success && !result.waypoints.is_empty() {
-            return Ok(SegmentPlan {
-                waypoints: result.waypoints,
-                stats: result.stats,
-                nodes_visited: result.nodes_visited,
-                optimized_points: result.optimized_points,
-                sample_points: last_sample_points,
-                hazards,
-                terrain,
-            });
+        if !attempted && last_errors.is_empty() {
+            last_errors = vec!["failed to generate grid".to_string()];
         }
-
-        last_errors = result.errors.clone();
-        lane_radius += expansion_step;
     }
 
     let errors = if last_errors.is_empty() {
@@ -655,38 +1074,6 @@ async fn plan_airborne_segment(
     Err(SegmentError::Path(errors))
 }
 
-
-fn build_obstacle_geofences(
-    footprints: &[ObstacleFootprint],
-    terrain: Option<&TerrainGrid>,
-) -> Vec<Geofence> {
-    let mut geofences = Vec::new();
-    for footprint in footprints {
-        if footprint.polygon.len() < 3 {
-            continue;
-        }
-        if footprint.height_m <= 0.0 {
-            continue;
-        }
-        let (centroid_lat, centroid_lon) = polygon_centroid(&footprint.polygon);
-        let base_alt = terrain
-            .map(|grid| grid.sample(centroid_lat, centroid_lon))
-            .unwrap_or(0.0)
-            .max(0.0);
-        let upper = (base_alt + footprint.height_m).max(base_alt + 1.0);
-        geofences.push(Geofence {
-            id: format!("osm-{}", footprint.id),
-            name: format!("OSM {}", footprint.name),
-            geofence_type: GeofenceType::NoFlyZone,
-            polygon: footprint.polygon.clone(),
-            lower_altitude_m: base_alt,
-            upper_altitude_m: upper,
-            active: true,
-            created_at: Utc::now(),
-        });
-    }
-    geofences
-}
 
 fn empty_obstacle_analysis() -> ObstacleAnalysis {
     ObstacleAnalysis {
@@ -736,6 +1123,7 @@ pub async fn plan_airborne_route(
         &points,
         safety_buffer_m,
         Some(max_lane_radius + safety_buffer_m),
+        ObstacleQueryMode::RoutePlanner,
     )
     .await
     {
@@ -770,7 +1158,6 @@ pub async fn plan_airborne_route(
     let terrain = fetch_terrain_grid(&client, config, &points, base_spacing).await.ok().flatten();
 
     let mut geofences = state.get_geofences();
-    geofences.extend(build_obstacle_geofences(&analysis.footprints, terrain.as_ref()));
     geofences.extend(extra_geofences.iter().cloned());
     let geofences: Vec<Geofence> = geofences
         .into_iter()
@@ -779,39 +1166,56 @@ pub async fn plan_airborne_route(
 
     let mut lane_radius = lane_radius;
     let mut best_result: Option<RouteEngineResult> = None;
+    let spacing_candidates = lane_spacing_candidates(lane_spacing);
+    let phase_candidates = grid_phase_candidates();
     while lane_radius <= max_lane_radius + f64::EPSILON {
-        let lane_offsets = build_lane_offsets(lane_radius, lane_spacing);
-        let spacing = resolve_spacing_for_grid(route_distance_m, base_spacing, lane_offsets.len());
-        let Some(mut grid) = generate_grid_samples(waypoints, spacing, &lane_offsets) else {
-            break;
-        };
-        let sample_points = grid
-            .lanes
-            .first()
-            .map(|lane| lane.len() * grid.lanes.len())
-            .unwrap_or(0);
-        if sample_points > MAX_ROUTE_GRID_POINTS {
+        for lane_spacing in spacing_candidates.iter().copied() {
+            let lane_offsets = build_lane_offsets(lane_radius, lane_spacing);
+            let spacing = resolve_spacing_for_grid(route_distance_m, base_spacing, lane_offsets.len());
+            let estimated_points = estimate_grid_points(route_distance_m, spacing, lane_offsets.len());
+            if estimated_points > MAX_ROUTE_GRID_POINTS {
+                continue;
+            }
+
+            for phase in phase_candidates {
+                let Some(mut grid) = generate_grid_samples(waypoints, spacing, &lane_offsets, phase) else {
+                    continue;
+                };
+                let sample_points = grid
+                    .lanes
+                    .first()
+                    .map(|lane| lane.len() * grid.lanes.len())
+                    .unwrap_or(0);
+                if sample_points > MAX_ROUTE_GRID_POINTS {
+                    continue;
+                }
+
+                let terrain_ref = terrain.as_ref();
+                apply_obstacles(&mut grid, &obstacles, |lat, lon| {
+                    terrain_ref
+                        .map(|grid| grid.sample(lat, lon))
+                        .unwrap_or(0.0)
+                });
+
+                let mut engine_config = RouteEngineConfig::default();
+                engine_config.safety_buffer_m = safety_buffer_m;
+                engine_config.faa_limit_agl = 500.0;
+                engine_config.wind_mps = config.route_planner_wind_mps.max(0.0);
+                engine_config.geofence_sample_step_m = spacing.clamp(5.0, 25.0);
+
+                let result = optimize_airborne_path(waypoints, &grid, &geofences, &engine_config);
+                if result.success && !result.waypoints.is_empty() {
+                    best_result = Some(result);
+                    break;
+                }
+            }
+            if best_result.is_some() {
+                break;
+            }
+        }
+        if best_result.is_some() {
             break;
         }
-
-        let terrain_ref = terrain.as_ref();
-        apply_obstacles(&mut grid, &obstacles, |lat, lon| {
-            terrain_ref
-                .map(|grid| grid.sample(lat, lon))
-                .unwrap_or(0.0)
-        });
-
-        let mut engine_config = RouteEngineConfig::default();
-        engine_config.safety_buffer_m = safety_buffer_m;
-        engine_config.faa_limit_agl = 500.0;
-        engine_config.geofence_sample_step_m = spacing.clamp(5.0, 25.0);
-
-        let result = optimize_airborne_path(waypoints, &grid, &geofences, &engine_config);
-        if result.success && !result.waypoints.is_empty() {
-            best_result = Some(result);
-            break;
-        }
-
         lane_radius += DEFAULT_LANE_EXPANSION_STEP_M;
     }
 
@@ -868,11 +1272,11 @@ fn resolve_max_lane_radius(
 ) -> f64 {
     let mut radius = override_radius.unwrap_or_else(|| {
         if route_distance_m > 12_000.0 {
-            1500.0
+            1800.0
         } else if route_distance_m > 8_000.0 {
-            1000.0
+            1400.0
         } else if route_distance_m > 4_000.0 {
-            700.0
+            1000.0
         } else {
             DEFAULT_MAX_LANE_RADIUS_M
         }
@@ -880,23 +1284,10 @@ fn resolve_max_lane_radius(
     if radius < base_radius {
         radius = base_radius;
     }
+    if radius < DEFAULT_MAX_LANE_RADIUS_M {
+        radius = DEFAULT_MAX_LANE_RADIUS_M;
+    }
     radius
-}
-
-fn polygon_centroid(polygon: &[[f64; 2]]) -> (f64, f64) {
-    let mut sum_lat = 0.0;
-    let mut sum_lon = 0.0;
-    let mut count = 0.0;
-    for point in polygon {
-        sum_lat += point[0];
-        sum_lon += point[1];
-        count += 1.0;
-    }
-    if count <= 0.0 {
-        (0.0, 0.0)
-    } else {
-        (sum_lat / count, sum_lon / count)
-    }
 }
 
 fn build_segments(waypoints: &[Waypoint], segment_length_m: f64) -> Vec<Vec<Waypoint>> {
@@ -971,6 +1362,58 @@ fn resolve_spacing_for_grid(distance_m: f64, base_spacing: f64, lane_count: usiz
 fn estimate_grid_points(distance_m: f64, spacing_m: f64, lane_count: usize) -> usize {
     let steps = (distance_m / spacing_m.max(1.0)).ceil().max(1.0) as usize + 1;
     steps.saturating_mul(lane_count.max(1))
+}
+
+fn lane_radius_candidates(start: f64, max: f64, expansion_step: f64) -> Vec<f64> {
+    let mut candidates = Vec::new();
+    if !start.is_finite() || !max.is_finite() {
+        return vec![start.max(1.0)];
+    }
+    let start = start.max(1.0);
+    let max = max.max(start);
+    let step = expansion_step.max(1.0);
+
+    let mut radius = start;
+    let mut guard = 0u32;
+    while radius + f64::EPSILON < max && guard < 32 {
+        candidates.push(radius);
+        let next = (radius * 1.8).max(radius + step);
+        if !next.is_finite() || next <= radius + f64::EPSILON {
+            break;
+        }
+        radius = next.min(max);
+        guard += 1;
+    }
+    if candidates.last().copied().unwrap_or(0.0) + f64::EPSILON < max {
+        candidates.push(max);
+    } else if candidates.is_empty() {
+        candidates.push(max);
+    }
+    candidates
+}
+
+fn lane_spacing_candidates(base_spacing: f64) -> Vec<f64> {
+    let base = base_spacing.max(1.0);
+    let mut candidates = vec![base];
+    let refined = (base / 2.0).max(MIN_LANE_SPACING_M);
+    if refined + f64::EPSILON < base {
+        candidates.push(refined);
+    }
+    candidates
+}
+
+fn grid_phase_candidates() -> [f64; 2] {
+    [0.0, 0.5]
+}
+
+fn normalize_waypoints(waypoints: &[Waypoint], config: &Config) -> Vec<Waypoint> {
+    waypoints
+        .iter()
+        .map(|wp| Waypoint {
+            altitude_m: altitude_to_amsl(wp.altitude_m, config.altitude_reference, config.geoid_offset_m),
+            ..wp.clone()
+        })
+        .collect()
 }
 
 fn append_segment_waypoints(

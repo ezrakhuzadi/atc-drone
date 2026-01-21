@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const METERS_PER_DEG_LAT: f64 = 111_320.0;
+
 /// Severity levels for detected conflicts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -30,6 +32,8 @@ pub struct DronePosition {
     pub heading_deg: f64,
     #[serde(default)]
     pub speed_mps: f64,
+    #[serde(default)]
+    pub velocity_z: f64,
     #[serde(default = "current_timestamp")]
     pub timestamp: f64,
 }
@@ -51,14 +55,16 @@ impl DronePosition {
             altitude_m,
             heading_deg: 0.0,
             speed_mps: 0.0,
+            velocity_z: 0.0,
             timestamp: current_timestamp(),
         }
     }
 
     /// Set heading and speed.
-    pub fn with_velocity(mut self, heading_deg: f64, speed_mps: f64) -> Self {
+    pub fn with_velocity(mut self, heading_deg: f64, speed_mps: f64, velocity_z: f64) -> Self {
         self.heading_deg = heading_deg;
         self.speed_mps = speed_mps;
+        self.velocity_z = velocity_z;
         self
     }
 }
@@ -159,7 +165,8 @@ impl ConflictDetector {
     /// Predict drone position after time_offset_s seconds.
     fn predict_position(drone: &DronePosition, time_offset_s: f64) -> (f64, f64, f64) {
         if drone.speed_mps <= 0.0 {
-            return (drone.lat, drone.lon, drone.altitude_m);
+            let altitude_m = drone.altitude_m + drone.velocity_z * time_offset_s;
+            return (drone.lat, drone.lon, altitude_m);
         }
 
         // Distance traveled
@@ -168,19 +175,16 @@ impl ConflictDetector {
         // Convert heading to radians (0 = North, clockwise)
         let heading_rad = drone.heading_deg.to_radians();
 
-        // Calculate offset in meters
-        let north_m = distance_m * heading_rad.cos();
-        let east_m = distance_m * heading_rad.sin();
+        let (lat, lon) = crate::spatial::offset_by_bearing(
+            drone.lat,
+            drone.lon,
+            distance_m,
+            heading_rad,
+        );
 
-        // Convert to lat/lon offset
-        let lat_offset = north_m / 111_320.0;
-        let lon_offset = east_m / (111_320.0 * drone.lat.to_radians().cos());
+        let altitude_m = drone.altitude_m + drone.velocity_z * time_offset_s;
 
-        (
-            drone.lat + lat_offset,
-            drone.lon + lon_offset,
-            drone.altitude_m, // Assuming constant altitude
-        )
+        (lat, lon, altitude_m)
     }
 
     /// Check separation between two positions.
@@ -195,112 +199,165 @@ impl ConflictDetector {
     }
 
     /// Find time and distance of closest approach.
-    /// Returns (time_to_closest_s, closest_distance_m, cpa_lat, cpa_lon, cpa_altitude_m).
-    fn find_closest_approach(
+    /// Returns (severity, time_to_closest_s, closest_distance_m, cpa_lat, cpa_lon, cpa_altitude_m).
+    fn predict_conflict(
         &self,
         drone1: &DronePosition,
         drone2: &DronePosition,
-    ) -> (f64, f64, f64, f64, f64) {
-        let mut min_distance = f64::INFINITY;
-        let mut time_of_min = 0.0;
-        let mut cpa_pos1 = (drone1.lat, drone1.lon, drone1.altitude_m);
-        let mut cpa_pos2 = (drone2.lat, drone2.lon, drone2.altitude_m);
+        warning_horizontal_m: f64,
+        warning_vertical_m: f64,
+    ) -> Option<(ConflictSeverity, f64, f64, f64, f64, f64)> {
+        let mut best_critical: Option<(f64, f64, (f64, f64, f64), (f64, f64, f64))> = None;
+        let mut best_warning: Option<(f64, f64, (f64, f64, f64), (f64, f64, f64))> = None;
 
-        // Sample at 1-second intervals
         for t in 0..=(self.lookahead_seconds as i32) {
             let t = t as f64;
             let pos1 = Self::predict_position(drone1, t);
             let pos2 = Self::predict_position(drone2, t);
             let (h_dist, v_dist) = Self::check_separation(pos1, pos2);
-
-            // 3D distance (weighted vertical)
             let distance = (h_dist.powi(2) + v_dist.powi(2)).sqrt();
 
-            if distance < min_distance {
-                min_distance = distance;
-                time_of_min = t;
-                cpa_pos1 = pos1;
-                cpa_pos2 = pos2;
+            if h_dist < self.separation_horizontal_m && v_dist < self.separation_vertical_m {
+                let replace = best_critical
+                    .as_ref()
+                    .map(|(best_distance, ..)| distance < *best_distance)
+                    .unwrap_or(true);
+                if replace {
+                    best_critical = Some((distance, t, pos1, pos2));
+                }
+            } else if h_dist < warning_horizontal_m && v_dist < warning_vertical_m {
+                let replace = best_warning
+                    .as_ref()
+                    .map(|(best_distance, ..)| distance < *best_distance)
+                    .unwrap_or(true);
+                if replace {
+                    best_warning = Some((distance, t, pos1, pos2));
+                }
             }
         }
 
-        // CPA is the midpoint between the two predicted positions
-        let cpa_lat = (cpa_pos1.0 + cpa_pos2.0) / 2.0;
-        let cpa_lon = (cpa_pos1.1 + cpa_pos2.1) / 2.0;
-        let cpa_altitude_m = (cpa_pos1.2 + cpa_pos2.2) / 2.0;
+        let (severity, distance, time, pos1, pos2) = if let Some(best) = best_critical {
+            (ConflictSeverity::Critical, best.0, best.1, best.2, best.3)
+        } else if let Some(best) = best_warning {
+            (ConflictSeverity::Warning, best.0, best.1, best.2, best.3)
+        } else {
+            return None;
+        };
 
-        (time_of_min, min_distance, cpa_lat, cpa_lon, cpa_altitude_m)
+        let cpa_lat = (pos1.0 + pos2.0) / 2.0;
+        let cpa_lon = (pos1.1 + pos2.1) / 2.0;
+        let cpa_altitude_m = (pos1.2 + pos2.2) / 2.0;
+
+        Some((severity, time, distance, cpa_lat, cpa_lon, cpa_altitude_m))
     }
 
     /// Check all tracked drones for conflicts.
     pub fn detect_conflicts(&mut self) -> Vec<Conflict> {
         let mut conflicts = Vec::new();
-        let drone_list: Vec<_> = self.drones.values().collect();
+        let drone_list: Vec<DronePosition> = self.drones.values().cloned().collect();
+        if drone_list.len() < 2 {
+            self.active_conflicts.clear();
+            return conflicts;
+        }
 
-        // Check all pairs
+        let max_speed = drone_list
+            .iter()
+            .map(|drone| drone.speed_mps)
+            .fold(0.0, f64::max);
+        let warning_h = self.separation_horizontal_m * self.warning_multiplier;
+        let warning_v = self.separation_vertical_m * self.warning_multiplier;
+        let max_threshold = self.separation_horizontal_m.max(warning_h);
+        let cell_size_m = (max_threshold + max_speed * self.lookahead_seconds).max(1.0);
+
+        let (ref_lat, ref_lon) = average_lat_lon(&drone_list);
+        let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+        let mut projected: Vec<(f64, f64)> = Vec::with_capacity(drone_list.len());
+
+        for (idx, drone) in drone_list.iter().enumerate() {
+            let (x, y) = project_xy(drone.lat, drone.lon, ref_lat, ref_lon);
+            projected.push((x, y));
+            let cell = ((x / cell_size_m).floor() as i32, (y / cell_size_m).floor() as i32);
+            grid.entry(cell).or_default().push(idx);
+        }
+
+        // Check nearby pairs using a spatial grid to avoid O(N^2) scans.
         for i in 0..drone_list.len() {
-            for j in (i + 1)..drone_list.len() {
-                let drone1 = drone_list[i];
-                let drone2 = drone_list[j];
+            let drone1 = &drone_list[i];
+            let (x, y) = projected[i];
+            let cell_x = (x / cell_size_m).floor() as i32;
+            let cell_y = (y / cell_size_m).floor() as i32;
+            let search_radius_m =
+                max_threshold + (drone1.speed_mps + max_speed) * self.lookahead_seconds;
+            let search_cells = (search_radius_m / cell_size_m).ceil() as i32;
 
-                // Check current separation
-                let (h_dist, v_dist) = Self::check_separation(
-                    (drone1.lat, drone1.lon, drone1.altitude_m),
-                    (drone2.lat, drone2.lon, drone2.altitude_m),
-                );
-                let current_distance = (h_dist.powi(2) + v_dist.powi(2)).sqrt();
+            for dx in -search_cells..=search_cells {
+                for dy in -search_cells..=search_cells {
+                    let Some(indices) = grid.get(&(cell_x + dx, cell_y + dy)) else {
+                        continue;
+                    };
 
-                // Check for current violation
-                if h_dist < self.separation_horizontal_m
-                    && v_dist < self.separation_vertical_m
-                {
-                    // Current position is the CPA for immediate violations
-                    let cpa_lat = (drone1.lat + drone2.lat) / 2.0;
-                    let cpa_lon = (drone1.lon + drone2.lon) / 2.0;
-                    let cpa_altitude_m = (drone1.altitude_m + drone2.altitude_m) / 2.0;
-                    
-                    conflicts.push(Conflict {
-                        drone1_id: drone1.drone_id.clone(),
-                        drone2_id: drone2.drone_id.clone(),
-                        severity: ConflictSeverity::Critical,
-                        distance_m: current_distance,
-                        time_to_closest: 0.0,
-                        closest_distance_m: current_distance,
-                        cpa_lat,
-                        cpa_lon,
-                        cpa_altitude_m,
-                        timestamp: current_timestamp(),
-                    });
-                    continue;
+                    for &j in indices {
+                        if j <= i {
+                            continue;
+                        }
+                        let drone2 = &drone_list[j];
+
+                        // Check current separation
+                        let (h_dist, v_dist) = Self::check_separation(
+                            (drone1.lat, drone1.lon, drone1.altitude_m),
+                            (drone2.lat, drone2.lon, drone2.altitude_m),
+                        );
+                        let max_possible_distance = max_threshold
+                            + (drone1.speed_mps + drone2.speed_mps) * self.lookahead_seconds;
+                        if h_dist > max_possible_distance {
+                            continue;
+                        }
+                        let current_distance = (h_dist.powi(2) + v_dist.powi(2)).sqrt();
+
+                        // Check for current violation
+                        if h_dist < self.separation_horizontal_m
+                            && v_dist < self.separation_vertical_m
+                        {
+                            // Current position is the CPA for immediate violations
+                            let cpa_lat = (drone1.lat + drone2.lat) / 2.0;
+                            let cpa_lon = (drone1.lon + drone2.lon) / 2.0;
+                            let cpa_altitude_m = (drone1.altitude_m + drone2.altitude_m) / 2.0;
+                            
+                            conflicts.push(Conflict {
+                                drone1_id: drone1.drone_id.clone(),
+                                drone2_id: drone2.drone_id.clone(),
+                                severity: ConflictSeverity::Critical,
+                                distance_m: current_distance,
+                                time_to_closest: 0.0,
+                                closest_distance_m: current_distance,
+                                cpa_lat,
+                                cpa_lon,
+                                cpa_altitude_m,
+                                timestamp: current_timestamp(),
+                            });
+                            continue;
+                        }
+
+                        let Some((severity, time_to_closest, closest_distance, cpa_lat, cpa_lon, cpa_altitude_m)) =
+                            self.predict_conflict(drone1, drone2, warning_h, warning_v)
+                        else {
+                            continue;
+                        };
+
+                        conflicts.push(Conflict {
+                            drone1_id: drone1.drone_id.clone(),
+                            drone2_id: drone2.drone_id.clone(),
+                            severity,
+                            distance_m: current_distance,
+                            time_to_closest,
+                            closest_distance_m: closest_distance,
+                            cpa_lat,
+                            cpa_lon,
+                            cpa_altitude_m,
+                            timestamp: current_timestamp(),
+                        });
+                    }
                 }
-
-                // Check predicted conflicts
-                let (time_to_closest, closest_distance, cpa_lat, cpa_lon, cpa_altitude_m) =
-                    self.find_closest_approach(drone1, drone2);
-
-                // Warning threshold
-                let warning_h = self.separation_horizontal_m * self.warning_multiplier;
-
-                let severity = if closest_distance < self.separation_horizontal_m {
-                    ConflictSeverity::Critical
-                } else if closest_distance < warning_h {
-                    ConflictSeverity::Warning
-                } else {
-                    continue; // No conflict
-                };
-
-                conflicts.push(Conflict {
-                    drone1_id: drone1.drone_id.clone(),
-                    drone2_id: drone2.drone_id.clone(),
-                    severity,
-                    distance_m: current_distance,
-                    time_to_closest,
-                    closest_distance_m: closest_distance,
-                    cpa_lat,
-                    cpa_lon,
-                    cpa_altitude_m,
-                    timestamp: current_timestamp(),
-                });
             }
         }
 
@@ -317,6 +374,21 @@ impl ConflictDetector {
 
         conflicts
     }
+}
+
+fn average_lat_lon(drones: &[DronePosition]) -> (f64, f64) {
+    let count = drones.len() as f64;
+    let (sum_lat, sum_lon) = drones.iter().fold((0.0, 0.0), |acc, drone| {
+        (acc.0 + drone.lat, acc.1 + drone.lon)
+    });
+    (sum_lat / count, sum_lon / count)
+}
+
+fn project_xy(lat: f64, lon: f64, ref_lat: f64, ref_lon: f64) -> (f64, f64) {
+    let meters_per_deg_lon = (ref_lat.to_radians().cos().abs().max(0.01)) * METERS_PER_DEG_LAT;
+    let x = (lon - ref_lon) * meters_per_deg_lon;
+    let y = (lat - ref_lat) * METERS_PER_DEG_LAT;
+    (x, y)
 }
 
 #[cfg(test)]
@@ -352,6 +424,27 @@ mod tests {
 
         let conflicts = detector.detect_conflicts();
         assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].severity, ConflictSeverity::Critical);
+    }
+
+    #[test]
+    fn test_vertical_conflict_detection() {
+        let mut detector = ConflictDetector::default();
+
+        let (lat2, lon2) = crate::spatial::offset_by_bearing(
+            0.0,
+            0.0,
+            49.0,
+            std::f64::consts::FRAC_PI_2,
+        );
+
+        detector.update_position(DronePosition::new("DRONE001", 0.0, 0.0, 0.0));
+        detector.update_position(
+            DronePosition::new("DRONE002", lat2, lon2, 80.0).with_velocity(0.0, 0.0, -3.0),
+        );
+
+        let conflicts = detector.detect_conflicts();
+        assert!(!conflicts.is_empty());
         assert_eq!(conflicts[0].severity, ConflictSeverity::Critical);
     }
 }

@@ -1,6 +1,8 @@
 //! Server-side compliance evaluation for flight plans.
 
+use crate::cache;
 use crate::config::Config;
+use atc_core::spatial::{meters_per_deg_lat, meters_per_deg_lon};
 use atc_core::models::FlightPlanRequest;
 use chrono::Utc;
 use reqwest::Client;
@@ -8,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+use tokio::time::sleep;
 use dashmap::DashMap;
 
 #[derive(Debug, Clone, Copy)]
@@ -134,6 +137,23 @@ struct Bounds {
     max_lon: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObstacleQueryMode {
+    /// Full building coverage for compliance and population checks.
+    Full,
+    /// Reduced building coverage (tagged heights/levels only) for fast route planning.
+    RoutePlanner,
+}
+
+impl ObstacleQueryMode {
+    fn cache_key_part(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::RoutePlanner => "route",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ObstacleAnalysis {
     pub(crate) candidates: Vec<ObstacleCandidate>,
@@ -153,10 +173,18 @@ struct ObstacleCacheEntry {
     analysis: ObstacleAnalysis,
 }
 
+impl cache::CacheEntry for ObstacleCacheEntry {
+    fn fetched_at(&self) -> Instant {
+        self.fetched_at
+    }
+}
+
 fn obstacle_cache() -> &'static DashMap<String, ObstacleCacheEntry> {
     static CACHE: OnceLock<DashMap<String, ObstacleCacheEntry>> = OnceLock::new();
     CACHE.get_or_init(DashMap::new)
 }
+
+const OBSTACLE_CACHE_MAX_ENTRIES: usize = 256;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ObstacleCandidate {
@@ -246,7 +274,6 @@ pub async fn evaluate_compliance(
         .and_then(|m| m.compliance_override_notes.clone())
         .unwrap_or_default();
 
-    let route = build_route_metrics(points, cruise_speed_mps);
     let client = Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
@@ -254,7 +281,7 @@ pub async fn evaluate_compliance(
 
     let (weather_result, obstacle_result) = tokio::join!(
         fetch_weather(&client, config, points),
-        fetch_obstacles(&client, config, points, clearance_m, None)
+        fetch_obstacles(&client, config, points, clearance_m, None, ObstacleQueryMode::Full)
     );
 
     let weather_check = match weather_result {
@@ -301,6 +328,12 @@ pub async fn evaluate_compliance(
         ),
     };
 
+    let wind_mps = weather_check
+        .wind_mps
+        .unwrap_or(0.0)
+        .max(weather_check.gust_mps.unwrap_or(0.0));
+    let route = build_route_metrics(points, cruise_speed_mps, wind_mps);
+
     let battery_check = evaluate_battery(config, &route, cruise_speed_mps, battery_capacity_min, battery_reserve_min);
 
     let checks = ComplianceChecks {
@@ -345,7 +378,7 @@ pub async fn evaluate_compliance(
     }
 }
 
-fn build_route_metrics(points: &[RoutePoint], cruise_speed_mps: Option<f64>) -> RouteMetrics {
+fn build_route_metrics(points: &[RoutePoint], cruise_speed_mps: Option<f64>, wind_mps: f64) -> RouteMetrics {
     if points.len() < 2 {
         return RouteMetrics {
             distance_m: 0.0,
@@ -358,8 +391,9 @@ fn build_route_metrics(points: &[RoutePoint], cruise_speed_mps: Option<f64>) -> 
         distance_m += haversine_distance_m(points[idx - 1], points[idx]);
     }
     let speed = cruise_speed_mps.unwrap_or(0.0);
+    let effective_speed = (speed - wind_mps).max(0.1);
     let estimated_minutes = if speed > 0.0 {
-        distance_m / speed / 60.0
+        distance_m / effective_speed / 60.0
     } else {
         0.0
     };
@@ -645,6 +679,7 @@ pub(crate) async fn fetch_obstacles(
     points: &[RoutePoint],
     clearance_m: f64,
     corridor_radius_m: Option<f64>,
+    mode: ObstacleQueryMode,
 ) -> Result<ObstacleAnalysis, String> {
     let base_bounds = compute_bounds(points).ok_or("invalid route bounds")?;
     let bounds = corridor_radius_m
@@ -661,6 +696,7 @@ pub(crate) async fn fetch_obstacles(
         clearance_m,
         corridor_radius_m,
         config.compliance_max_overpass_elements,
+        mode,
     );
     let cache_ttl = Duration::from_secs(config.obstacle_cache_ttl_s.max(30));
     let cache = obstacle_cache();
@@ -676,48 +712,69 @@ pub(crate) async fn fetch_obstacles(
     }
     let area_km2 = bounds_area_km2(&bounds);
     let bbox = format!("{},{},{},{}", bounds.min_lat, bounds.min_lon, bounds.max_lat, bounds.max_lon);
-    let query = format!(
-        "[out:json][timeout:25];\n(\n  node[\"man_made\"~\"tower|mast|chimney\"]({bbox});\n  node[\"power\"=\"tower\"]({bbox});\n  node[\"aeroway\"~\"helipad|heliport\"]({bbox});\n  way[\"man_made\"~\"tower|mast|chimney\"]({bbox});\n  way[\"power\"=\"tower\"]({bbox});\n  way[\"aeroway\"~\"helipad|heliport\"]({bbox});\n  way[\"building\"]({bbox});\n  way[\"building:part\"]({bbox});\n  relation[\"building\"]({bbox});\n  relation[\"building:part\"]({bbox});\n);\nout center geom tags;"
-    );
+    let overpass_timeout_s = config.compliance_overpass_timeout_s.max(5);
+    let route_min_height_m = config.route_planner_building_min_height_m.max(0.0);
+    let route_min_levels = config.route_planner_building_min_levels as f64;
+    let query = match mode {
+        ObstacleQueryMode::Full => format!(
+            "[out:json][timeout:{overpass_timeout_s}];\n(\n  node[\"man_made\"~\"tower|mast|chimney\"]({bbox});\n  node[\"power\"=\"tower\"]({bbox});\n  node[\"aeroway\"~\"helipad|heliport\"]({bbox});\n  way[\"man_made\"~\"tower|mast|chimney\"]({bbox});\n  way[\"power\"=\"tower\"]({bbox});\n  way[\"aeroway\"~\"helipad|heliport\"]({bbox});\n  way[\"building\"]({bbox});\n  way[\"building:part\"]({bbox});\n  relation[\"building\"]({bbox});\n  relation[\"building:part\"]({bbox});\n);\nout center tags;"
+        ),
+        ObstacleQueryMode::RoutePlanner => format!(
+            "[out:json][timeout:{overpass_timeout_s}];\n(\n  node[\"man_made\"~\"tower|mast|chimney\"]({bbox});\n  node[\"power\"=\"tower\"]({bbox});\n  node[\"aeroway\"~\"helipad|heliport\"]({bbox});\n  way[\"man_made\"~\"tower|mast|chimney\"]({bbox});\n  way[\"power\"=\"tower\"]({bbox});\n  way[\"aeroway\"~\"helipad|heliport\"]({bbox});\n  way[\"building\"][\"height\"]({bbox})(if:number(t[\"height\"])>{route_min_height_m});\n  way[\"building\"][\"building:height\"]({bbox})(if:number(t[\"building:height\"])>{route_min_height_m});\n  way[\"building\"][\"building:levels\"]({bbox})(if:number(t[\"building:levels\"])>{route_min_levels});\n  way[\"building\"][\"levels\"]({bbox})(if:number(t[\"levels\"])>{route_min_levels});\n  way[\"building:part\"][\"height\"]({bbox})(if:number(t[\"height\"])>{route_min_height_m});\n  way[\"building:part\"][\"building:height\"]({bbox})(if:number(t[\"building:height\"])>{route_min_height_m});\n  way[\"building:part\"][\"building:levels\"]({bbox})(if:number(t[\"building:levels\"])>{route_min_levels});\n  way[\"building:part\"][\"levels\"]({bbox})(if:number(t[\"levels\"])>{route_min_levels});\n  relation[\"building\"][\"height\"]({bbox})(if:number(t[\"height\"])>{route_min_height_m});\n  relation[\"building\"][\"building:height\"]({bbox})(if:number(t[\"building:height\"])>{route_min_height_m});\n  relation[\"building\"][\"building:levels\"]({bbox})(if:number(t[\"building:levels\"])>{route_min_levels});\n  relation[\"building\"][\"levels\"]({bbox})(if:number(t[\"levels\"])>{route_min_levels});\n  relation[\"building:part\"][\"height\"]({bbox})(if:number(t[\"height\"])>{route_min_height_m});\n  relation[\"building:part\"][\"building:height\"]({bbox})(if:number(t[\"building:height\"])>{route_min_height_m});\n  relation[\"building:part\"][\"building:levels\"]({bbox})(if:number(t[\"building:levels\"])>{route_min_levels});\n  relation[\"building:part\"][\"levels\"]({bbox})(if:number(t[\"levels\"])>{route_min_levels});\n);\nout center tags qt;"
+        ),
+    };
 
-    let response = client
-        .post(&config.compliance_overpass_url)
-        .header("Content-Type", "text/plain")
-        .body(query)
-        .send()
-        .await
-        .map_err(|err| err.to_string());
+    let request_timeout = Duration::from_secs(overpass_timeout_s);
+    let max_attempts = config.compliance_overpass_retries.saturating_add(1);
+    let backoff_base_ms = config.compliance_overpass_retry_backoff_ms.max(1);
+    let mut last_err: Option<String> = None;
+    let mut payload: Option<OverpassResponse> = None;
 
-    let response = match response {
-        Ok(response) => response,
-        Err(err) => {
+    for attempt in 0..max_attempts {
+        let response = client
+            .post(&config.compliance_overpass_url)
+            .header("Content-Type", "text/plain")
+            .timeout(request_timeout)
+            .body(query.clone())
+            .send()
+            .await;
+
+        match response {
+            Ok(response) => {
+                if !response.status().is_success() {
+                    last_err = Some(format!("OSM provider HTTP {}", response.status()));
+                } else {
+                    match response.json().await {
+                        Ok(parsed) => {
+                            payload = Some(parsed);
+                            break;
+                        }
+                        Err(err) => {
+                            last_err = Some(err.to_string());
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                last_err = Some(err.to_string());
+            }
+        }
+
+        if attempt + 1 < max_attempts {
+            let delay_ms = backoff_base_ms.saturating_mul(attempt.saturating_add(1) as u64);
+            sleep(Duration::from_millis(delay_ms)).await;
+        }
+    }
+
+    let payload = match payload {
+        Some(payload) => payload,
+        None => {
+            let err = last_err.unwrap_or_else(|| "OSM request failed".to_string());
             if let Some(stale) = stale_cache {
                 tracing::warn!("Obstacle fetch failed, using stale cache: {}", err);
                 return Ok(stale);
             }
             return Err(err);
-        }
-    };
-
-    if !response.status().is_success() {
-        if let Some(stale) = stale_cache {
-            tracing::warn!(
-                "OSM provider HTTP {}, using stale cache",
-                response.status()
-            );
-            return Ok(stale);
-        }
-        return Err(format!("OSM provider HTTP {}", response.status()));
-    }
-
-    let payload: OverpassResponse = match response.json().await {
-        Ok(payload) => payload,
-        Err(err) => {
-            if let Some(stale) = stale_cache {
-                tracing::warn!("OSM parse failed, using stale cache: {}", err);
-                return Ok(stale);
-            }
-            return Err(err.to_string());
         }
     };
     let elements = payload.elements;
@@ -887,6 +944,7 @@ pub(crate) async fn fetch_obstacles(
             analysis: analysis.clone(),
         },
     );
+    cache::prune_cache(cache, OBSTACLE_CACHE_MAX_ENTRIES, cache_ttl.saturating_mul(2));
 
     Ok(analysis)
 }
@@ -946,9 +1004,9 @@ fn expand_bounds(bounds: &Bounds) -> Bounds {
 }
 
 fn expand_bounds_by_meters(bounds: &Bounds, padding_m: f64) -> Bounds {
-    let mean_lat = ((bounds.min_lat + bounds.max_lat) / 2.0).to_radians();
-    let meters_per_deg_lat = 111_320.0;
-    let meters_per_deg_lon = 111_320.0 * mean_lat.cos().max(0.01);
+    let mean_lat = (bounds.min_lat + bounds.max_lat) / 2.0;
+    let meters_per_deg_lat = meters_per_deg_lat(mean_lat);
+    let meters_per_deg_lon = meters_per_deg_lon(mean_lat).max(1.0);
     let pad_lat = (padding_m / meters_per_deg_lat).max(0.002);
     let pad_lon = (padding_m / meters_per_deg_lon).max(0.002);
     Bounds {
@@ -960,9 +1018,9 @@ fn expand_bounds_by_meters(bounds: &Bounds, padding_m: f64) -> Bounds {
 }
 
 fn bounds_area_km2(bounds: &Bounds) -> f64 {
-    let mean_lat = ((bounds.min_lat + bounds.max_lat) / 2.0).to_radians();
-    let meters_per_deg_lat = 111_320.0;
-    let meters_per_deg_lon = 111_320.0 * mean_lat.cos();
+    let mean_lat = (bounds.min_lat + bounds.max_lat) / 2.0;
+    let meters_per_deg_lat = meters_per_deg_lat(mean_lat);
+    let meters_per_deg_lon = meters_per_deg_lon(mean_lat).max(1.0);
     let width_m = (bounds.max_lon - bounds.min_lon) * meters_per_deg_lon;
     let height_m = (bounds.max_lat - bounds.min_lat) * meters_per_deg_lat;
     let area_km2 = (width_m.max(0.0) * height_m.max(0.0)) / 1_000_000.0;
@@ -974,10 +1032,12 @@ fn obstacle_cache_key(
     clearance_m: f64,
     corridor_radius_m: Option<f64>,
     max_elements: usize,
+    mode: ObstacleQueryMode,
 ) -> String {
     let radius = corridor_radius_m.unwrap_or(0.0);
     format!(
-        "obs:{:.4}:{:.4}:{:.4}:{:.4}:{:.0}:{:.0}:{}",
+        "obs:{}:{:.4}:{:.4}:{:.4}:{:.4}:{:.0}:{:.0}:{}",
+        mode.cache_key_part(),
         bounds.min_lat,
         bounds.min_lon,
         bounds.max_lat,
@@ -990,18 +1050,50 @@ fn obstacle_cache_key(
 
 fn parse_height(value: Option<&String>) -> Option<f64> {
     let value = value?;
+    let raw = value.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    let lower = raw.to_lowercase();
     let mut digits = String::new();
-    for ch in value.chars() {
-        if ch.is_ascii_digit() || ch == '.' {
+    let mut end_idx = 0usize;
+    let mut started = false;
+
+    for (idx, ch) in lower.char_indices() {
+        if !started && ch.is_whitespace() {
+            continue;
+        }
+        if ch.is_ascii_digit() || ch == '.' || (!started && ch == '-') {
+            started = true;
             digits.push(ch);
-        } else if !digits.is_empty() {
+            end_idx = idx + ch.len_utf8();
+            continue;
+        }
+        if started {
             break;
         }
     }
+
     if digits.is_empty() {
         return None;
     }
-    digits.parse::<f64>().ok()
+
+    let mut height = digits.parse::<f64>().ok()?;
+    if !height.is_finite() || height <= 0.0 {
+        return None;
+    }
+
+    let unit = lower.get(end_idx..).unwrap_or("").trim_start();
+    let is_feet = unit.starts_with("ft") || unit.starts_with("feet") || unit.starts_with("foot");
+    if is_feet {
+        height *= 0.3048;
+    }
+
+    if !height.is_finite() || height <= 0.0 {
+        return None;
+    }
+    Some(height)
 }
 
 fn element_center(element: &OverpassElement) -> Option<(f64, f64)> {
@@ -1086,9 +1178,8 @@ fn distance_to_route_meters(hazard_lat: f64, hazard_lon: f64, points: &[RoutePoi
         return f64::INFINITY;
     }
 
-    let ref_lat = hazard_lat.to_radians();
-    let meters_per_deg_lat = 111_320.0;
-    let meters_per_deg_lon = 111_320.0 * ref_lat.cos();
+    let meters_per_deg_lat = meters_per_deg_lat(hazard_lat);
+    let meters_per_deg_lon = meters_per_deg_lon(hazard_lat).max(1.0);
 
     let to_xy = |point: &RoutePoint| -> (f64, f64) {
         (

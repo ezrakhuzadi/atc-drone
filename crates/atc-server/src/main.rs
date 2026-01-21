@@ -1,10 +1,13 @@
 //! ATC Server - Always-on backend for drone traffic management
 
 mod api;
+mod altitude;
+mod cache;
 mod compliance;
 mod state;
 mod loops;
 mod config;
+mod blender_auth;
 mod persistence;
 mod route_planner;
 mod terrain;
@@ -41,6 +44,12 @@ async fn main() -> Result<()> {
     if config.require_registration_token && config.registration_token.is_none() {
         bail!("ATC_REGISTRATION_TOKEN is required when ATC_REQUIRE_REGISTRATION_TOKEN is enabled");
     }
+    if !config.allow_dummy_blender_auth
+        && config.blender_auth_token.trim().is_empty()
+        && config.blender_oauth_config().is_none()
+    {
+        bail!("BLENDER_AUTH_TOKEN or BLENDER_OAUTH_* is required when ATC_ENV is not development");
+    }
     
     // Initialize database
     tracing::info!("Initializing database: {}", config.database_path);
@@ -62,6 +71,20 @@ async fn main() -> Result<()> {
     tracing::info!("CORS origins: {:?}", config.allowed_origins);
     
     let (shutdown_tx, _) = broadcast::channel(1);
+
+    if let (Some(db), Some(telemetry_rx)) = (state.database().cloned(), state.take_telemetry_receiver()) {
+        let telemetry_state = state.clone();
+        let telemetry_shutdown = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            loops::telemetry_persist_loop::run_telemetry_persist_loop(
+                db,
+                telemetry_state,
+                telemetry_rx,
+                telemetry_shutdown,
+            )
+            .await;
+        });
+    }
 
     // Start background loops with supervision
     {
@@ -147,7 +170,7 @@ async fn main() -> Result<()> {
         let handle = axum_server::Handle::new();
         let server = axum_server::bind_rustls(addr, tls_config)
             .handle(handle.clone())
-            .serve(app.into_make_service());
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>());
         let shutdown = shutdown_signal(shutdown_tx.clone());
 
         tokio::select! {
@@ -160,7 +183,7 @@ async fn main() -> Result<()> {
         bail!("TLS required but ATC_TLS_CERT_PATH/ATC_TLS_KEY_PATH not set");
     } else {
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, app)
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
             .with_graceful_shutdown(shutdown_signal(shutdown_tx.clone()))
             .await?;
     }

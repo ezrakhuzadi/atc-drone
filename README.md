@@ -44,7 +44,7 @@ A Rust-based strategic conflict detection and resolution system for drone traffi
 - **Hold-aware logic**: Prevents cascading reroutes when priority drone is already maneuvering
 
 ### Command System
-- **Command types**: Reroute, Hold, Resume, Land, AltitudeChange
+- **Command types**: Reroute, Hold, Resume, AltitudeChange
 - **Expiration handling**: Commands auto-expire after configurable duration
 - **Lifecycle tracking**: Prevents duplicate commands via cooldown periods
 - **Distance-based blocking check**: Uses segment-to-segment distance (not bounding box)
@@ -173,10 +173,10 @@ Environment variables:
 - [x] WebSocket real-time updates
 
 ### Roadmap
-- [ ] Persistence layer (SQLite/PostgreSQL)
-- [ ] Time-aware strategic planning (4D flight plans)
+- [x] Persistence layer (SQLite)
+- [x] Time-aware strategic planning (4D flight plans)
 - [ ] MAVLink bridge for real drone integration
-- [ ] WebSocket command push (replace polling)
+- [x] WebSocket command push (replace polling)
 
 ## License
 

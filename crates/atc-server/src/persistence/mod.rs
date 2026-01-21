@@ -8,5 +8,7 @@ pub mod drones;
 pub mod geofences;
 pub mod flight_plans;
 pub mod commands;
+pub mod geofence_sync;
+pub mod drone_tokens;
 
 pub use db::{Database, init_database};

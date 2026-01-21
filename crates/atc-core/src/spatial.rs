@@ -246,43 +246,54 @@ fn segment_to_segment_distance(
 /// 
 /// # Returns
 /// Distance in meters
+pub const EARTH_RADIUS_M: f64 = 6_371_000.0;
+
 pub fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    const R: f64 = 6_371_000.0; // Earth radius in meters
     let phi1 = lat1.to_radians();
     let phi2 = lat2.to_radians();
     let dphi = (lat2 - lat1).to_radians();
     let dlambda = (lon2 - lon1).to_radians();
     let a = (dphi / 2.0).sin().powi(2)
         + phi1.cos() * phi2.cos() * (dlambda / 2.0).sin().powi(2);
-    2.0 * R * a.sqrt().atan2((1.0 - a).sqrt())
+    2.0 * EARTH_RADIUS_M * a.sqrt().atan2((1.0 - a).sqrt())
 }
 
 // ==== ENU (East-North-Up) Coordinate Conversion ====
-// These functions convert between meters and degrees using proper latitude scaling.
+// These functions convert between meters and degrees using latitude-aware scaling.
 
-/// Meters per degree of latitude (constant at all latitudes).
-pub const METERS_PER_DEG_LAT: f64 = 111_320.0;
+/// Meters per degree of latitude at a given latitude (WGS84 approximation).
+pub fn meters_per_deg_lat(lat_deg: f64) -> f64 {
+    let lat_rad = lat_deg.to_radians();
+    111_132.954
+        - 559.822 * (2.0 * lat_rad).cos()
+        + 1.175 * (4.0 * lat_rad).cos()
+        - 0.0023 * (6.0 * lat_rad).cos()
+}
 
-/// Meters per degree of longitude at a given latitude.
-/// Longitude degrees shrink as you move toward the poles.
+/// Meters per degree of longitude at a given latitude (WGS84 approximation).
 pub fn meters_per_deg_lon(lat_deg: f64) -> f64 {
-    METERS_PER_DEG_LAT * lat_deg.to_radians().cos()
+    let lat_rad = lat_deg.to_radians();
+    111_412.84 * lat_rad.cos()
+        - 93.5 * (3.0 * lat_rad).cos()
+        + 0.118 * (5.0 * lat_rad).cos()
 }
 
 /// Convert a north/south offset in meters to degrees latitude.
-pub fn meters_to_lat(meters: f64) -> f64 {
-    meters / METERS_PER_DEG_LAT
+pub fn meters_to_lat(meters: f64, ref_lat_deg: f64) -> f64 {
+    let meters_per_deg = meters_per_deg_lat(ref_lat_deg).max(1e-9);
+    meters / meters_per_deg
 }
 
 /// Convert an east/west offset in meters to degrees longitude.
 /// Requires the reference latitude for proper scaling.
 pub fn meters_to_lon(meters: f64, ref_lat_deg: f64) -> f64 {
-    meters / meters_per_deg_lon(ref_lat_deg)
+    let meters_per_deg = meters_per_deg_lon(ref_lat_deg).max(1e-9);
+    meters / meters_per_deg
 }
 
-/// Convert degrees latitude to meters.
-pub fn lat_to_meters(deg: f64) -> f64 {
-    deg * METERS_PER_DEG_LAT
+/// Convert degrees latitude to meters using local scaling.
+pub fn lat_to_meters(deg: f64, ref_lat_deg: f64) -> f64 {
+    deg * meters_per_deg_lat(ref_lat_deg)
 }
 
 /// Convert degrees longitude to meters at a given latitude.
@@ -300,9 +311,12 @@ pub fn lon_to_meters(deg: f64, ref_lat_deg: f64) -> f64 {
 /// # Returns
 /// (new_lat, new_lon) in degrees
 pub fn offset_position(lat: f64, lon: f64, north_m: f64, east_m: f64) -> (f64, f64) {
-    let new_lat = lat + meters_to_lat(north_m);
-    let new_lon = lon + meters_to_lon(east_m, lat);
-    (new_lat, new_lon)
+    let distance_m = (north_m * north_m + east_m * east_m).sqrt();
+    if distance_m <= f64::EPSILON {
+        return (lat, lon);
+    }
+    let bearing_rad = east_m.atan2(north_m);
+    offset_by_bearing(lat, lon, distance_m, bearing_rad)
 }
 
 /// Calculate bearing from point 1 to point 2 in radians.
@@ -328,9 +342,29 @@ pub fn bearing(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 /// # Returns
 /// (new_lat, new_lon) in degrees
 pub fn offset_by_bearing(lat: f64, lon: f64, distance_m: f64, bearing_rad: f64) -> (f64, f64) {
-    let north_m = distance_m * bearing_rad.cos();
-    let east_m = distance_m * bearing_rad.sin();
-    offset_position(lat, lon, north_m, east_m)
+    if distance_m.abs() <= f64::EPSILON {
+        return (lat, lon);
+    }
+
+    let lat1 = lat.to_radians();
+    let lon1 = lon.to_radians();
+    let angular_distance = distance_m / EARTH_RADIUS_M;
+
+    let sin_lat1 = lat1.sin();
+    let cos_lat1 = lat1.cos();
+    let sin_ad = angular_distance.sin();
+    let cos_ad = angular_distance.cos();
+
+    let sin_lat2 = sin_lat1 * cos_ad + cos_lat1 * sin_ad * bearing_rad.cos();
+    let lat2 = sin_lat2.clamp(-1.0, 1.0).asin();
+
+    let y = bearing_rad.sin() * sin_ad * cos_lat1;
+    let x = cos_ad - sin_lat1 * sin_lat2;
+    let mut lon2 = lon1 + y.atan2(x);
+    lon2 = (lon2 + std::f64::consts::PI).rem_euclid(2.0 * std::f64::consts::PI)
+        - std::f64::consts::PI;
+
+    (lat2.to_degrees(), lon2.to_degrees())
 }
 
 /// Calculate minimum distance from a point to a line segment (in meters).
@@ -355,11 +389,11 @@ pub fn distance_to_segment_m(
     
     // Point in local coords
     let px = lon_to_meters(point_lon - seg_start_lon, ref_lat);
-    let py = lat_to_meters(point_lat - seg_start_lat);
+    let py = lat_to_meters(point_lat - seg_start_lat, ref_lat);
     
     // Segment end in local coords
     let sx = lon_to_meters(seg_end_lon - seg_start_lon, ref_lat);
-    let sy = lat_to_meters(seg_end_lat - seg_start_lat);
+    let sy = lat_to_meters(seg_end_lat - seg_start_lat, ref_lat);
     
     // Segment length squared
     let seg_len_sq = sx * sx + sy * sy;

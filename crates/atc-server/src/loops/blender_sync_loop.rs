@@ -7,6 +7,7 @@ use tokio::time::interval;
 
 use crate::state::AppState;
 use crate::config::Config;
+use crate::blender_auth::BlenderAuthManager;
 use atc_blender::BlenderClient;
 
 /// Start the Blender sync loop.
@@ -15,7 +16,8 @@ pub async fn run_blender_loop(
     config: Config,
     mut shutdown: broadcast::Receiver<()>,
 ) {
-    let client = BlenderClient::new(
+    let auth = BlenderAuthManager::new(&config);
+    let mut client = BlenderClient::new(
         config.blender_url,
         config.blender_session_id,
         config.blender_auth_token,
@@ -30,6 +32,10 @@ pub async fn run_blender_loop(
                 break;
             }
             _ = ticker.tick() => {
+                if let Err(err) = auth.apply(&mut client).await {
+                    tracing::warn!("Blender sync auth refresh failed: {}", err);
+                    continue;
+                }
                 let drones = state.get_all_drones();
                 if drones.is_empty() {
                     continue;

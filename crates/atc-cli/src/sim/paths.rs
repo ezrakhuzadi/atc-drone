@@ -1,6 +1,6 @@
 //! Flight path implementations.
 
-use atc_core::spatial::haversine_distance;
+use atc_core::spatial::{bearing, haversine_distance, offset_by_bearing};
 use std::f64::consts::PI;
 
 /// Trait for flight path implementations.
@@ -92,16 +92,9 @@ impl FlightPath for CircularPath {
             angle_rad = -angle_rad;
         }
 
-        // Convert radius from meters to degrees (approximate)
-        let lat_offset = (self.radius_m / 111_320.0) * angle_rad.cos();
-        let lon_offset = (self.radius_m / (111_320.0 * self.center_lat.to_radians().cos()))
-            * angle_rad.sin();
+        let (lat, lon) = offset_by_bearing(self.center_lat, self.center_lon, self.radius_m, angle_rad);
 
-        (
-            self.center_lat + lat_offset,
-            self.center_lon + lon_offset,
-            self.altitude_m,
-        )
+        (lat, lon, self.altitude_m)
     }
 
     fn get_speed_mps(&self) -> f64 {
@@ -119,7 +112,8 @@ pub struct LinearPath {
     pub speed_mps: f64,
     pub distance_m: f64,
     pub duration: f64,
-    heading: f64,
+    heading_deg: f64,
+    heading_rad: f64,
 }
 
 impl LinearPath {
@@ -140,12 +134,10 @@ impl LinearPath {
         };
 
         // Calculate heading
-        let dlat = end_lat - start_lat;
-        let dlon = end_lon - start_lon;
-        let heading_rad = dlon.atan2(dlat);
-        let mut heading = heading_rad.to_degrees();
-        if heading < 0.0 {
-            heading += 360.0;
+        let heading_rad = bearing(start_lat, start_lon, end_lat, end_lon);
+        let mut heading_deg = heading_rad.to_degrees();
+        if heading_deg < 0.0 {
+            heading_deg += 360.0;
         }
 
         Self {
@@ -157,7 +149,8 @@ impl LinearPath {
             speed_mps,
             distance_m,
             duration,
-            heading,
+            heading_deg,
+            heading_rad,
         }
     }
 }
@@ -171,14 +164,14 @@ impl FlightPath for LinearPath {
             0.0
         };
 
-        let lat = self.start_lat + progress * (self.end_lat - self.start_lat);
-        let lon = self.start_lon + progress * (self.end_lon - self.start_lon);
+        let distance = self.distance_m * progress;
+        let (lat, lon) = offset_by_bearing(self.start_lat, self.start_lon, distance, self.heading_rad);
 
         (lat, lon, self.altitude_m)
     }
 
     fn get_heading(&self, _t: f64) -> f64 {
-        self.heading
+        self.heading_deg
     }
 
     fn get_speed_mps(&self) -> f64 {

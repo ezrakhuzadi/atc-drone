@@ -21,6 +21,8 @@ use atc_blender::BlenderClient;
 use atc_core::models::{Geofence, GeofenceType};
 
 use crate::config::Config;
+use crate::blender_auth::BlenderAuthManager;
+use crate::persistence::{Database, geofence_sync as geofence_sync_db};
 use crate::state::AppState;
 
 const GEOFENCE_SYNC_SECS: u64 = 15;
@@ -41,7 +43,8 @@ pub async fn run_geofence_sync_loop(
     config: Config,
     mut shutdown: broadcast::Receiver<()>,
 ) {
-    let blender = BlenderClient::new(
+    let auth = BlenderAuthManager::new(&config);
+    let mut blender = BlenderClient::new(
         &config.blender_url,
         &config.blender_session_id,
         &config.blender_auth_token,
@@ -49,12 +52,28 @@ pub async fn run_geofence_sync_loop(
 
     let mut ticker = interval(Duration::from_secs(GEOFENCE_SYNC_SECS));
     let state_path = PathBuf::from(config.geofence_sync_state_path.clone());
-    let mut tracked = match load_tracking_state(&state_path).await {
-        Ok(existing) => existing,
-        Err(err) => {
-            tracing::warn!("Geofence sync state load failed: {}", err);
-            HashMap::new()
-        }
+    let db = state.database().cloned();
+    let mut tracked = match db.as_ref() {
+        Some(db) => match load_tracking_state_db(db).await {
+            Ok(existing) => existing,
+            Err(err) => {
+                tracing::warn!("Geofence sync DB state load failed: {}", err);
+                match load_tracking_state(&state_path).await {
+                    Ok(existing) => existing,
+                    Err(err) => {
+                        tracing::warn!("Geofence sync state file load failed: {}", err);
+                        HashMap::new()
+                    }
+                }
+            }
+        },
+        None => match load_tracking_state(&state_path).await {
+            Ok(existing) => existing,
+            Err(err) => {
+                tracing::warn!("Geofence sync state file load failed: {}", err);
+                HashMap::new()
+            }
+        },
     };
 
     loop {
@@ -64,6 +83,10 @@ pub async fn run_geofence_sync_loop(
                 break;
             }
             _ = ticker.tick() => {
+                if let Err(err) = auth.apply(&mut blender).await {
+                    tracing::warn!("Geofence sync Blender auth refresh failed: {}", err);
+                    continue;
+                }
                 if config.pull_blender_geofences {
                     if let Err(err) = sync_external_geofences(&blender, state.as_ref(), &tracked, &config).await {
                         tracing::warn!("Failed to pull Blender geofences: {}", err);
@@ -142,7 +165,12 @@ pub async fn run_geofence_sync_loop(
                 }
 
                 if dirty {
-                    if let Err(err) = persist_tracking_state(&state_path, &tracked).await {
+                    let persisted = if let Some(db) = db.as_ref() {
+                        persist_tracking_state_db(db, &tracked).await
+                    } else {
+                        persist_tracking_state(&state_path, &tracked).await
+                    };
+                    if let Err(err) = persisted {
                         tracing::warn!("Failed to persist geofence sync state: {}", err);
                     }
                 }
@@ -434,9 +462,11 @@ fn fingerprint_geofence(geofence: &Geofence) -> u64 {
     hasher.finish()
 }
 
+type SyncResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
 async fn load_tracking_state(
     path: &Path,
-) -> Result<HashMap<String, BlenderGeofenceState>, Box<dyn std::error::Error + Send + Sync>> {
+) -> SyncResult<HashMap<String, BlenderGeofenceState>> {
     if !path.exists() {
         return Ok(HashMap::new());
     }
@@ -448,7 +478,7 @@ async fn load_tracking_state(
 async fn persist_tracking_state(
     path: &Path,
     tracked: &HashMap<String, BlenderGeofenceState>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> SyncResult<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).await?;
@@ -456,5 +486,38 @@ async fn persist_tracking_state(
     }
     let payload = serde_json::to_vec_pretty(tracked)?;
     fs::write(path, payload).await?;
+    Ok(())
+}
+
+async fn load_tracking_state_db(db: &Database) -> SyncResult<HashMap<String, BlenderGeofenceState>> {
+    let rows = geofence_sync_db::load_geofence_sync_state(db.pool()).await?;
+    let mut tracked = HashMap::new();
+    for row in rows {
+        tracked.insert(
+            row.local_id,
+            BlenderGeofenceState {
+                blender_id: row.blender_id,
+                fingerprint: row.fingerprint,
+                expires_at: row.expires_at,
+            },
+        );
+    }
+    Ok(tracked)
+}
+
+async fn persist_tracking_state_db(
+    db: &Database,
+    tracked: &HashMap<String, BlenderGeofenceState>,
+) -> SyncResult<()> {
+    let entries: Vec<geofence_sync_db::GeofenceSyncState> = tracked
+        .iter()
+        .map(|(local_id, state)| geofence_sync_db::GeofenceSyncState {
+            local_id: local_id.clone(),
+            blender_id: state.blender_id.clone(),
+            fingerprint: state.fingerprint,
+            expires_at: state.expires_at,
+        })
+        .collect();
+    geofence_sync_db::replace_geofence_sync_state(db.pool(), &entries).await?;
     Ok(())
 }

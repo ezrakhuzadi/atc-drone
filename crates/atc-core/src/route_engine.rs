@@ -3,9 +3,10 @@
 //! This module keeps routing logic server-side so ATC is the source of truth.
 
 use crate::models::{Geofence, GeofenceType, Waypoint};
-use crate::spatial::{bearing, haversine_distance, offset_by_bearing};
+use crate::spatial::{bearing, haversine_distance, meters_per_deg_lat, meters_per_deg_lon, offset_by_bearing};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteEngineConfig {
@@ -14,6 +15,7 @@ pub struct RouteEngineConfig {
     pub climb_speed_mps: f64,
     pub cruise_speed_mps: f64,
     pub descent_speed_mps: f64,
+    pub wind_mps: f64,
     pub cost_time_weight: f64,
     pub cost_climb_penalty: f64,
     pub cost_lane_change: f64,
@@ -29,6 +31,7 @@ impl Default for RouteEngineConfig {
             climb_speed_mps: 2.0,
             cruise_speed_mps: 15.0,
             descent_speed_mps: 3.0,
+            wind_mps: 0.0,
             cost_time_weight: 1.0,
             cost_climb_penalty: 15.0,
             cost_lane_change: 50.0,
@@ -102,6 +105,76 @@ struct NodeKey {
     lane: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FloatOrd(f64);
+
+impl PartialEq for FloatOrd {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for FloatOrd {}
+
+impl PartialOrd for FloatOrd {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for FloatOrd {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OpenNode {
+    step: usize,
+    lane: usize,
+    g_score: FloatOrd,
+    f_score: FloatOrd,
+    alt: f64,
+}
+
+impl OpenNode {
+    fn key(&self) -> NodeKey {
+        NodeKey {
+            step: self.step,
+            lane: self.lane,
+        }
+    }
+}
+
+impl PartialEq for OpenNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.step == other.step
+            && self.lane == other.lane
+            && self.g_score == other.g_score
+            && self.f_score == other.f_score
+            && self.alt.to_bits() == other.alt.to_bits()
+    }
+}
+
+impl Eq for OpenNode {}
+
+impl PartialOrd for OpenNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OpenNode {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.f_score
+            .cmp(&other.f_score)
+            .then_with(|| self.g_score.cmp(&other.g_score))
+            .then_with(|| self.step.cmp(&other.step))
+            .then_with(|| self.lane.cmp(&other.lane))
+            .then_with(|| self.alt.total_cmp(&other.alt))
+    }
+}
+
 struct PathResult {
     smoothed_path: Vec<Node>,
     nodes_visited: usize,
@@ -159,6 +232,7 @@ pub fn generate_grid_samples(
     waypoints: &[Waypoint],
     spacing_m: f64,
     lane_offsets: &[f64],
+    sample_phase: f64,
 ) -> Option<RouteGrid> {
     if waypoints.len() < 2 {
         return None;
@@ -166,6 +240,8 @@ pub fn generate_grid_samples(
     let spacing = spacing_m.max(1.0);
     let mut lanes: Vec<Vec<RouteGridPoint>> = lane_offsets.iter().map(|_| Vec::new()).collect();
     let mut waypoint_indices = vec![0];
+
+    let phase = sample_phase.clamp(0.0, 0.999);
 
     for i in 0..waypoints.len() - 1 {
         let start = &waypoints[i];
@@ -178,7 +254,13 @@ pub fn generate_grid_samples(
             if step_idx == num_steps && i < waypoints.len() - 2 {
                 continue;
             }
-            let fraction = step_idx as f64 / num_steps as f64;
+            let fraction = if step_idx == 0 {
+                0.0
+            } else if step_idx == num_steps {
+                1.0
+            } else {
+                (step_idx as f64 + phase) / num_steps as f64
+            };
             let (center_lat, center_lon) =
                 offset_by_bearing(start.lat, start.lon, distance_m * fraction, heading);
             let altitude_m = start.altitude_m + fraction * (end.altitude_m - start.altitude_m);
@@ -226,21 +308,88 @@ pub fn apply_obstacles<F>(
 ) where
     F: Fn(f64, f64) -> f64,
 {
+    if obstacles.is_empty() {
+        for lane in &mut grid.lanes {
+            for point in lane {
+                let terrain = terrain_height(point.lat, point.lon).max(0.0);
+                point.terrain_height_m = terrain;
+                point.obstacle_height_m = terrain;
+            }
+        }
+        return;
+    }
+
+    #[derive(Clone, Copy)]
+    struct IndexedObstacle {
+        x_m: f64,
+        y_m: f64,
+        radius2_m: f64,
+        height_m: f64,
+    }
+
+    const CELL_SIZE_M: f64 = 100.0;
+    let inv_cell = 1.0 / CELL_SIZE_M;
+
+    let center_lane_idx = grid.lanes.len() / 2;
+    let mean_lat = grid
+        .lanes
+        .get(center_lane_idx)
+        .and_then(|lane| {
+            let first = lane.first()?;
+            let last = lane.last()?;
+            Some((first.lat + last.lat) / 2.0)
+        })
+        .unwrap_or(0.0);
+    let meters_lat = meters_per_deg_lat(mean_lat);
+    let meters_lon = meters_per_deg_lon(mean_lat).max(1.0);
+
+    let mut obstacle_index: HashMap<(i32, i32), Vec<IndexedObstacle>> = HashMap::new();
+    for obstacle in obstacles {
+        let radius = obstacle.radius_m.max(0.0);
+        if radius <= 0.0 {
+            continue;
+        }
+        let height_m = obstacle.height_m.unwrap_or(0.0).max(0.0);
+        let x_m = obstacle.lon * meters_lon;
+        let y_m = obstacle.lat * meters_lat;
+        let cell_x = (x_m * inv_cell).floor() as i32;
+        let cell_y = (y_m * inv_cell).floor() as i32;
+        let mut cell_radius = (radius * inv_cell).ceil() as i32;
+        cell_radius = cell_radius.clamp(0, 16);
+        let entry = IndexedObstacle {
+            x_m,
+            y_m,
+            radius2_m: radius * radius,
+            height_m,
+        };
+        for dx in -cell_radius..=cell_radius {
+            for dy in -cell_radius..=cell_radius {
+                obstacle_index.entry((cell_x + dx, cell_y + dy)).or_default().push(entry);
+            }
+        }
+    }
+
     for lane in &mut grid.lanes {
         for point in lane {
             let terrain = terrain_height(point.lat, point.lon).max(0.0);
             point.terrain_height_m = terrain;
             point.obstacle_height_m = terrain;
 
-            for obstacle in obstacles {
-                let distance = haversine_distance(point.lat, point.lon, obstacle.lat, obstacle.lon);
-                if distance > obstacle.radius_m {
-                    continue;
-                }
-                let height = obstacle.height_m.unwrap_or(0.0);
-                let obstacle_alt = terrain + height;
-                if obstacle_alt > point.obstacle_height_m {
-                    point.obstacle_height_m = obstacle_alt;
+            let x_m = point.lon * meters_lon;
+            let y_m = point.lat * meters_lat;
+            let cell_x = (x_m * inv_cell).floor() as i32;
+            let cell_y = (y_m * inv_cell).floor() as i32;
+            if let Some(obstacles) = obstacle_index.get(&(cell_x, cell_y)) {
+                for obstacle in obstacles {
+                    let dx = obstacle.x_m - x_m;
+                    let dy = obstacle.y_m - y_m;
+                    if dx * dx + dy * dy > obstacle.radius2_m {
+                        continue;
+                    }
+                    let obstacle_alt = terrain + obstacle.height_m;
+                    if obstacle_alt > point.obstacle_height_m {
+                        point.obstacle_height_m = obstacle_alt;
+                    }
                 }
             }
         }
@@ -476,7 +625,20 @@ fn compute_path_nodes(
         alt: start_alt,
     };
 
-    let mut open_set = vec![start_node.clone()];
+    let effective_speed = (config.cruise_speed_mps - config.wind_mps).max(1.0);
+    let end_point = &grid.lanes[center_lane_idx][num_steps - 1];
+    let start_h =
+        haversine_distance(start_point.lat, start_point.lon, end_point.lat, end_point.lon)
+            / effective_speed;
+
+    let mut open_set: BinaryHeap<Reverse<OpenNode>> = BinaryHeap::new();
+    open_set.push(Reverse(OpenNode {
+        step: start_node.step,
+        lane: start_node.lane,
+        g_score: FloatOrd(start_node.g_score),
+        f_score: FloatOrd(start_node.g_score + start_h),
+        alt: start_node.alt,
+    }));
     let mut closed_set: HashSet<NodeKey> = HashSet::new();
     let mut g_score: HashMap<NodeKey, f64> = HashMap::new();
     let mut came_from: HashMap<NodeKey, Node> = HashMap::new();
@@ -485,27 +647,37 @@ fn compute_path_nodes(
     let mut final_node: Option<Node> = None;
     let mut nodes_visited = 0usize;
 
-    while !open_set.is_empty() {
-        open_set.sort_by(|a, b| a.f_score.partial_cmp(&b.f_score).unwrap_or(std::cmp::Ordering::Equal));
-        let current = open_set.remove(0);
+    while let Some(Reverse(current)) = open_set.pop() {
+        let current_key = current.key();
+        if closed_set.contains(&current_key) {
+            continue;
+        }
+        let best_g = g_score.get(&current_key).copied().unwrap_or(f64::INFINITY);
+        if current.g_score.0 > best_g + 1e-9 {
+            continue;
+        }
+
         nodes_visited += 1;
 
         if current.step == num_steps - 1 && current.lane == center_lane_idx {
-            final_node = Some(current.clone());
+            final_node = Some(Node {
+                step: current.step,
+                lane: current.lane,
+                g_score: best_g,
+                f_score: current.f_score.0,
+                alt: current.alt,
+            });
             break;
         }
 
-        closed_set.insert(current.key());
+        closed_set.insert(current_key);
         let next_step = current.step + 1;
         if next_step >= num_steps {
             continue;
         }
 
-        let candidate_lanes = [
-            current.lane.wrapping_sub(1),
-            current.lane,
-            current.lane + 1,
-        ];
+        let curr_point = &grid.lanes[current.lane][current.step];
+        let candidate_lanes = [current.lane.wrapping_sub(1), current.lane, current.lane + 1];
 
         for next_lane in candidate_lanes.iter().copied() {
             if next_lane >= num_lanes {
@@ -527,9 +699,8 @@ fn compute_path_nodes(
                 continue;
             }
 
-            let curr_point = &grid.lanes[current.lane][current.step];
             let dist = haversine_distance(curr_point.lat, curr_point.lon, next_point.lat, next_point.lon);
-            let time_to_travel = dist / config.cruise_speed_mps.max(1.0);
+            let time_to_travel = dist / effective_speed;
 
             let target_alt = min_safe_alt;
             let current_alt = current.alt;
@@ -572,30 +743,32 @@ fn compute_path_nodes(
             }
 
             let step_cost = time_to_travel + alt_cost + lane_change_cost + proximity_cost;
-            let tentative_g = g_score.get(&current.key()).copied().unwrap_or(f64::INFINITY) + step_cost;
-
+            let tentative_g = best_g + step_cost;
             if tentative_g < g_score.get(&next_key).copied().unwrap_or(f64::INFINITY) {
-                came_from.insert(next_key, current.clone());
+                came_from.insert(
+                    next_key,
+                    Node {
+                        step: current.step,
+                        lane: current.lane,
+                        g_score: best_g,
+                        f_score: current.f_score.0,
+                        alt: current.alt,
+                    },
+                );
                 g_score.insert(next_key, tentative_g);
 
-                let end_point = &grid.lanes[center_lane_idx][num_steps - 1];
-                let dist_to_end = haversine_distance(next_point.lat, next_point.lon, end_point.lat, end_point.lon);
-                let h_score = dist_to_end / config.cruise_speed_mps.max(1.0);
+                let dist_to_end =
+                    haversine_distance(next_point.lat, next_point.lon, end_point.lat, end_point.lon);
+                let h_score = dist_to_end / effective_speed;
 
                 let new_alt = current.alt.max(target_alt);
-                if let Some(existing) = open_set.iter_mut().find(|node| node.step == next_step && node.lane == next_lane) {
-                    existing.g_score = tentative_g;
-                    existing.f_score = tentative_g + h_score;
-                    existing.alt = new_alt;
-                } else {
-                    open_set.push(Node {
-                        step: next_step,
-                        lane: next_lane,
-                        g_score: tentative_g,
-                        f_score: tentative_g + h_score,
-                        alt: new_alt,
-                    });
-                }
+                open_set.push(Reverse(OpenNode {
+                    step: next_step,
+                    lane: next_lane,
+                    g_score: FloatOrd(tentative_g),
+                    f_score: FloatOrd(tentative_g + h_score),
+                    alt: new_alt,
+                }));
             }
         }
     }

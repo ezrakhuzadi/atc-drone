@@ -72,7 +72,14 @@ pub async fn run_mission_loop(state: Arc<AppState>, mut shutdown: broadcast::Rec
                                 acknowledged: false,
                             };
 
-                            state.enqueue_command(cmd);
+                            if let Err(err) = state.enqueue_command(cmd).await {
+                                tracing::warn!(
+                                    "Failed to enqueue mission command for {}: {}",
+                                    plan.drone_id,
+                                    err
+                                );
+                                continue;
+                            }
                             state.mark_command_issued(&plan.drone_id);
                             plan.status = FlightStatus::Active;
                         }

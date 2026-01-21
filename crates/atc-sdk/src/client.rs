@@ -17,6 +17,7 @@ pub struct AtcClient {
     pub(crate) owner_id: Option<String>,
     pub(crate) session_token: Option<String>,
     pub(crate) registration_token: Option<String>,
+    pub(crate) admin_token: Option<String>,
     pub(crate) client: reqwest::Client,
 }
 
@@ -53,6 +54,7 @@ impl AtcClient {
             owner_id: None,
             session_token: None,
             registration_token: None,
+            admin_token: None,
             client: reqwest::Client::new(),
         }
     }
@@ -60,6 +62,11 @@ impl AtcClient {
     /// Set the shared registration token for /v1/drones/register.
     pub fn set_registration_token(&mut self, token: Option<String>) {
         self.registration_token = token;
+    }
+
+    /// Set the admin token for control-plane endpoints.
+    pub fn set_admin_token(&mut self, token: Option<String>) {
+        self.admin_token = token;
     }
 
     /// Register this drone with the ATC server.
@@ -148,15 +155,16 @@ impl AtcClient {
         if let Some(drone_id) = &self.drone_id {
             req.drone_id = drone_id.clone();
         }
+        if req.owner_id.is_none() {
+            req.owner_id = self.owner_id.clone();
+        }
 
-        let response: atc_core::models::FlightPlan = self
-            .client
-            .post(&url)
-            .json(&req)
-            .send()
-            .await?
-            .json()
-            .await?;
+        let mut builder = self.client.post(&url).json(&req);
+        if let Some(token) = self.admin_token.as_deref() {
+            builder = builder.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let response: atc_core::models::FlightPlan = builder.send().await?.json().await?;
 
         Ok(response)
     }

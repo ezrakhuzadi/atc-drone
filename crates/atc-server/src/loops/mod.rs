@@ -7,3 +7,4 @@ pub mod flight_declaration_sync_loop;
 pub mod geofence_sync_loop;
 pub mod mission_loop;
 pub mod rid_sync_loop;
+pub mod telemetry_persist_loop;

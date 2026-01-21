@@ -2,6 +2,7 @@
 
 use std::env;
 use atc_core::rules::{AltitudeBand, SafetyRules};
+use crate::altitude::AltitudeReference;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -11,6 +12,11 @@ pub struct Config {
     pub rid_view_bbox: String,
     pub geofence_sync_state_path: String,
     pub blender_auth_token: String,
+    pub allow_dummy_blender_auth: bool,
+    pub blender_oauth_token_url: Option<String>,
+    pub blender_oauth_client_id: Option<String>,
+    pub blender_oauth_client_secret: Option<String>,
+    pub blender_oauth_scope: Option<String>,
     /// Comma-separated list of allowed CORS origins
     pub allowed_origins: Vec<String>,
     /// Admin token for protected endpoints (generate random if not set)
@@ -29,6 +35,8 @@ pub struct Config {
     pub rate_limit_rps: u32,
     /// Max requests per second per IP for drone registration
     pub registration_rate_limit_rps: u32,
+    /// Trust X-Forwarded-For headers for rate limiting
+    pub trust_proxy: bool,
     /// Path to SQLite database file
     pub database_path: String,
     /// Max connections for database pool
@@ -54,6 +62,13 @@ pub struct Config {
     pub obstacle_cache_ttl_s: u64,
     pub route_planner_require_obstacles: bool,
     pub route_planner_allow_truncated_obstacles: bool,
+    pub route_planner_wind_mps: f64,
+    /// Minimum building height (meters) included in route-planner obstacle queries.
+    pub route_planner_building_min_height_m: f64,
+    /// Minimum building levels included in route-planner obstacle queries.
+    pub route_planner_building_min_levels: u32,
+    pub altitude_reference: AltitudeReference,
+    pub geoid_offset_m: f64,
     pub terrain_provider_url: String,
     pub terrain_sample_spacing_m: f64,
     pub terrain_max_points_per_request: usize,
@@ -70,6 +85,7 @@ pub struct Config {
     pub telemetry_max_speed_mps: f64,
     pub telemetry_max_future_s: i64,
     pub telemetry_max_age_s: i64,
+    pub command_ack_timeout_secs: i64,
     pub pull_blender_geofences: bool,
     pub allow_admin_reset: bool,
     pub require_blender_declaration: bool,
@@ -85,6 +101,14 @@ pub struct Config {
     pub rules_min_altitude_m: f64,
 }
 
+#[derive(Debug, Clone)]
+pub struct BlenderOAuthConfig {
+    pub token_url: String,
+    pub client_id: String,
+    pub client_secret: String,
+    pub scope: Option<String>,
+}
+
 
 impl Config {
     pub fn from_env() -> Self {
@@ -93,7 +117,7 @@ impl Config {
         // Generate admin token if not provided
         let admin_token = env::var("ATC_ADMIN_TOKEN").unwrap_or_else(|_| {
             let token = uuid::Uuid::new_v4().to_string();
-            tracing::warn!("No ATC_ADMIN_TOKEN set, generated: {}", token);
+            tracing::warn!("No ATC_ADMIN_TOKEN set; generated a random token for this run");
             token
         });
 
@@ -118,6 +142,23 @@ impl Config {
             geofence_sync_state_path: env::var("GEOFENCE_SYNC_STATE_PATH")
                 .unwrap_or_else(|_| "data/geofence_sync.json".to_string()),
             blender_auth_token: env::var("BLENDER_AUTH_TOKEN").unwrap_or_default(),
+            allow_dummy_blender_auth: is_dev,
+            blender_oauth_token_url: env::var("BLENDER_OAUTH_TOKEN_URL")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            blender_oauth_client_id: env::var("BLENDER_OAUTH_CLIENT_ID")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            blender_oauth_client_secret: env::var("BLENDER_OAUTH_CLIENT_SECRET")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            blender_oauth_scope: env::var("BLENDER_OAUTH_SCOPE")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
             allowed_origins: env::var("ATC_ALLOWED_ORIGINS")
                 .unwrap_or_else(|_| if is_dev {
                     "http://localhost:5000,http://localhost:3000,http://localhost:5050,http://127.0.0.1:5000,http://127.0.0.1:5050".to_string()
@@ -132,7 +173,7 @@ impl Config {
             ws_token: ws_token.clone(),
             require_ws_token: env::var("ATC_REQUIRE_WS_TOKEN")
                 .map(|v| v != "0" && v.to_lowercase() != "false")
-                .unwrap_or(!is_dev && ws_token.is_some()),
+                .unwrap_or(ws_token.is_some()),
             registration_token: env::var("ATC_REGISTRATION_TOKEN")
                 .ok()
                 .map(|v| v.trim().to_string())
@@ -151,6 +192,9 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(10),
+            trust_proxy: env::var("ATC_TRUST_PROXY")
+                .map(|v| v == "1" || v.to_lowercase() == "true")
+                .unwrap_or(false),
             database_path: env::var("ATC_DATABASE_PATH")
                 .unwrap_or_else(|_| "data/atc.db".to_string()),
             database_max_connections: env::var("ATC_DB_MAX_CONNECTIONS")
@@ -235,6 +279,39 @@ impl Config {
             route_planner_allow_truncated_obstacles: env::var("ATC_ROUTE_PLANNER_ALLOW_TRUNCATED_OBSTACLES")
                 .map(|v| v != "0" && v.to_lowercase() != "false")
                 .unwrap_or(is_dev),
+            route_planner_wind_mps: env::var("ATC_ROUTE_PLANNER_WIND_MPS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0),
+            route_planner_building_min_height_m: env::var("ATC_ROUTE_PLANNER_BUILDING_MIN_HEIGHT_M")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(45.0),
+            route_planner_building_min_levels: env::var("ATC_ROUTE_PLANNER_BUILDING_MIN_LEVELS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(15),
+            altitude_reference: match env::var("ATC_ALTITUDE_REFERENCE") {
+                Ok(value) => {
+                    if value.trim().eq_ignore_ascii_case("agl") {
+                        tracing::warn!("ATC_ALTITUDE_REFERENCE=agl is not supported; using AMSL");
+                        AltitudeReference::Amsl
+                    } else {
+                        AltitudeReference::parse(&value).unwrap_or_else(|| {
+                            tracing::warn!(
+                                "ATC_ALTITUDE_REFERENCE='{}' is invalid; using WGS84",
+                                value
+                            );
+                            AltitudeReference::Wgs84
+                        })
+                    }
+                }
+                Err(_) => AltitudeReference::Wgs84,
+            },
+            geoid_offset_m: env::var("ATC_GEOID_OFFSET_M")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0),
             terrain_provider_url: env::var("ATC_TERRAIN_PROVIDER_URL")
                 .unwrap_or_else(|_| "https://api.open-meteo.com/v1/elevation".to_string()),
             terrain_sample_spacing_m: env::var("ATC_TERRAIN_SAMPLE_SPACING_M")
@@ -296,6 +373,10 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(300),
+            command_ack_timeout_secs: env::var("ATC_COMMAND_ACK_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10),
             pull_blender_geofences: env::var("ATC_PULL_BLENDER_GEOFENCES")
                 .map(|v| v != "0" && v.to_lowercase() != "false")
                 .unwrap_or(true),
@@ -381,5 +462,20 @@ impl Config {
             ];
         }
         rules
+    }
+
+    pub fn blender_oauth_config(&self) -> Option<BlenderOAuthConfig> {
+        let token_url = self.blender_oauth_token_url.as_ref()?.trim();
+        let client_id = self.blender_oauth_client_id.as_ref()?.trim();
+        let client_secret = self.blender_oauth_client_secret.as_ref()?.trim();
+        if token_url.is_empty() || client_id.is_empty() || client_secret.is_empty() {
+            return None;
+        }
+        Some(BlenderOAuthConfig {
+            token_url: token_url.to_string(),
+            client_id: client_id.to_string(),
+            client_secret: client_secret.to_string(),
+            scope: self.blender_oauth_scope.clone(),
+        })
     }
 }

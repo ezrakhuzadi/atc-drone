@@ -1,12 +1,15 @@
 //! Terrain sampling utilities for server-side routing.
 
+use crate::cache;
 use crate::config::Config;
+use atc_core::spatial::{meters_per_deg_lat, meters_per_deg_lon};
 use crate::compliance::RoutePoint;
 use dashmap::DashMap;
 use reqwest::Client;
 use serde::Deserialize;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+use tokio::time::sleep;
 
 #[derive(Debug, Clone)]
 pub struct TerrainGrid {
@@ -27,10 +30,18 @@ struct TerrainCacheEntry {
     grid: TerrainGrid,
 }
 
+impl cache::CacheEntry for TerrainCacheEntry {
+    fn fetched_at(&self) -> Instant {
+        self.fetched_at
+    }
+}
+
 fn terrain_cache() -> &'static DashMap<String, TerrainCacheEntry> {
     static CACHE: OnceLock<DashMap<String, TerrainCacheEntry>> = OnceLock::new();
     CACHE.get_or_init(DashMap::new)
 }
+
+const TERRAIN_CACHE_MAX_ENTRIES: usize = 256;
 
 impl TerrainGrid {
     pub fn sample(&self, lat: f64, lon: f64) -> f64 {
@@ -67,17 +78,14 @@ impl TerrainGrid {
         let x0 = x.floor() as usize;
         let y1 = (y0 + 1).min(self.rows - 1);
         let x1 = (x0 + 1).min(self.cols - 1);
-        let dy = y - y0 as f64;
-        let dx = x - x0 as f64;
-
         let v00 = self.value_at(y0, x0);
         let v10 = self.value_at(y0, x1);
         let v01 = self.value_at(y1, x0);
         let v11 = self.value_at(y1, x1);
 
-        let v0 = v00 + (v10 - v00) * dx;
-        let v1 = v01 + (v11 - v01) * dx;
-        v0 + (v1 - v0) * dy
+        // Conservative sampling avoids undercutting peaks between grid points.
+        let max_corner = v00.max(v10).max(v01).max(v11);
+        max_corner
     }
 
     fn value_at(&self, row: usize, col: usize) -> f64 {
@@ -105,6 +113,7 @@ pub async fn fetch_terrain_grid(
     points: &[RoutePoint],
     grid_spacing_m: f64,
 ) -> Result<Option<TerrainGrid>, String> {
+    let started_at = Instant::now();
     if config.terrain_provider_url.trim().is_empty() {
         return Err("terrain provider URL is empty".to_string());
     }
@@ -113,10 +122,28 @@ pub async fn fetch_terrain_grid(
         Some(bounds) => expand_bounds(&bounds, 0.2),
         None => return Ok(None),
     };
-    let cache_key = terrain_cache_key(&bounds, grid_spacing_m);
     let cache_ttl = Duration::from_secs(config.terrain_cache_ttl_s.max(30));
     let cache = terrain_cache();
     let mut stale_cache: Option<TerrainGrid> = None;
+
+    if !config.terrain_provider_url.is_empty() && config.terrain_max_grid_points == 0 {
+        return Err("terrain_max_grid_points must be > 0".to_string());
+    }
+
+    let spacing_target_m = config.terrain_sample_spacing_m.max(5.0);
+    let mean_lat = (bounds.min_lat + bounds.max_lat) / 2.0;
+    let meters_per_deg_lat = meters_per_deg_lat(mean_lat);
+    let meters_per_deg_lon = meters_per_deg_lon(mean_lat).max(1.0);
+
+    let (rows, cols, lat_step_deg, lon_step_deg, spacing_m) = resolve_grid_dims(
+        &bounds,
+        spacing_target_m,
+        meters_per_deg_lat,
+        meters_per_deg_lon,
+        config.terrain_max_grid_points,
+    );
+
+    let cache_key = terrain_cache_key(&bounds, spacing_m);
     if let Some(entry) = cache.get(&cache_key) {
         let age = entry.fetched_at.elapsed();
         if age <= cache_ttl {
@@ -126,23 +153,6 @@ pub async fn fetch_terrain_grid(
             stale_cache = Some(entry.grid.clone());
         }
     }
-
-    if !config.terrain_provider_url.is_empty() && config.terrain_max_grid_points == 0 {
-        return Err("terrain_max_grid_points must be > 0".to_string());
-    }
-
-    let mut spacing_m = config.terrain_sample_spacing_m.max(5.0);
-    let max_grid_spacing = grid_spacing_m.max(2.0) * 2.0;
-    if spacing_m > max_grid_spacing {
-        spacing_m = max_grid_spacing;
-    }
-
-    let mean_lat = ((bounds.min_lat + bounds.max_lat) / 2.0).to_radians();
-    let meters_per_deg_lat = 111_320.0;
-    let meters_per_deg_lon = 111_320.0 * mean_lat.cos().max(0.01);
-
-    let (rows, cols, lat_step_deg, lon_step_deg) =
-        resolve_grid_dims(&bounds, spacing_m, meters_per_deg_lat, meters_per_deg_lon, config.terrain_max_grid_points);
 
     let total = rows.saturating_mul(cols);
     if total == 0 {
@@ -162,56 +172,107 @@ pub async fn fetch_terrain_grid(
 
     let max_points = config.terrain_max_points_per_request.max(1);
     let timeout = Duration::from_secs(config.terrain_request_timeout_s.max(3));
+    let min_interval = Duration::from_millis(config.terrain_request_min_interval_ms);
+    let max_attempts = config.terrain_request_retries.saturating_add(1);
+    let backoff_base_ms = config.terrain_request_backoff_ms.max(1);
+    let total_requests = (total + max_points - 1) / max_points;
+    if config.terrain_max_requests > 0 && total_requests > config.terrain_max_requests {
+        return Err(format!(
+            "terrain request count {} exceeds terrain_max_requests {}",
+            total_requests, config.terrain_max_requests
+        ));
+    }
+
+    tracing::info!(
+        provider = %config.terrain_provider_url,
+        grid_spacing_m = grid_spacing_m,
+        spacing_m = spacing_m,
+        rows = rows,
+        cols = cols,
+        points = total,
+        max_points_per_request = max_points,
+        requests = total_requests,
+        min_interval_ms = config.terrain_request_min_interval_ms,
+        "Terrain fetch start"
+    );
+
     let mut elevations = vec![0.0; total];
 
     let mut start = 0usize;
+    let mut last_request_at: Option<Instant> = None;
     while start < total {
+        let request_idx = start / max_points;
+        if total_requests >= 25 && request_idx > 0 && request_idx % 25 == 0 {
+            tracing::info!(
+                request = request_idx,
+                total_requests = total_requests,
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                "Terrain fetch progress"
+            );
+        }
         let end = (start + max_points).min(total);
         let lat_slice = &latitudes[start..end];
         let lon_slice = &longitudes[start..end];
         let lat_param = join_params(lat_slice);
         let lon_param = join_params(lon_slice);
 
-        let url = build_provider_url(&config.terrain_provider_url, &lat_param, &lon_param);
-    let response = client
-        .get(url)
-        .timeout(timeout)
-        .send()
-        .await
-        .map_err(|err| err.to_string());
-
-    let response = match response {
-        Ok(response) => response,
-        Err(err) => {
-            if let Some(stale) = stale_cache {
-                tracing::warn!("Terrain fetch failed, using stale cache: {}", err);
-                return Ok(Some(stale));
+        if let Some(last_request_at) = last_request_at {
+            let elapsed = last_request_at.elapsed();
+            if elapsed < min_interval {
+                sleep(min_interval - elapsed).await;
             }
-            return Err(err);
         }
-    };
 
-    if !response.status().is_success() {
-        if let Some(stale) = stale_cache {
-            tracing::warn!(
-                "Terrain provider HTTP {}, using stale cache",
-                response.status()
-            );
-            return Ok(Some(stale));
+        let url = build_provider_url(&config.terrain_provider_url, &lat_param, &lon_param);
+        let mut payload: Option<OpenMeteoElevationResponse> = None;
+        let mut last_err: Option<String> = None;
+
+        for attempt in 0..max_attempts {
+            let response = client
+                .get(&url)
+                .timeout(timeout)
+                .send()
+                .await;
+
+            match response {
+                Ok(response) => {
+                    if !response.status().is_success() {
+                        last_err = Some(format!("terrain provider HTTP {}", response.status()));
+                    } else {
+                        match response.json().await {
+                            Ok(parsed) => {
+                                payload = Some(parsed);
+                                break;
+                            }
+                            Err(err) => {
+                                last_err = Some(err.to_string());
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    last_err = Some(err.to_string());
+                }
+            }
+
+            if attempt + 1 < max_attempts {
+                let delay_ms = backoff_base_ms.saturating_mul(attempt.saturating_add(1) as u64);
+                sleep(Duration::from_millis(delay_ms)).await;
+            }
         }
-        return Err(format!("terrain provider HTTP {}", response.status()));
-    }
 
-        let payload: OpenMeteoElevationResponse = match response.json().await {
-            Ok(payload) => payload,
-            Err(err) => {
+        let payload = match payload {
+            Some(payload) => payload,
+            None => {
+                let err = last_err.unwrap_or_else(|| "terrain request failed".to_string());
                 if let Some(stale) = stale_cache {
-                    tracing::warn!("Terrain parse failed, using stale cache: {}", err);
+                    tracing::warn!("Terrain fetch failed, using stale cache: {}", err);
                     return Ok(Some(stale));
                 }
-                return Err(err.to_string());
+                return Err(err);
             }
         };
+
         let chunk = payload
             .elevation
             .ok_or_else(|| "terrain provider missing elevation".to_string())?;
@@ -224,6 +285,7 @@ pub async fn fetch_terrain_grid(
             elevations[start + idx] = if value.is_finite() { value } else { 0.0 };
         }
 
+        last_request_at = Some(Instant::now());
         start = end;
     }
 
@@ -245,6 +307,16 @@ pub async fn fetch_terrain_grid(
             fetched_at: Instant::now(),
             grid: grid.clone(),
         },
+    );
+    cache::prune_cache(cache, TERRAIN_CACHE_MAX_ENTRIES, cache_ttl.saturating_mul(2));
+
+    tracing::info!(
+        rows = rows,
+        cols = cols,
+        points = total,
+        requests = total_requests,
+        elapsed_ms = started_at.elapsed().as_millis() as u64,
+        "Terrain fetch complete"
     );
 
     Ok(Some(grid))
@@ -294,24 +366,25 @@ fn resolve_grid_dims(
     meters_per_deg_lat: f64,
     meters_per_deg_lon: f64,
     max_points: usize,
-) -> (usize, usize, f64, f64) {
+) -> (usize, usize, f64, f64, f64) {
     let mut spacing = spacing_m.max(5.0);
     let max_points = max_points.max(1000);
 
     loop {
+        let spacing_used = spacing;
         let lat_step_deg = spacing / meters_per_deg_lat;
         let lon_step_deg = spacing / meters_per_deg_lon;
         let rows = ((bounds.max_lat - bounds.min_lat) / lat_step_deg).ceil().max(1.0) as usize + 1;
         let cols = ((bounds.max_lon - bounds.min_lon) / lon_step_deg).ceil().max(1.0) as usize + 1;
         let total = rows.saturating_mul(cols);
         if total <= max_points {
-            return (rows, cols, lat_step_deg, lon_step_deg);
+            return (rows, cols, lat_step_deg, lon_step_deg, spacing_used);
         }
 
         let scale = ((total as f64) / (max_points as f64)).sqrt().max(1.1);
         spacing *= scale;
         if spacing > 2000.0 {
-            return (rows, cols, lat_step_deg, lon_step_deg);
+            return (rows, cols, lat_step_deg, lon_step_deg, spacing_used);
         }
     }
 }

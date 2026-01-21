@@ -1,6 +1,7 @@
 //! Pre-defined drone flight scenarios for testing.
 
 use super::paths::LinearPath;
+use atc_core::spatial::offset_by_bearing;
 use std::sync::Arc;
 
 use super::FlightPath;
@@ -16,24 +17,34 @@ pub struct Scenario {
 /// - Drone 1: Flying West to East through center
 /// - Drone 2: Flying South to North through center
 pub fn create_crossing_scenario(center_lat: f64, center_lon: f64) -> Scenario {
-    let offset = 0.003; // ~300m offset in degrees
+    let offset_m = 300.0;
 
     // Drone 1: West to East
+    let (start_lat_1, start_lon_1) =
+        offset_by_bearing(center_lat, center_lon, offset_m, 270.0_f64.to_radians());
+    let (end_lat_1, end_lon_1) =
+        offset_by_bearing(center_lat, center_lon, offset_m, 90.0_f64.to_radians());
+
     let drone1_path = Arc::new(LinearPath::new(
-        center_lat,
-        center_lon - offset,
-        center_lat,
-        center_lon + offset,
+        start_lat_1,
+        start_lon_1,
+        end_lat_1,
+        end_lon_1,
         50.0,  // altitude
         10.0,  // speed
     ));
 
     // Drone 2: South to North
+    let (start_lat_2, start_lon_2) =
+        offset_by_bearing(center_lat, center_lon, offset_m, 180.0_f64.to_radians());
+    let (end_lat_2, end_lon_2) =
+        offset_by_bearing(center_lat, center_lon, offset_m, 0.0_f64.to_radians());
+
     let drone2_path = Arc::new(LinearPath::new(
-        center_lat - offset,
-        center_lon,
-        center_lat + offset,
-        center_lon,
+        start_lat_2,
+        start_lon_2,
+        end_lat_2,
+        end_lon_2,
         50.0,
         10.0,
     ));
@@ -49,23 +60,35 @@ pub fn create_crossing_scenario(center_lat: f64, center_lon: f64) -> Scenario {
 
 /// Create two drones flying parallel paths (no conflict).
 pub fn create_parallel_scenario(center_lat: f64, center_lon: f64) -> Scenario {
-    let offset = 0.003;
-    let separation = 0.001; // ~100m separation
+    let offset_m = 300.0;
+    let separation_m = 100.0;
+
+    let (start_lat_1, start_lon_1) =
+        offset_by_bearing(center_lat, center_lon, offset_m, 270.0_f64.to_radians());
+    let (end_lat_1, end_lon_1) =
+        offset_by_bearing(center_lat, center_lon, offset_m, 90.0_f64.to_radians());
 
     let drone1_path = Arc::new(LinearPath::new(
-        center_lat,
-        center_lon - offset,
-        center_lat,
-        center_lon + offset,
+        start_lat_1,
+        start_lon_1,
+        end_lat_1,
+        end_lon_1,
         50.0,
         10.0,
     ));
 
+    let (sep_lat, sep_lon) =
+        offset_by_bearing(center_lat, center_lon, separation_m, 0.0_f64.to_radians());
+    let (start_lat_2, start_lon_2) =
+        offset_by_bearing(sep_lat, sep_lon, offset_m, 270.0_f64.to_radians());
+    let (end_lat_2, end_lon_2) =
+        offset_by_bearing(sep_lat, sep_lon, offset_m, 90.0_f64.to_radians());
+
     let drone2_path = Arc::new(LinearPath::new(
-        center_lat + separation,
-        center_lon - offset,
-        center_lat + separation,
-        center_lon + offset,
+        start_lat_2,
+        start_lon_2,
+        end_lat_2,
+        end_lon_2,
         50.0,
         10.0,
     ));
@@ -81,7 +104,7 @@ pub fn create_parallel_scenario(center_lat: f64, center_lon: f64) -> Scenario {
 
 /// Create multiple drones converging on a central point.
 pub fn create_converging_scenario(center_lat: f64, center_lon: f64) -> Scenario {
-    let offset = 0.003;
+    let offset_m = 300.0;
     let angles: [f64; 4] = [0.0, 90.0, 180.0, 270.0]; // 4 drones from cardinal directions
 
     let drones: Vec<_> = angles
@@ -89,8 +112,8 @@ pub fn create_converging_scenario(center_lat: f64, center_lon: f64) -> Scenario 
         .enumerate()
         .map(|(i, &angle)| {
             let angle_rad = angle.to_radians();
-            let start_lat = center_lat + offset * angle_rad.cos();
-            let start_lon = center_lon + offset * angle_rad.sin();
+            let (start_lat, start_lon) =
+                offset_by_bearing(center_lat, center_lon, offset_m, angle_rad);
 
             let path = Arc::new(LinearPath::new(
                 start_lat,

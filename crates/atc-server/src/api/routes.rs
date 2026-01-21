@@ -1,14 +1,14 @@
 //! REST API routes.
 
 use axum::{
-    extract::{State, Query},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     middleware,
     response::IntoResponse,
     routing::{get, post, delete, put},
     Json, Router,
 };
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
@@ -16,19 +16,26 @@ use std::sync::Arc;
 
 use crate::api::{commands, flights, geofences, daa, ws};
 use crate::api::auth::{self, AdminToken, RateLimiter};
+use crate::altitude::altitude_to_amsl;
 use crate::compliance::{self, ComplianceReport, RoutePoint};
 use crate::config::Config;
 use crate::route_planner::{plan_route, RoutePlanRequest, RoutePlanResponse};
 use crate::state::{AppState, ExternalTraffic};
+use crate::state::store::RegisterDroneOutcome;
 use atc_core::models::{Telemetry, ConformanceStatus, DroneStatus, FlightPlanRequest, FlightPlanMetadata, TrajectoryPoint, Waypoint, GeofenceType};
 
 /// Create the API router.
 pub fn create_router(config: &Config) -> Router<Arc<AppState>> {
     // Create rate limiter for telemetry
-    let rate_limiter = RateLimiter::new(config.rate_limit_rps, config.rate_limit_enabled);
+    let rate_limiter = RateLimiter::new(
+        config.rate_limit_rps,
+        config.rate_limit_enabled,
+        config.trust_proxy,
+    );
     let registration_limiter = RateLimiter::new(
         config.registration_rate_limit_rps,
         config.rate_limit_enabled,
+        config.trust_proxy,
     );
     
     // Create admin token extractor
@@ -37,6 +44,7 @@ pub fn create_router(config: &Config) -> Router<Arc<AppState>> {
     // Public routes (no auth required)
     let public_routes = Router::new()
         .route("/v1/drones", get(list_drones))
+        .route("/v1/drones/:drone_id", get(get_drone))
         .route("/v1/traffic", get(list_traffic))
         .route("/v1/conflicts", get(list_conflicts))
         .route("/v1/conformance", get(list_conformance))
@@ -45,11 +53,8 @@ pub fn create_router(config: &Config) -> Router<Arc<AppState>> {
         .route("/v1/compliance/evaluate", post(evaluate_compliance))
         .route("/v1/rid/view", post(update_rid_view))
         .route("/v1/routes/plan", post(plan_route_handler))
-        .route("/v1/flights/plan", post(flights::create_flight_plan))
-        .route("/v1/flights", get(flights::get_flight_plans).post(flights::create_flight_plan_compat))
-        // Command dispatch routes
-        .route("/v1/commands", post(commands::issue_command))
-        .route("/v1/commands", get(commands::get_all_commands))
+        .route("/v1/flights", get(flights::get_flight_plans))
+        // Command polling routes
         .route("/v1/commands/next", get(commands::get_next_command))
         .route("/v1/commands/ack", post(commands::ack_command))
         .route("/v1/commands/ws", get(commands::command_stream_ws))
@@ -67,6 +72,16 @@ pub fn create_router(config: &Config) -> Router<Arc<AppState>> {
     let registration_routes = Router::new()
         .route("/v1/drones/register", post(register_drone))
         .layer(middleware::from_fn_with_state(registration_limiter, auth::rate_limit));
+
+    let admin_command_routes = Router::new()
+        .route("/v1/commands", post(commands::issue_command))
+        .route("/v1/commands", get(commands::get_all_commands))
+        .layer(middleware::from_fn_with_state(admin_token.clone(), auth::require_admin));
+
+    let admin_flight_routes = Router::new()
+        .route("/v1/flights/plan", post(flights::create_flight_plan))
+        .route("/v1/flights", post(flights::create_flight_plan_compat))
+        .layer(middleware::from_fn_with_state(admin_token.clone(), auth::require_admin));
     
     // Rate-limited telemetry route
     let telemetry_route = Router::new()
@@ -81,6 +96,8 @@ pub fn create_router(config: &Config) -> Router<Arc<AppState>> {
     public_routes
         .merge(registration_routes)
         .merge(telemetry_route)
+        .merge(admin_command_routes)
+        .merge(admin_flight_routes)
         .merge(admin_routes)
 }
 
@@ -224,13 +241,74 @@ async fn register_drone(
         format!("DRONE{:04}", state.next_drone_id())
     });
 
-    state.register_drone(&drone_id, req.owner_id.clone());
+    if let Some(existing) = state.get_drone(&drone_id) {
+        if let Some(expected_owner) = existing.owner_id.as_deref() {
+            match req.owner_id.as_deref() {
+                Some(owner_id) if owner_id == expected_owner => {}
+                Some(_) => {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "error": "Drone ID already claimed",
+                            "hint": "Use a different drone_id or match the existing owner_id",
+                            "drone_id": drone_id
+                        })),
+                    );
+                }
+                None => {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "error": "Drone ID already claimed",
+                            "hint": "Provide owner_id to reclaim this drone_id",
+                            "drone_id": drone_id
+                        })),
+                    );
+                }
+            }
+        }
 
-    // Generate real session token
+        if state.drone_token(&drone_id).is_some() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "Drone already registered",
+                    "hint": "Use existing session token or register with a new drone_id",
+                    "drone_id": drone_id
+                })),
+            );
+        }
+    }
+
     let session_token = uuid::Uuid::new_v4().to_string();
-    state.set_drone_token(&drone_id, session_token.clone());
-    
-    tracing::info!("Registered drone {} with token {}", drone_id, &session_token[..8]);
+    match state
+        .register_drone_with_token(&drone_id, req.owner_id.clone(), session_token.clone())
+        .await
+    {
+        Ok(RegisterDroneOutcome::Registered) => {}
+        Ok(RegisterDroneOutcome::AlreadyRegistered) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "Drone already registered",
+                    "hint": "Use existing session token or register with a new drone_id",
+                    "drone_id": drone_id
+                })),
+            );
+        }
+        Err(err) => {
+            tracing::error!("Failed to persist drone registration {}: {}", drone_id, err);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "Failed to register drone",
+                    "drone_id": drone_id
+                })),
+            );
+        }
+    }
+
+    tracing::info!("Registered drone {}", drone_id);
     
     (
         StatusCode::CREATED,
@@ -249,7 +327,10 @@ async fn receive_telemetry(
     if let Err(status) = auth::authorize_drone_for(state.as_ref(), &telemetry.drone_id, &headers) {
         return (status, Json(serde_json::json!({"error": "Authorization failed"})));
     }
-    if let Err(response) = validate_telemetry(&telemetry, state.config()) {
+    let mut telemetry = telemetry;
+    let now = Utc::now();
+    normalize_telemetry_timestamp(&mut telemetry, state.config(), now);
+    if let Err(response) = validate_telemetry(&telemetry, state.config(), now) {
         return response;
     }
     state.update_telemetry(telemetry);
@@ -272,6 +353,15 @@ async fn list_drones(
     };
     
     Json(filtered)
+}
+
+async fn get_drone(
+    State(state): State<Arc<AppState>>,
+    Path(drone_id): Path<String>,
+) -> Result<Json<atc_core::models::DroneState>, StatusCode> {
+    state.get_drone(&drone_id)
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn list_traffic(
@@ -351,6 +441,7 @@ fn bad_request(message: &str, field: Option<&str>) -> (StatusCode, Json<serde_js
 fn validate_telemetry(
     telemetry: &Telemetry,
     config: &Config,
+    now: DateTime<Utc>,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     let lat = telemetry.lat;
     let lon = telemetry.lon;
@@ -368,10 +459,15 @@ fn validate_telemetry(
     }
 
     let altitude = telemetry.altitude_m;
-    if !altitude.is_finite() {
+    let altitude_amsl = altitude_to_amsl(
+        altitude,
+        config.altitude_reference,
+        config.geoid_offset_m,
+    );
+    if !altitude_amsl.is_finite() {
         return Err(bad_request("Altitude must be a finite number", Some("altitude_m")));
     }
-    if altitude < config.telemetry_min_alt_m || altitude > config.telemetry_max_alt_m {
+    if altitude_amsl < config.telemetry_min_alt_m || altitude_amsl > config.telemetry_max_alt_m {
         return Err(bad_request("Altitude out of allowed range", Some("altitude_m")));
     }
 
@@ -391,7 +487,6 @@ fn validate_telemetry(
         return Err(bad_request("Heading out of range", Some("heading_deg")));
     }
 
-    let now = Utc::now();
     let max_future = Duration::seconds(config.telemetry_max_future_s);
     let max_age = Duration::seconds(config.telemetry_max_age_s);
     if telemetry.timestamp > now + max_future {
@@ -402,6 +497,19 @@ fn validate_telemetry(
     }
 
     Ok(())
+}
+
+fn normalize_telemetry_timestamp(telemetry: &mut Telemetry, config: &Config, now: DateTime<Utc>) {
+    let max_future = Duration::seconds(config.telemetry_max_future_s);
+    let max_age = Duration::seconds(config.telemetry_max_age_s);
+    if telemetry.timestamp > now + max_future || telemetry.timestamp < now - max_age {
+        tracing::warn!(
+            "Telemetry timestamp out of bounds for {} ({}); normalizing to server time",
+            telemetry.drone_id,
+            telemetry.timestamp
+        );
+        telemetry.timestamp = now;
+    }
 }
 
 fn external_to_traffic(external: ExternalTraffic) -> TrafficState {
@@ -491,7 +599,7 @@ async fn evaluate_compliance(
         departure_time: req.departure_time,
     };
 
-    let points = extract_route_points(&request);
+    let points = extract_route_points(&request, state.config());
     let mut violations: Vec<serde_json::Value> = Vec::new();
 
     if points.is_empty() {
@@ -625,7 +733,7 @@ async fn evaluate_compliance(
     })
 }
 
-fn extract_route_points(request: &FlightPlanRequest) -> Vec<RoutePoint> {
+fn extract_route_points(request: &FlightPlanRequest, config: &Config) -> Vec<RoutePoint> {
     if let Some(log) = request.trajectory_log.as_ref() {
         if log.len() >= 2 {
             return log
@@ -633,7 +741,11 @@ fn extract_route_points(request: &FlightPlanRequest) -> Vec<RoutePoint> {
                 .map(|point| RoutePoint {
                     lat: point.lat,
                     lon: point.lon,
-                    altitude_m: point.altitude_m,
+                    altitude_m: altitude_to_amsl(
+                        point.altitude_m,
+                        config.altitude_reference,
+                        config.geoid_offset_m,
+                    ),
                 })
                 .collect();
         }
@@ -648,7 +760,11 @@ fn extract_route_points(request: &FlightPlanRequest) -> Vec<RoutePoint> {
                 .map(|point| RoutePoint {
                     lat: point.lat,
                     lon: point.lon,
-                    altitude_m: point.altitude_m,
+                    altitude_m: altitude_to_amsl(
+                        point.altitude_m,
+                        config.altitude_reference,
+                        config.geoid_offset_m,
+                    ),
                 })
                 .collect::<Vec<_>>()
         })
@@ -659,12 +775,20 @@ fn extract_route_points(request: &FlightPlanRequest) -> Vec<RoutePoint> {
             points.push(RoutePoint {
                 lat: origin.lat,
                 lon: origin.lon,
-                altitude_m: origin.altitude_m,
+                altitude_m: altitude_to_amsl(
+                    origin.altitude_m,
+                    config.altitude_reference,
+                    config.geoid_offset_m,
+                ),
             });
             points.push(RoutePoint {
                 lat: destination.lat,
                 lon: destination.lon,
-                altitude_m: destination.altitude_m,
+                altitude_m: altitude_to_amsl(
+                    destination.altitude_m,
+                    config.altitude_reference,
+                    config.geoid_offset_m,
+                ),
             });
         }
     }
@@ -765,7 +889,15 @@ async fn admin_reset(
         );
     }
 
-    state.clear_all();
+    if let Err(err) = state.clear_all().await {
+        tracing::error!("Failed to reset state: {}", err);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "Failed to reset state"
+            })),
+        );
+    }
     (
         StatusCode::OK,
         Json(serde_json::json!({

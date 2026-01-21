@@ -62,6 +62,23 @@ CREATE TABLE IF NOT EXISTS commands (
     FOREIGN KEY (drone_id) REFERENCES drones(drone_id)
 );
 
+-- Drone session tokens table: persists registration tokens across restarts
+CREATE TABLE IF NOT EXISTS drone_tokens (
+    drone_id TEXT PRIMARY KEY,
+    session_token TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (drone_id) REFERENCES drones(drone_id)
+);
+
+-- Geofence sync table: track Blender IDs for ATC-managed geofences
+CREATE TABLE IF NOT EXISTS geofence_sync_state (
+    local_id TEXT PRIMARY KEY,
+    blender_id TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Indexes for common queries
 CREATE INDEX IF NOT EXISTS idx_drones_owner ON drones(owner_id);
 CREATE INDEX IF NOT EXISTS idx_drones_status ON drones(status);
@@ -69,3 +86,5 @@ CREATE INDEX IF NOT EXISTS idx_flight_plans_drone ON flight_plans(drone_id);
 CREATE INDEX IF NOT EXISTS idx_flight_plans_owner ON flight_plans(owner_id);
 CREATE INDEX IF NOT EXISTS idx_commands_drone ON commands(drone_id);
 CREATE INDEX IF NOT EXISTS idx_commands_expires ON commands(expires_at);
+CREATE INDEX IF NOT EXISTS idx_drone_tokens_updated ON drone_tokens(updated_at);
+CREATE INDEX IF NOT EXISTS idx_geofence_sync_expires ON geofence_sync_state(expires_at);

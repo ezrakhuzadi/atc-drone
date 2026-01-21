@@ -14,16 +14,42 @@ use tokio::sync::broadcast;
 use tokio::time::interval;
 
 use crate::config::Config;
+use crate::blender_auth::BlenderAuthManager;
 use crate::state::AppState;
 
 const LOOP_INTERVAL_SECS: u64 = 30;
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct AtcPlanEmbed {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    drone_id: Option<String>,
+    #[serde(default)]
+    waypoints: Vec<AtcWaypointEmbed>,
+    #[serde(default)]
+    trajectory_log: Vec<atc_core::models::TrajectoryPoint>,
+    #[serde(default)]
+    metadata: Option<FlightPlanMetadata>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct AtcWaypointEmbed {
+    lat: f64,
+    lon: f64,
+    #[serde(alias = "altitude_m", alias = "alt")]
+    alt: f64,
+    #[serde(default)]
+    speed_mps: Option<f64>,
+}
 
 pub async fn run_flight_declaration_sync_loop(
     state: Arc<AppState>,
     config: Config,
     mut shutdown: broadcast::Receiver<()>,
 ) {
-    let blender = BlenderClient::new(
+    let auth = BlenderAuthManager::new(&config);
+    let mut blender = BlenderClient::new(
         &config.blender_url,
         &config.blender_session_id,
         &config.blender_auth_token,
@@ -38,6 +64,10 @@ pub async fn run_flight_declaration_sync_loop(
                 break;
             }
             _ = ticker.tick() => {
+                if let Err(err) = auth.apply(&mut blender).await {
+                    tracing::warn!("Flight declaration sync Blender auth refresh failed: {}", err);
+                    continue;
+                }
                 if let Err(err) = sync_flight_declarations(state.as_ref(), &blender).await {
                     tracing::warn!("Flight declaration sync failed: {}", err);
                 }
@@ -85,7 +115,7 @@ async fn sync_flight_declarations(state: &AppState, blender: &BlenderClient) -> 
 
         known_declarations.insert(declaration_id);
         known_flight_ids.insert(plan.flight_id.clone());
-        state.add_flight_plan(plan);
+        state.add_flight_plan(plan).await?;
     }
 
     Ok(())
@@ -109,7 +139,12 @@ fn declaration_to_plan(declaration: &Value, declaration_id: &str) -> Option<Flig
     let properties = feature.get("properties").unwrap_or(&Value::Null);
 
     let coordinates = extract_coordinates(geometry);
-    if coordinates.is_empty() {
+    let compliance = properties.get("compliance");
+    let atc_plan = compliance
+        .and_then(|value| value.get("atc_plan"))
+        .and_then(|value| serde_json::from_value::<AtcPlanEmbed>(value.clone()).ok());
+
+    if coordinates.is_empty() && atc_plan.as_ref().map(|plan| plan.waypoints.is_empty()).unwrap_or(true) {
         return None;
     }
 
@@ -117,20 +152,41 @@ fn declaration_to_plan(declaration: &Value, declaration_id: &str) -> Option<Flig
     let max_alt = altitude_from_property(properties, "max_altitude");
     let altitude = max_alt.or(min_alt).unwrap_or(0.0);
 
-    let waypoints: Vec<Waypoint> = coordinates
-        .into_iter()
-        .map(|(lon, lat)| Waypoint {
-            lat,
-            lon,
-            altitude_m: altitude,
-            speed_mps: None,
-        })
-        .collect();
-
-    let compliance = properties.get("compliance");
-    let flight_id = compliance
-        .and_then(extract_atc_plan_id)
+    let flight_id = atc_plan
+        .as_ref()
+        .and_then(|plan| plan.id.as_ref())
+        .map(|id| id.trim())
+        .filter(|id| !id.is_empty())
+        .map(|id| id.to_string())
+        .or_else(|| compliance.and_then(extract_atc_plan_id))
         .unwrap_or_else(|| format!("BLENDER-{}", declaration_id));
+
+    let speed_mps = atc_plan
+        .as_ref()
+        .and_then(|plan| plan.metadata.as_ref())
+        .and_then(|meta| meta.drone_speed_mps);
+
+    let waypoints: Vec<Waypoint> = if let Some(plan) = atc_plan.as_ref().filter(|plan| !plan.waypoints.is_empty()) {
+        plan.waypoints
+            .iter()
+            .map(|wp| Waypoint {
+                lat: wp.lat,
+                lon: wp.lon,
+                altitude_m: wp.alt,
+                speed_mps: wp.speed_mps.or(speed_mps),
+            })
+            .collect()
+    } else {
+        coordinates
+            .into_iter()
+            .map(|(lon, lat)| Waypoint {
+                lat,
+                lon,
+                altitude_m: altitude,
+                speed_mps,
+            })
+            .collect()
+    };
 
     let departure_time = parse_datetime(
         declaration.get("start_datetime")
@@ -155,20 +211,32 @@ fn declaration_to_plan(declaration: &Value, declaration_id: &str) -> Option<Flig
     ])
     .unwrap_or_else(|| format!("BLENDER-{}", declaration_id));
 
-    let metadata = FlightPlanMetadata {
-        blender_declaration_id: Some(declaration_id.to_string()),
-        planned_altitude_m: Some(altitude),
-        operation_type: declaration.get("type_of_operation").and_then(|v| v.as_u64()).map(|v| v as u8),
-        compliance_report: compliance.cloned(),
-        ..Default::default()
-    };
+    let mut metadata = atc_plan
+        .as_ref()
+        .and_then(|plan| plan.metadata.clone())
+        .unwrap_or_default();
+    metadata.blender_declaration_id = Some(declaration_id.to_string());
+    if metadata.planned_altitude_m.is_none() {
+        metadata.planned_altitude_m = Some(altitude);
+    }
+    if metadata.operation_type.is_none() {
+        metadata.operation_type = declaration
+            .get("type_of_operation")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u8);
+    }
+    if metadata.compliance_report.is_none() {
+        metadata.compliance_report = compliance.cloned();
+    }
 
     Some(FlightPlan {
         flight_id,
         drone_id,
         owner_id: None,
         waypoints,
-        trajectory_log: None,
+        trajectory_log: atc_plan
+            .as_ref()
+            .and_then(|plan| if plan.trajectory_log.is_empty() { None } else { Some(plan.trajectory_log.clone()) }),
         metadata: Some(metadata),
         status,
         departure_time,

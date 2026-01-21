@@ -11,11 +11,13 @@
 //! Usage:
 //!   cargo run -p atc-cli --bin demo_scenario
 
-use atc_core::models::CommandType;
-use atc_core::spatial::haversine_distance;
+use atc_core::models::{Command, CommandType};
+use atc_core::spatial::{bearing, haversine_distance, offset_by_bearing};
 use atc_sdk::AtcClient;
 use clap::Parser;
 use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::time;
 
 /// Irvine coordinates (flight hub)
@@ -26,9 +28,16 @@ const IRVINE_LON: f64 = -117.8265;
 const CRUISE_ALTITUDE_M: f64 = 50.0;
 const DRONE_SPEED_MPS: f64 = 10.0;
 const UPDATE_RATE_HZ: f64 = 1.0;
+const BATTERY_CAPACITY_MIN: f64 = 12.0;
+const BATTERY_RESERVE_MIN: f64 = 2.0;
+const BATTERY_HOVER_DRAIN_FACTOR: f64 = 0.3;
+const MAX_TURN_RATE_DEG_PER_S: f64 = 25.0;
+const MAX_ACCEL_MPS2: f64 = 2.0;
+const WAYPOINT_REACHED_M: f64 = 5.0;
+const COMMAND_CHANNEL_SIZE: usize = 32;
 
-/// ~300m offset in degrees
-const OFFSET_DEG: f64 = 0.003;
+/// ~300m offset from the hub
+const OFFSET_M: f64 = 300.0;
 
 /// Lifecycle timing (seconds)
 const PREFLIGHT_DURATION: f64 = 3.0;
@@ -79,6 +88,7 @@ struct Args {
 struct DemoState {
     drone_id: String,
     client: AtcClient,
+    command_rx: Option<mpsc::Receiver<Command>>,
     // Positions
     start_lat: f64,
     start_lon: f64,
@@ -90,33 +100,41 @@ struct DemoState {
     // Current state
     phase: FlightPhase,
     phase_start_time: f64,
-    cruise_start_time: f64,  // When cruise phase started (reset after reroute)
-    heading: f64,
+    heading_deg: f64,
+    current_speed_mps: f64,
     current_alt: f64,
     // Rerouting state
     is_rerouting: bool,
     reroute_waypoints: Vec<(f64, f64, f64)>,
     reroute_index: usize,
-    reroute_segment_start_time: f64,  // When we started flying towards current waypoint
-    reroute_segment_start_pos: (f64, f64, f64), // Position when segment started (lat, lon, alt)
     // Hold state
     is_holding: bool,
     hold_until: Option<time::Instant>,
     // Altitude offset from ALTITUDE_CHANGE commands
     altitude_offset_m: f64,
+    // Battery state (minutes)
+    battery_capacity_min: f64,
+    battery_reserve_min: f64,
+    battery_remaining_min: f64,
+    battery_warned: bool,
 }
 
 impl DemoState {
-    fn new(drone_id: &str, client: AtcClient, start: (f64, f64), end: (f64, f64)) -> Self {
-        let dlat = end.0 - start.0;
-        let dlon = end.1 - start.1;
-        let heading_rad = dlon.atan2(dlat);
+    fn new(
+        drone_id: &str,
+        client: AtcClient,
+        command_rx: Option<mpsc::Receiver<Command>>,
+        start: (f64, f64),
+        end: (f64, f64),
+    ) -> Self {
+        let heading_rad = bearing(start.0, start.1, end.0, end.1);
         let mut heading = heading_rad.to_degrees();
         if heading < 0.0 { heading += 360.0; }
 
         Self {
             drone_id: drone_id.to_string(),
             client,
+            command_rx,
             start_lat: start.0,
             start_lon: start.1,
             end_lat: end.0,
@@ -125,22 +143,24 @@ impl DemoState {
             current_lon: start.1,
             phase: FlightPhase::Preflight,
             phase_start_time: 0.0,
-            cruise_start_time: 0.0,
-            heading,
+            heading_deg: heading,
+            current_speed_mps: 0.0,
             current_alt: 0.0, // Start on ground
             is_rerouting: false,
             reroute_waypoints: Vec::new(),
             reroute_index: 0,
-            reroute_segment_start_time: 0.0,
-            reroute_segment_start_pos: (0.0, 0.0, 0.0),
             is_holding: false,
             hold_until: None,
             altitude_offset_m: 0.0,
+            battery_capacity_min: BATTERY_CAPACITY_MIN,
+            battery_reserve_min: BATTERY_RESERVE_MIN,
+            battery_remaining_min: BATTERY_CAPACITY_MIN,
+            battery_warned: false,
         }
     }
 
     /// Update phase based on elapsed time and current state
-    fn update_phase(&mut self, elapsed: f64, _cruise_duration: f64) {
+    fn update_phase(&mut self, elapsed: f64) {
         let phase_elapsed = elapsed - self.phase_start_time;
         
         match self.phase {
@@ -181,54 +201,162 @@ impl DemoState {
         }
     }
 
-    /// Get current position based on phase and progress
-    fn get_position(&self, cruise_elapsed: f64, _cruise_duration: f64) -> (f64, f64) {
-        match self.phase {
-            FlightPhase::Preflight | FlightPhase::Takeoff => {
-                // Stay at start position
-                (self.start_lat, self.start_lon)
-            }
-            FlightPhase::Cruise => {
-                if self.is_rerouting && self.reroute_index < self.reroute_waypoints.len() {
-                    // Physics-based interpolation towards current waypoint
-                    let target = self.reroute_waypoints[self.reroute_index];
-                    let start_pos = self.reroute_segment_start_pos;
-                    
-                    let segment_dist = haversine_distance(start_pos.0, start_pos.1, target.0, target.1);
-                    let segment_time = segment_dist / DRONE_SPEED_MPS;
-                    let segment_elapsed = cruise_elapsed - self.reroute_segment_start_time;
-                    let segment_progress = if segment_time > 0.01 {
-                        (segment_elapsed / segment_time).clamp(0.0, 1.0)
-                    } else {
-                        1.0 // Already at waypoint
-                    };
-                    
-                    let lat = start_pos.0 + segment_progress * (target.0 - start_pos.0);
-                    let lon = start_pos.1 + segment_progress * (target.1 - start_pos.1);
-                    (lat, lon)
-                } else {
-                    // Use current position as start (updated after reroute completes)
-                    let remaining_distance = haversine_distance(
-                        self.current_lat, self.current_lon,
-                        self.end_lat, self.end_lon
-                    );
-                    let _total_distance = haversine_distance(
-                        self.start_lat, self.start_lon,
-                        self.end_lat, self.end_lon
-                    );
-                    let remaining_time = remaining_distance / DRONE_SPEED_MPS;
-                    let progress = (cruise_elapsed / remaining_time.max(0.1)).clamp(0.0, 1.0);
-                    let lat = self.current_lat + progress * (self.end_lat - self.current_lat);
-                    let lon = self.current_lon + progress * (self.end_lon - self.current_lon);
-                    (lat, lon)
+    fn update_motion(&mut self, target_lat: f64, target_lon: f64, dt_s: f64, target_speed_mps: f64) {
+        if dt_s <= 0.0 {
+            return;
+        }
+
+        let speed_delta = target_speed_mps - self.current_speed_mps;
+        let max_speed_delta = MAX_ACCEL_MPS2 * dt_s;
+        self.current_speed_mps += speed_delta.clamp(-max_speed_delta, max_speed_delta);
+        if self.current_speed_mps.abs() < 0.01 {
+            self.current_speed_mps = 0.0;
+        }
+
+        if self.current_speed_mps <= 0.0 {
+            return;
+        }
+
+        let desired_heading = bearing(self.current_lat, self.current_lon, target_lat, target_lon).to_degrees();
+        let desired_heading = if desired_heading < 0.0 {
+            desired_heading + 360.0
+        } else {
+            desired_heading
+        };
+        let heading_delta = Self::shortest_heading_delta(desired_heading, self.heading_deg);
+        let max_turn = MAX_TURN_RATE_DEG_PER_S * dt_s;
+        self.heading_deg = Self::normalize_heading_deg(
+            self.heading_deg + heading_delta.clamp(-max_turn, max_turn),
+        );
+
+        let remaining = haversine_distance(self.current_lat, self.current_lon, target_lat, target_lon);
+        let travel = (self.current_speed_mps * dt_s).min(remaining);
+        if travel <= 0.0 {
+            return;
+        }
+        let (lat, lon) = offset_by_bearing(
+            self.current_lat,
+            self.current_lon,
+            travel,
+            self.heading_deg.to_radians(),
+        );
+        self.current_lat = lat;
+        self.current_lon = lon;
+    }
+
+    fn normalize_heading_deg(heading: f64) -> f64 {
+        let mut heading = heading % 360.0;
+        if heading < 0.0 {
+            heading += 360.0;
+        }
+        heading
+    }
+
+    fn shortest_heading_delta(target: f64, current: f64) -> f64 {
+        let mut delta = target - current;
+        while delta > 180.0 {
+            delta -= 360.0;
+        }
+        while delta < -180.0 {
+            delta += 360.0;
+        }
+        delta
+    }
+
+    fn drain_battery(&mut self, dt_s: f64, speed_mps: f64, airborne: bool) {
+        if dt_s <= 0.0 {
+            return;
+        }
+        let drain_factor = if speed_mps > 0.0 {
+            (speed_mps / DRONE_SPEED_MPS).max(0.0)
+        } else if airborne {
+            BATTERY_HOVER_DRAIN_FACTOR
+        } else {
+            0.0
+        };
+        let drain_min = (dt_s / 60.0) * drain_factor;
+        self.battery_remaining_min = (self.battery_remaining_min - drain_min).max(0.0);
+    }
+}
+
+async fn spawn_command_listener(
+    drone_id: &str,
+    client: &AtcClient,
+) -> Option<mpsc::Receiver<Command>> {
+    let mut stream = match client.connect_command_stream().await {
+        Ok(stream) => stream,
+        Err(err) => {
+            eprintln!(
+                "[CMD] {} WebSocket unavailable, falling back to polling: {}",
+                drone_id, err
+            );
+            return None;
+        }
+    };
+
+    let (tx, rx) = mpsc::channel(COMMAND_CHANNEL_SIZE);
+    let drone_id = drone_id.to_string();
+    tokio::spawn(async move {
+        loop {
+            match stream.next_command().await {
+                Ok(Some(cmd)) => {
+                    if tx.send(cmd).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    eprintln!("[CMD] {} command stream closed", drone_id);
+                    break;
+                }
+                Err(err) => {
+                    eprintln!("[CMD] {} command stream error: {}", drone_id, err);
+                    break;
                 }
             }
-            FlightPhase::Landing | FlightPhase::Landed => {
-                // At destination
-                (self.end_lat, self.end_lon)
-            }
+        }
+    });
+
+    Some(rx)
+}
+
+async fn handle_command(drone: &mut DemoState, cmd: Command) {
+    println!("\n  ╔════════════════════════════════════════════════════════════╗");
+    println!("  ║  COMMAND: {:?}", cmd.command_type);
+    println!("  ╚════════════════════════════════════════════════════════════╝");
+
+    match cmd.command_type {
+        CommandType::Hold { duration_secs } => {
+            drone.is_holding = true;
+            drone.hold_until = Some(time::Instant::now() + Duration::from_secs(duration_secs as u64));
+            println!("  [CMD] {} HOLD for {}s\n", drone.drone_id, duration_secs);
+        }
+        CommandType::Resume => {
+            drone.is_holding = false;
+            drone.is_rerouting = false;
+            drone.altitude_offset_m = 0.0; // Reset altitude modifications
+            println!("  [CMD] {} RESUME\n", drone.drone_id);
+        }
+        CommandType::Reroute { waypoints, reason } => {
+            drone.is_rerouting = true;
+            drone.reroute_waypoints = waypoints
+                .iter()
+                .map(|wp| (wp.lat, wp.lon, wp.altitude_m))
+                .collect();
+            drone.reroute_index = 0;
+            println!("  [CMD] {} REROUTE ({} waypoints)", drone.drone_id, waypoints.len());
+            println!("        Reason: {}\n", reason.as_deref().unwrap_or("none"));
+        }
+        CommandType::AltitudeChange { target_altitude_m } => {
+            // Calculate offset from current cruise altitude
+            drone.altitude_offset_m = target_altitude_m - CRUISE_ALTITUDE_M;
+            println!(
+                "  [CMD] {} ALT_CHANGE → {}m (offset: {:+.0}m)\n",
+                drone.drone_id, target_altitude_m, drone.altitude_offset_m
+            );
         }
     }
+
+    let _ = drone.client.ack_command(&cmd.command_id).await;
 }
 
 #[tokio::main]
@@ -268,19 +396,32 @@ async fn main() -> anyhow::Result<()> {
     beta_client.register(Some("demo-beta")).await?;
     println!("[REGISTER] ✓ Both drones registered\n");
 
+    let alpha_command_rx = spawn_command_listener("demo-alpha", &alpha_client).await;
+    let beta_command_rx = spawn_command_listener("demo-beta", &beta_client).await;
+
     // Create demo states
+    let (alpha_start_lat, alpha_start_lon) =
+        offset_by_bearing(IRVINE_LAT, IRVINE_LON, OFFSET_M, 270.0_f64.to_radians());
+    let (alpha_end_lat, alpha_end_lon) =
+        offset_by_bearing(IRVINE_LAT, IRVINE_LON, OFFSET_M, 90.0_f64.to_radians());
     let mut alpha = DemoState::new(
         "demo-alpha",
         alpha_client,
-        (IRVINE_LAT, IRVINE_LON - OFFSET_DEG),
-        (IRVINE_LAT, IRVINE_LON + OFFSET_DEG),
+        alpha_command_rx,
+        (alpha_start_lat, alpha_start_lon),
+        (alpha_end_lat, alpha_end_lon),
     );
 
+    let (beta_start_lat, beta_start_lon) =
+        offset_by_bearing(IRVINE_LAT, IRVINE_LON, OFFSET_M, 90.0_f64.to_radians());
+    let (beta_end_lat, beta_end_lon) =
+        offset_by_bearing(IRVINE_LAT, IRVINE_LON, OFFSET_M, 270.0_f64.to_radians());
     let mut beta = DemoState::new(
         "demo-beta",
         beta_client,
-        (IRVINE_LAT, IRVINE_LON + OFFSET_DEG),
-        (IRVINE_LAT, IRVINE_LON - OFFSET_DEG),
+        beta_command_rx,
+        (beta_start_lat, beta_start_lon),
+        (beta_end_lat, beta_end_lon),
     );
 
     // Calculate cruise duration
@@ -298,10 +439,13 @@ async fn main() -> anyhow::Result<()> {
     let owner_id = args.owner.clone();  // For telemetry owner tracking
     let mut update_count = 0u32;
     let mut interval = time::interval(Duration::from_secs_f64(1.0 / UPDATE_RATE_HZ));
+    let mut last_elapsed = 0.0;
 
     loop {
         interval.tick().await;
         let elapsed = start_time.elapsed().as_secs_f64();
+        let dt = (elapsed - last_elapsed).max(0.0);
+        last_elapsed = elapsed;
 
         if elapsed > total_duration {
             println!("\n╔═══════════════════════════════════════════════════════════════╗");
@@ -321,21 +465,44 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            // Calculate cruise elapsed time (relative to current segment)
-            // If in preflight/takeoff, cruise_start_time is the end of takeoff phase
-            let effective_start_time = if drone.cruise_start_time > 0.0 {
-                drone.cruise_start_time
-            } else {
-                PREFLIGHT_DURATION + TAKEOFF_DURATION
-            };
-            
-            let cruise_elapsed = (elapsed - effective_start_time).max(0.0);
-
             // Update phase
-            drone.update_phase(elapsed, cruise_duration);
+            drone.update_phase(elapsed);
 
-            // Get position
-            let (lat, lon) = drone.get_position(cruise_elapsed, cruise_duration);
+            let (target_lat, target_lon, target_alt) = if drone.is_rerouting && drone.reroute_index < drone.reroute_waypoints.len() {
+                drone.reroute_waypoints[drone.reroute_index]
+            } else {
+                (drone.end_lat, drone.end_lon, drone.current_alt)
+            };
+
+            let target_speed = if drone.is_holding
+                || matches!(drone.phase, FlightPhase::Preflight | FlightPhase::Takeoff | FlightPhase::Landing | FlightPhase::Landed)
+            {
+                0.0
+            } else {
+                DRONE_SPEED_MPS
+            };
+            drone.update_motion(target_lat, target_lon, dt, target_speed);
+
+            let lat = drone.current_lat;
+            let lon = drone.current_lon;
+
+            if drone.is_rerouting && drone.reroute_index < drone.reroute_waypoints.len() {
+                let target = drone.reroute_waypoints[drone.reroute_index];
+                let dist_to_target = haversine_distance(lat, lon, target.0, target.1);
+                if dist_to_target <= WAYPOINT_REACHED_M {
+                    drone.current_lat = target.0;
+                    drone.current_lon = target.1;
+                    drone.current_alt = target.2;
+
+                    drone.reroute_index += 1;
+                    if drone.reroute_index >= drone.reroute_waypoints.len() {
+                        drone.is_rerouting = false;
+                        drone.reroute_waypoints.clear();
+                        drone.reroute_index = 0;
+                        println!("[{:3}] {} reroute complete, continuing from new position", update_count, drone.drone_id);
+                    }
+                }
+            }
 
             // Check if we reached destination (distance-based transition)
             if drone.phase == FlightPhase::Cruise && !drone.is_rerouting && !drone.is_holding {
@@ -350,7 +517,7 @@ async fn main() -> anyhow::Result<()> {
             // Calculate altitude with offset applied during cruise
             let alt = if drone.is_rerouting && drone.reroute_index < drone.reroute_waypoints.len() {
                 // During reroute: use waypoint altitude + any additional offset
-                drone.reroute_waypoints[drone.reroute_index].2 + drone.altitude_offset_m
+                target_alt + drone.altitude_offset_m
             } else if drone.phase == FlightPhase::Cruise {
                 // Normal cruise: apply offset to cruise altitude
                 drone.current_alt + drone.altitude_offset_m
@@ -359,14 +526,40 @@ async fn main() -> anyhow::Result<()> {
                 drone.current_alt
             };
 
-            let speed = if drone.is_holding || drone.phase == FlightPhase::Preflight || drone.phase == FlightPhase::Landed {
-                0.0
-            } else {
-                DRONE_SPEED_MPS
-            };
+            let speed = drone.current_speed_mps;
+
+            let airborne = !matches!(drone.phase, FlightPhase::Preflight | FlightPhase::Landed);
+            drone.drain_battery(dt, speed, airborne);
+
+            if drone.battery_remaining_min <= drone.battery_reserve_min {
+                if !drone.battery_warned {
+                    drone.battery_warned = true;
+                    println!(
+                        "[{:3}] {} battery reserve reached ({:.1} min left), forcing landing",
+                        update_count,
+                        drone.drone_id,
+                        drone.battery_remaining_min
+                    );
+                }
+                if matches!(drone.phase, FlightPhase::Cruise | FlightPhase::Takeoff | FlightPhase::Preflight) {
+                    drone.is_holding = false;
+                    drone.is_rerouting = false;
+                    drone.phase = FlightPhase::Landing;
+                    drone.phase_start_time = elapsed;
+                }
+            }
 
             // Send telemetry with owner ID
-            match drone.client.send_position_with_owner(lat, lon, alt, drone.heading, speed, Some(owner_id.clone())).await {
+            match drone.client.send_position_with_owner(
+                lat,
+                lon,
+                alt,
+                drone.heading_deg,
+                speed,
+                Some(owner_id.clone()),
+            )
+            .await
+            {
                 Ok(_) => {
                     let status = if drone.is_rerouting {
                         format!("REROUTE[{}/{}]", drone.reroute_index + 1, drone.reroute_waypoints.len())
@@ -384,79 +577,42 @@ async fn main() -> anyhow::Result<()> {
                 Err(e) => eprintln!("[{:3}] {} ERROR: {}", update_count, drone.drone_id, e),
             }
 
-            // Poll for commands
-            if let Ok(Some(cmd)) = drone.client.get_next_command().await {
-                println!("\n  ╔════════════════════════════════════════════════════════════╗");
-                println!("  ║  COMMAND: {:?}", cmd.command_type);
-                println!("  ╚════════════════════════════════════════════════════════════╝");
+            let mut poll_fallback = drone.command_rx.is_none();
+            let mut received_commands = Vec::new();
+            let mut disconnected = false;
 
-                match cmd.command_type {
-                    CommandType::Hold { duration_secs } => {
-                        drone.is_holding = true;
-                        drone.hold_until = Some(time::Instant::now() + Duration::from_secs(duration_secs as u64));
-                        println!("  [CMD] {} HOLD for {}s\n", drone.drone_id, duration_secs);
-                    }
-                    CommandType::Resume => {
-                        drone.is_holding = false;
-                        drone.is_rerouting = false;
-                        drone.altitude_offset_m = 0.0; // Reset altitude modifications
-                        println!("  [CMD] {} RESUME\n", drone.drone_id);
-                    }
-                    CommandType::Reroute { waypoints, reason } => {
-                        drone.is_rerouting = true;
-                        drone.reroute_waypoints = waypoints.iter()
-                            .map(|wp| (wp.lat, wp.lon, wp.altitude_m))
-                            .collect();
-                        drone.reroute_index = 0;
-                        // Initialize segment tracking with current position
-                        drone.reroute_segment_start_time = cruise_elapsed;
-                        drone.reroute_segment_start_pos = (lat, lon, alt);
-                        println!("  [CMD] {} REROUTE ({} waypoints)", drone.drone_id, waypoints.len());
-                        println!("        Reason: {}\n", reason.as_deref().unwrap_or("none"));
-                    }
-                    CommandType::AltitudeChange { target_altitude_m } => {
-                        // Calculate offset from current cruise altitude
-                        drone.altitude_offset_m = target_altitude_m - CRUISE_ALTITUDE_M;
-                        println!("  [CMD] {} ALT_CHANGE → {}m (offset: {:+.0}m)\n", 
-                            drone.drone_id, target_altitude_m, drone.altitude_offset_m);
-                    }
-                }
-
-                let _ = drone.client.ack_command(&cmd.command_id).await;
-            }
-
-            // Advance reroute based on PHYSICS (distance/speed), not fixed time
-            if drone.is_rerouting && drone.reroute_index < drone.reroute_waypoints.len() {
-                let target = drone.reroute_waypoints[drone.reroute_index];
-                let start_pos = drone.reroute_segment_start_pos;
-                
-                let segment_dist = haversine_distance(start_pos.0, start_pos.1, target.0, target.1);
-                let segment_time = segment_dist / DRONE_SPEED_MPS;
-                let segment_elapsed = cruise_elapsed - drone.reroute_segment_start_time;
-                
-                // Check if we've reached this waypoint
-                if segment_elapsed >= segment_time {
-                    // Update current position to this waypoint
-                    drone.current_lat = target.0;
-                    drone.current_lon = target.1;
-                    drone.current_alt = target.2;
-                    
-                    drone.reroute_index += 1;
-                    
-                    if drone.reroute_index >= drone.reroute_waypoints.len() {
-                        // All waypoints done, resume normal cruise
-                        drone.cruise_start_time = elapsed;
-                        drone.is_rerouting = false;
-                        drone.reroute_waypoints.clear();
-                        drone.reroute_index = 0;
-                        println!("[{:3}] {} reroute complete, continuing from new position", update_count, drone.drone_id);
-                    } else {
-                        // Start next segment
-                        drone.reroute_segment_start_time = cruise_elapsed;
-                        drone.reroute_segment_start_pos = (target.0, target.1, target.2);
+            if let Some(rx) = drone.command_rx.as_mut() {
+                loop {
+                    match rx.try_recv() {
+                        Ok(cmd) => received_commands.push(cmd),
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            disconnected = true;
+                            break;
+                        }
                     }
                 }
             }
+
+            if disconnected {
+                eprintln!(
+                    "[CMD] {} command stream disconnected, falling back to polling",
+                    drone.drone_id
+                );
+                drone.command_rx = None;
+                poll_fallback = true;
+            }
+
+            for cmd in received_commands {
+                handle_command(drone, cmd).await;
+            }
+
+            if poll_fallback {
+                if let Ok(Some(cmd)) = drone.client.get_next_command().await {
+                    handle_command(drone, cmd).await;
+                }
+            }
+
         }
     }
 

@@ -2,19 +2,22 @@
 
 use atc_core::models::{Command, DroneState, FlightPlan, Telemetry, Geofence, ConformanceStatus, DaaAdvisory, DroneStatus};
 use atc_core::rules::SafetyRules;
-use atc_core::{Conflict, ConflictDetector};
+use atc_core::{Conflict, ConflictDetector, DronePosition};
 use dashmap::DashMap;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{atomic::{AtomicU32, Ordering}, RwLock};
-use std::future::Future;
-use chrono::Utc;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use anyhow::Result;
 
-use tokio::sync::broadcast;
-use crate::persistence::{Database, commands as commands_db, drones as drones_db, flight_plans as flight_plans_db, geofences as geofences_db};
+use tokio::sync::{broadcast, mpsc};
+use crate::persistence::{Database, commands as commands_db, drones as drones_db, flight_plans as flight_plans_db, geofences as geofences_db, drone_tokens as drone_tokens_db};
 use crate::persistence::db as db_persistence;
 use crate::config::Config;
+use crate::altitude::altitude_to_amsl;
+
+const TELEMETRY_QUEUE_DEPTH: usize = 4096;
+const DETECTOR_QUEUE_DEPTH: usize = 4096;
 
 /// Application state - thread-safe store for drones and conflicts.
 pub struct AppState {
@@ -24,14 +27,22 @@ pub struct AppState {
     external_traffic: DashMap<String, ExternalTraffic>,
     pub flight_plans: DashMap<String, FlightPlan>,
     detector: std::sync::Mutex<ConflictDetector>,
+    detector_tx: mpsc::Sender<DetectorUpdate>,
+    detector_rx: std::sync::Mutex<mpsc::Receiver<DetectorUpdate>>,
     conflicts: DashMap<String, Conflict>,
     /// Command queues per drone (FIFO)
     commands: DashMap<String, VecDeque<Command>>,
     /// Track recently issued commands to prevent spam
     command_cooldowns: DashMap<String, std::time::Instant>,
+    /// Track active HOLD commands after acknowledgment
+    active_holds: DashMap<String, DateTime<Utc>>,
     drone_counter: AtomicU32,
     pub tx: broadcast::Sender<DroneState>, // For WS broadcasting
     command_tx: broadcast::Sender<Command>,
+    /// Telemetry persistence queue (coalesced in background).
+    telemetry_tx: mpsc::Sender<DroneState>,
+    telemetry_rx: std::sync::Mutex<Option<mpsc::Receiver<DroneState>>>,
+    telemetry_overflow: std::sync::Mutex<HashMap<String, DroneState>>,
     /// Safety rules (for timeout checks, etc.)
     rules: SafetyRules,
     /// Geofences/No-fly zones
@@ -64,6 +75,18 @@ pub struct ExternalTraffic {
     pub last_update: chrono::DateTime<chrono::Utc>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterDroneOutcome {
+    Registered,
+    AlreadyRegistered,
+}
+
+#[derive(Debug)]
+enum DetectorUpdate {
+    Upsert(DronePosition),
+    Remove(String),
+}
+
 impl AppState {
 
     
@@ -82,6 +105,8 @@ impl AppState {
     pub fn with_rules_and_config(rules: SafetyRules, config: Config) -> Self {
         let (tx, _) = broadcast::channel(100);
         let (command_tx, _) = broadcast::channel(100);
+        let (telemetry_tx, telemetry_rx) = mpsc::channel(TELEMETRY_QUEUE_DEPTH);
+        let (detector_tx, detector_rx) = mpsc::channel(DETECTOR_QUEUE_DEPTH);
         
         // Create detector with configurable thresholds from rules
         let detector = ConflictDetector::new(
@@ -98,12 +123,18 @@ impl AppState {
             external_traffic: DashMap::new(),
             flight_plans: DashMap::new(),
             detector: std::sync::Mutex::new(detector),
+            detector_tx,
+            detector_rx: std::sync::Mutex::new(detector_rx),
             conflicts: DashMap::new(),
             commands: DashMap::new(),
             command_cooldowns: DashMap::new(),
+            active_holds: DashMap::new(),
             drone_counter: AtomicU32::new(1),
             tx,
             command_tx,
+            telemetry_tx,
+            telemetry_rx: std::sync::Mutex::new(Some(telemetry_rx)),
+            telemetry_overflow: std::sync::Mutex::new(HashMap::new()),
             rules,
             geofences: DashMap::new(),
             external_geofences: DashMap::new(),
@@ -122,6 +153,30 @@ impl AppState {
         self.database.as_ref()
     }
 
+    /// Take the telemetry receiver for the persistence loop.
+    pub fn take_telemetry_receiver(&self) -> Option<mpsc::Receiver<DroneState>> {
+        if let Ok(mut guard) = self.telemetry_rx.lock() {
+            guard.take()
+        } else {
+            None
+        }
+    }
+
+    /// Drain any telemetry snapshots that couldn't fit in the queue.
+    pub fn take_telemetry_overflow(&self) -> HashMap<String, DroneState> {
+        if let Ok(mut guard) = self.telemetry_overflow.lock() {
+            std::mem::take(&mut *guard)
+        } else {
+            HashMap::new()
+        }
+    }
+
+    fn store_telemetry_overflow(&self, state: DroneState) {
+        if let Ok(mut guard) = self.telemetry_overflow.lock() {
+            guard.insert(state.drone_id.clone(), state);
+        }
+    }
+
     /// Load persisted state from the database into memory.
     pub async fn load_from_database(&self) -> Result<()> {
         let Some(db) = self.database.clone() else {
@@ -132,9 +187,11 @@ impl AppState {
 
         self.drones.clear();
         self.drone_owners.clear();
+        self.drone_tokens.clear();
         self.flight_plans.clear();
         self.geofences.clear();
         self.commands.clear();
+        self.active_holds.clear();
 
         let drones = drones_db::load_all_drones(&pool).await?;
         for drone in drones {
@@ -143,6 +200,8 @@ impl AppState {
             }
             self.drones.insert(drone.drone_id.clone(), drone);
         }
+
+        self.seed_drone_counter();
 
         if let Ok(mut detector) = self.detector.lock() {
             for drone in self.drones.iter() {
@@ -154,7 +213,7 @@ impl AppState {
                         drone.lon,
                         drone.altitude_m,
                     )
-                    .with_velocity(drone.heading_deg, drone.speed_mps),
+                    .with_velocity(drone.heading_deg, drone.speed_mps, drone.velocity_z),
                 );
             }
             self.update_conflicts_from_detector(&mut detector);
@@ -178,23 +237,48 @@ impl AppState {
                 .push_back(command);
         }
 
+        let tokens = drone_tokens_db::load_all_drone_tokens(&pool).await?;
+        for token in tokens {
+            self.drone_tokens.insert(token.drone_id, token.session_token);
+        }
+
         Ok(())
     }
 
-    fn spawn_db_task<F, Fut>(&self, label: &'static str, task: F)
-    where
-        F: FnOnce(Database) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
-    {
-        let Some(db) = self.database.clone() else {
-            return;
+    fn queue_telemetry_persist(&self, state: DroneState) {
+        match self.telemetry_tx.try_send(state) {
+            Ok(_) => {}
+            Err(mpsc::error::TrySendError::Full(state)) => {
+                tracing::warn!("Telemetry persistence queue full; stashing latest snapshot");
+                self.store_telemetry_overflow(state);
+            }
+            Err(mpsc::error::TrySendError::Closed(state)) => {
+                tracing::warn!("Telemetry persistence queue closed; stashing latest snapshot");
+                self.store_telemetry_overflow(state);
+            }
+        }
+    }
+
+    fn queue_detector_update(&self, update: DetectorUpdate) {
+        let update = match self.detector_tx.try_send(update) {
+            Ok(_) => return,
+            Err(mpsc::error::TrySendError::Full(update)) => {
+                tracing::warn!("Conflict detector queue full; applying update synchronously");
+                update
+            }
+            Err(mpsc::error::TrySendError::Closed(update)) => {
+                tracing::warn!("Conflict detector queue closed; applying update synchronously");
+                update
+            }
         };
 
-        tokio::spawn(async move {
-            if let Err(err) = task(db).await {
-                tracing::warn!("Database task {} failed: {}", label, err);
+        if let Ok(mut detector) = self.detector.lock() {
+            match update {
+                DetectorUpdate::Upsert(position) => detector.update_position(position),
+                DetectorUpdate::Remove(drone_id) => detector.remove_drone(&drone_id),
             }
-        });
+            self.update_conflicts_from_detector(&mut detector);
+        }
     }
 
     /// Get the configured safety rules.
@@ -228,21 +312,66 @@ impl AppState {
             .unwrap_or_default()
     }
 
+    fn seed_drone_counter(&self) {
+        let mut max_id = 0u32;
+        for entry in self.drones.iter() {
+            if let Some(id) = Self::parse_drone_numeric_suffix(entry.key()) {
+                max_id = max_id.max(id);
+            }
+        }
+        if max_id > 0 {
+            self.drone_counter.store(max_id.saturating_add(1), Ordering::SeqCst);
+        }
+    }
+
+    fn parse_drone_numeric_suffix(drone_id: &str) -> Option<u32> {
+        let upper = drone_id.trim().to_ascii_uppercase();
+        let rest = upper.strip_prefix("DRONE")?;
+        let rest = rest.trim_start_matches(|c: char| c == '-' || c == '_');
+        if rest.is_empty() || !rest.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        rest.parse().ok()
+    }
+
     /// Get next drone ID number.
     pub fn next_drone_id(&self) -> u32 {
         self.drone_counter.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// Register a new drone.
-    pub fn register_drone(&self, drone_id: &str, owner_id: Option<String>) {
+    /// Register a new drone, persisting before updating in-memory state.
+    pub async fn register_drone(&self, drone_id: &str, owner_id: Option<String>) -> Result<()> {
+        self.register_drone_internal(drone_id, owner_id, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// Register a new drone and persist its session token in a single transaction.
+    pub async fn register_drone_with_token(
+        &self,
+        drone_id: &str,
+        owner_id: Option<String>,
+        token: String,
+    ) -> Result<RegisterDroneOutcome> {
+        self.register_drone_internal(drone_id, owner_id, Some(token))
+            .await
+    }
+
+    async fn register_drone_internal(
+        &self,
+        drone_id: &str,
+        owner_id: Option<String>,
+        token: Option<String>,
+    ) -> Result<RegisterDroneOutcome> {
         let owner_for_state = owner_id
             .clone()
             .or_else(|| self.drone_owners.get(drone_id).map(|entry| entry.value().clone()));
         let now = Utc::now();
-
-        self.drones
-            .entry(drone_id.to_string())
-            .or_insert_with(|| DroneState {
+        let mut state_for_db = self
+            .drones
+            .get(drone_id)
+            .map(|entry| entry.value().clone())
+            .unwrap_or_else(|| DroneState {
                 drone_id: drone_id.to_string(),
                 owner_id: owner_for_state.clone(),
                 lat: 0.0,
@@ -257,26 +386,106 @@ impl AppState {
                 status: DroneStatus::Inactive,
             });
 
-        if let Some(owner_id) = owner_id {
-            self.drone_owners.insert(drone_id.to_string(), owner_id.clone());
-            if let Some(mut entry) = self.drones.get_mut(drone_id) {
-                if entry.owner_id.is_none() {
-                    entry.owner_id = Some(owner_id);
+        if state_for_db.owner_id.is_none() {
+            state_for_db.owner_id = owner_for_state.clone();
+        }
+
+        if let Some(db) = self.database.clone() {
+            if let Some(token_value) = token.as_deref() {
+                let mut tx = db.pool().begin().await?;
+                sqlx::query(
+                    r#"
+                    INSERT INTO drones (drone_id, owner_id, lat, lon, altitude_m, heading_deg, speed_mps, velocity_x, velocity_y, velocity_z, status, last_update)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                    ON CONFLICT(drone_id) DO NOTHING
+                    "#,
+                )
+                .bind(&state_for_db.drone_id)
+                .bind(&state_for_db.owner_id)
+                .bind(state_for_db.lat)
+                .bind(state_for_db.lon)
+                .bind(state_for_db.altitude_m)
+                .bind(state_for_db.heading_deg)
+                .bind(state_for_db.speed_mps)
+                .bind(state_for_db.velocity_x)
+                .bind(state_for_db.velocity_y)
+                .bind(state_for_db.velocity_z)
+                .bind(format!("{:?}", state_for_db.status))
+                .bind(state_for_db.last_update.to_rfc3339())
+                .execute(&mut *tx)
+                .await?;
+
+                let token_result = sqlx::query(
+                    r#"
+                    INSERT INTO drone_tokens (drone_id, session_token, updated_at)
+                    VALUES (?1, ?2, CURRENT_TIMESTAMP)
+                    ON CONFLICT(drone_id) DO NOTHING
+                    "#,
+                )
+                .bind(&state_for_db.drone_id)
+                .bind(token_value)
+                .execute(&mut *tx)
+                .await?;
+
+                if token_result.rows_affected() == 0 {
+                    tx.rollback().await?;
+                    return Ok(RegisterDroneOutcome::AlreadyRegistered);
                 }
+
+                if let Some(owner) = state_for_db.owner_id.as_deref() {
+                    sqlx::query(
+                        r#"
+                        UPDATE drones
+                        SET owner_id = COALESCE(owner_id, ?2)
+                        WHERE drone_id = ?1
+                        "#,
+                    )
+                    .bind(&state_for_db.drone_id)
+                    .bind(owner)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+
+                tx.commit().await?;
+            } else {
+                drones_db::upsert_drone(db.pool(), &state_for_db).await?;
             }
         }
 
-        if let Some(state) = self.drones.get(drone_id) {
-            let state = state.value().clone();
-            self.spawn_db_task("upsert_drone", move |db| async move {
-                drones_db::upsert_drone(db.pool(), &state).await
-            });
+        if let Some(owner_id) = owner_id {
+            self.drone_owners.insert(drone_id.to_string(), owner_id);
         }
+
+        self.drones
+            .entry(drone_id.to_string())
+            .and_modify(|state| {
+                if state.owner_id.is_none() {
+                    state.owner_id = owner_for_state.clone();
+                }
+            })
+            .or_insert(state_for_db);
+
+        if let Some(token) = token {
+            self.drone_tokens.insert(drone_id.to_string(), token);
+        }
+
+        Ok(RegisterDroneOutcome::Registered)
     }
 
     /// Store or update the session token for a drone.
-    pub fn set_drone_token(&self, drone_id: &str, token: String) {
+    pub async fn set_drone_token(&self, drone_id: &str, token: String) -> Result<()> {
+        if let Some(db) = self.database.clone() {
+            drone_tokens_db::upsert_drone_token(db.pool(), drone_id, &token).await?;
+        }
         self.drone_tokens.insert(drone_id.to_string(), token);
+        Ok(())
+    }
+
+    /// Get the session token for a drone, if present.
+    pub fn drone_token(&self, drone_id: &str) -> Option<String> {
+        self.drone_tokens
+            .get(drone_id)
+            .map(|entry| entry.value().clone())
     }
 
     /// Check if a token matches the registered token for a drone.
@@ -302,6 +511,11 @@ impl AppState {
         let drone_id = telemetry.drone_id.clone();
         let mut telemetry = telemetry;
         let hold_active = self.has_active_hold_command(&drone_id);
+        telemetry.altitude_m = altitude_to_amsl(
+            telemetry.altitude_m,
+            self.config.altitude_reference,
+            self.config.geoid_offset_m,
+        );
 
         if telemetry.owner_id.is_none() {
             if let Some(owner_id) = self.drone_owners.get(&drone_id) {
@@ -338,22 +552,18 @@ impl AppState {
         // Broadcast update via WebSocket
         if let Some(state) = updated_state {
             let _ = self.tx.send(state.clone());
-            self.spawn_db_task("upsert_drone", move |db| async move {
-                drones_db::upsert_drone(db.pool(), &state).await
-            });
+            self.queue_telemetry_persist(state);
         }
 
-        // Update conflict detector
-        if let Ok(mut detector) = self.detector.lock() {
-            detector.update_position(atc_core::DronePosition::new(
+        self.queue_detector_update(DetectorUpdate::Upsert(
+            DronePosition::new(
                 &drone_id,
                 telemetry.lat,
                 telemetry.lon,
                 telemetry.altitude_m,
-            ).with_velocity(telemetry.heading_deg, telemetry.speed_mps));
-
-            self.update_conflicts_from_detector(&mut detector);
-        }
+            )
+            .with_velocity(telemetry.heading_deg, telemetry.speed_mps, telemetry.velocity_z),
+        ));
     }
 
     /// Get all drone states.
@@ -363,20 +573,24 @@ impl AppState {
 
     /// Upsert external traffic and feed it into conflict detection.
     pub fn upsert_external_traffic(&self, traffic: ExternalTraffic) {
+        let mut traffic = traffic;
         let traffic_id = traffic.traffic_id.clone();
+        traffic.altitude_m = altitude_to_amsl(
+            traffic.altitude_m,
+            self.config.altitude_reference,
+            self.config.geoid_offset_m,
+        );
         self.external_traffic.insert(traffic_id.clone(), traffic.clone());
 
-        if let Ok(mut detector) = self.detector.lock() {
-            detector.update_position(
-                atc_core::DronePosition::new(
-                    &traffic_id,
-                    traffic.lat,
-                    traffic.lon,
-                    traffic.altitude_m,
-                ).with_velocity(traffic.heading_deg, traffic.speed_mps)
-            );
-            self.update_conflicts_from_detector(&mut detector);
-        }
+        self.queue_detector_update(DetectorUpdate::Upsert(
+            DronePosition::new(
+                &traffic_id,
+                traffic.lat,
+                traffic.lon,
+                traffic.altitude_m,
+            )
+            .with_velocity(traffic.heading_deg, traffic.speed_mps, 0.0),
+        ));
     }
 
     /// Get all external traffic tracks.
@@ -400,24 +614,10 @@ impl AppState {
 
         for id in &stale_ids {
             self.external_traffic.remove(id);
-        }
-
-        if !stale_ids.is_empty() {
-            if let Ok(mut detector) = self.detector.lock() {
-                for id in &stale_ids {
-                    detector.remove_drone(id);
-                }
-                self.update_conflicts_from_detector(&mut detector);
-            }
+            self.queue_detector_update(DetectorUpdate::Remove(id.clone()));
         }
 
         stale_ids
-    }
-
-    /// Check if a drone ID belongs to external traffic.
-    #[allow(dead_code)]
-    pub fn is_external_traffic(&self, drone_id: &str) -> bool {
-        self.external_traffic.contains_key(drone_id)
     }
 
     fn update_conflicts_from_detector(&self, detector: &mut ConflictDetector) {
@@ -427,6 +627,29 @@ impl AppState {
         for conflict in new_conflicts {
             let key = format!("{}-{}", conflict.drone1_id, conflict.drone2_id);
             self.conflicts.insert(key, conflict);
+        }
+    }
+
+    /// Recompute conflicts from the latest detector state.
+    pub fn refresh_conflicts(&self) {
+        let updates = {
+            let mut pending = Vec::new();
+            if let Ok(mut rx) = self.detector_rx.lock() {
+                while let Ok(update) = rx.try_recv() {
+                    pending.push(update);
+                }
+            }
+            pending
+        };
+
+        if let Ok(mut detector) = self.detector.lock() {
+            for update in updates {
+                match update {
+                    DetectorUpdate::Upsert(position) => detector.update_position(position),
+                    DetectorUpdate::Remove(drone_id) => detector.remove_drone(&drone_id),
+                }
+            }
+            self.update_conflicts_from_detector(&mut detector);
         }
     }
 
@@ -458,11 +681,7 @@ impl AppState {
             if elapsed > timeout_secs {
                 drone.status = DroneStatus::Lost;
                 lost_drones.push(drone.drone_id.clone());
-                
-                // Remove from conflict detector (stale data)
-                if let Ok(mut detector) = self.detector.lock() {
-                    detector.remove_drone(&drone.drone_id);
-                }
+                self.queue_detector_update(DetectorUpdate::Remove(drone.drone_id.clone()));
             }
         }
         
@@ -484,12 +703,6 @@ impl AppState {
     /// Get conformance status for all drones.
     pub fn get_conformance_statuses(&self) -> Vec<ConformanceStatus> {
         self.conformance.iter().map(|r| r.value().clone()).collect()
-    }
-
-    /// Get conformance status for a single drone.
-    #[allow(dead_code)]
-    pub fn get_conformance_status(&self, drone_id: &str) -> Option<ConformanceStatus> {
-        self.conformance.get(drone_id).map(|r| r.value().clone())
     }
 
     // ========== DAA METHODS ==========
@@ -518,34 +731,45 @@ impl AppState {
         self.flight_plans.iter().map(|r| r.value().clone()).collect()
     }
     
-    /// Add or update a flight plan
-    pub fn add_flight_plan(&self, plan: FlightPlan) {
-        let plan_clone = plan.clone();
+    /// Add or update a flight plan, persisting before updating in-memory state.
+    pub async fn add_flight_plan(&self, plan: FlightPlan) -> Result<()> {
+        let blender_linked = plan
+            .metadata
+            .as_ref()
+            .and_then(|meta| meta.blender_declaration_id.as_deref())
+            .map(|id| !id.trim().is_empty())
+            .unwrap_or(false);
+        if !blender_linked {
+            if let Some(db) = self.database.clone() {
+                flight_plans_db::upsert_flight_plan(db.pool(), &plan).await?;
+            }
+        }
         self.flight_plans.insert(plan.flight_id.clone(), plan);
-        self.spawn_db_task("upsert_flight_plan", move |db| async move {
-            flight_plans_db::upsert_flight_plan(db.pool(), &plan_clone).await
-        });
+        Ok(())
     }
 
     // ========== COMMAND MANAGEMENT ==========
 
     /// Enqueue a command for a drone.
-    pub fn enqueue_command(&self, command: Command) {
+    pub async fn enqueue_command(&self, command: Command) -> Result<()> {
+        if let Some(db) = self.database.clone() {
+            commands_db::insert_command(db.pool(), &command).await?;
+        }
         let drone_id = command.drone_id.clone();
-        let command_for_db = command.clone();
         let command_for_broadcast = command.clone();
         self.commands
             .entry(drone_id)
             .or_default()
             .push_back(command);
         let _ = self.command_tx.send(command_for_broadcast);
-        self.spawn_db_task("insert_command", move |db| async move {
-            commands_db::insert_command(db.pool(), &command_for_db).await
-        });
+        Ok(())
     }
 
     /// Check if a command was recently issued (cooldown check).
     pub fn can_issue_command(&self, drone_id: &str, cooldown_secs: u64) -> bool {
+        if self.has_pending_command(drone_id) {
+            return false;
+        }
         if let Some(last_time) = self.command_cooldowns.get(drone_id) {
             last_time.elapsed().as_secs() >= cooldown_secs
         } else {
@@ -583,9 +807,11 @@ impl AppState {
         None
     }
 
-    /// Check if drone has an active HOLD or REROUTE command (is in controlled state).
-    /// Only considers non-expired, non-acknowledged commands.
+    /// Check if drone has an active HOLD (acknowledged) or pending HOLD/REROUTE command.
     pub fn has_active_command(&self, drone_id: &str) -> bool {
+        if self.has_active_hold_command(drone_id) {
+            return true;
+        }
         let now = chrono::Utc::now();
         if let Some(queue) = self.commands.get(drone_id) {
             queue.iter().any(|cmd| {
@@ -594,90 +820,194 @@ impl AppState {
                     atc_core::models::CommandType::Hold { .. } | 
                     atc_core::models::CommandType::Reroute { .. }
                 );
-                // Must not be acknowledged
-                let not_acked = !cmd.acknowledged;
+                let awaiting_ack = self.command_waiting_for_ack(cmd, now);
                 // Must not be expired
                 let not_expired = cmd.expires_at
                     .map(|exp| exp > now)
                     .unwrap_or(true); // No expiry = never expires
                 
-                is_control && not_acked && not_expired
+                is_control && awaiting_ack && not_expired
             })
         } else {
             false
         }
     }
 
-    /// Check if drone has an active HOLD command (non-expired, non-acknowledged).
+    /// Check if drone has an acknowledged HOLD command still in effect.
     pub fn has_active_hold_command(&self, drone_id: &str) -> bool {
-        let now = chrono::Utc::now();
-        if let Some(queue) = self.commands.get(drone_id) {
-            queue.iter().any(|cmd| {
-                let is_hold = matches!(cmd.command_type, atc_core::models::CommandType::Hold { .. });
-                let not_acked = !cmd.acknowledged;
-                let not_expired = cmd.expires_at
-                    .map(|exp| exp > now)
-                    .unwrap_or(true);
-                is_hold && not_acked && not_expired
-            })
+        let now = Utc::now();
+        let expires_at = self
+            .active_holds
+            .get(drone_id)
+            .map(|entry| entry.value().clone());
+        let Some(expires_at) = expires_at else {
+            return false;
+        };
+        if expires_at > now {
+            true
         } else {
+            self.active_holds.remove(drone_id);
             false
         }
+    }
+
+    /// Check if a drone has any pending (non-expired) command awaiting acknowledgement.
+    pub fn has_pending_command(&self, drone_id: &str) -> bool {
+        let now = Utc::now();
+        self.commands
+            .get(drone_id)
+            .map(|queue| {
+                queue.iter().any(|cmd| {
+                    let awaiting_ack = self.command_waiting_for_ack(cmd, now);
+                    let not_expired = cmd.expires_at
+                        .map(|exp| exp > now)
+                        .unwrap_or(true);
+                    awaiting_ack && not_expired
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    /// Remove expired HOLD states.
+    pub fn purge_expired_active_holds(&self) -> usize {
+        let now = Utc::now();
+        let expired: Vec<String> = self
+            .active_holds
+            .iter()
+            .filter(|entry| *entry.value() <= now)
+            .map(|entry| entry.key().clone())
+            .collect();
+        for drone_id in &expired {
+            self.active_holds.remove(drone_id);
+        }
+        expired.len()
     }
     
     /// Purge expired commands from all queues.
     /// Should be called periodically (e.g., from conflict loop).
-    pub fn purge_expired_commands(&self) -> usize {
+    pub async fn purge_expired_commands(&self) -> Result<usize> {
         let now = chrono::Utc::now();
         let mut purged_count = 0;
+        let mut stale_count = 0;
+        let mut stale_drone_ids: HashSet<String> = HashSet::new();
+        let ack_timeout = self.config.command_ack_timeout_secs;
+        let waiting_for_ack = |cmd: &Command| {
+            if cmd.acknowledged {
+                return false;
+            }
+            if ack_timeout <= 0 {
+                return true;
+            }
+            cmd.issued_at + ChronoDuration::seconds(ack_timeout) > now
+        };
         
         for mut entry in self.commands.iter_mut() {
             let queue = entry.value_mut();
             let before_len = queue.len();
             queue.retain(|cmd| {
                 // Keep if no expiry or not yet expired
-                cmd.expires_at
+                let not_expired = cmd.expires_at
                     .map(|exp| exp > now)
-                    .unwrap_or(true)
+                    .unwrap_or(true);
+                let awaiting_ack = waiting_for_ack(cmd);
+                if not_expired && !awaiting_ack && !cmd.acknowledged {
+                    stale_count += 1;
+                    stale_drone_ids.insert(cmd.drone_id.clone());
+                }
+                not_expired && awaiting_ack
             });
             purged_count += before_len - queue.len();
+        }
+
+        for drone_id in stale_drone_ids {
+            self.command_cooldowns.remove(&drone_id);
         }
         
         if purged_count > 0 {
             tracing::debug!("Purged {} expired commands", purged_count);
-            self.spawn_db_task("delete_expired_commands", move |db| async move {
+            if let Some(db) = self.database.clone() {
                 commands_db::delete_expired_commands(db.pool())
                     .await
-                    .map(|_| ())
-            });
+                    .map(|_| ())?;
+            }
         }
-        purged_count
+        if stale_count > 0 {
+            if let Some(db) = self.database.clone() {
+                commands_db::delete_stale_commands(db.pool(), ack_timeout)
+                    .await
+                    .map(|_| ())?;
+            }
+        }
+        Ok(purged_count)
     }
 
-    /// Get and remove the next pending command for a drone.
-    #[allow(dead_code)] // Will be used by SDK clients polling for commands
-    pub fn pop_command(&self, drone_id: &str) -> Option<Command> {
-        self.commands
-            .get_mut(drone_id)
-            .and_then(|mut queue| queue.pop_front())
+    fn command_waiting_for_ack(&self, cmd: &Command, now: DateTime<Utc>) -> bool {
+        if cmd.acknowledged {
+            return false;
+        }
+        let ack_timeout = self.config.command_ack_timeout_secs;
+        if ack_timeout <= 0 {
+            return true;
+        }
+        cmd.issued_at + ChronoDuration::seconds(ack_timeout) > now
     }
 
     /// Acknowledge a command by ID (removes it from queue).
-    pub fn ack_command(&self, command_id: &str) -> bool {
+    pub async fn ack_command(&self, command_id: &str) -> Result<bool> {
+        let command = match self.find_command(command_id) {
+            Some(command) => command,
+            None => return Ok(false),
+        };
+
+        if let Some(db) = self.database.clone() {
+            commands_db::ack_command(db.pool(), command_id).await?;
+        }
+
+        let removed = self.remove_command_by_id(command_id);
+        let command_to_apply = removed.as_ref().unwrap_or(&command);
+        self.apply_command_ack_effects(command_to_apply);
+
+        Ok(true)
+    }
+
+    fn find_command(&self, command_id: &str) -> Option<Command> {
+        for entry in self.commands.iter() {
+            if let Some(cmd) = entry.value().iter().find(|cmd| cmd.command_id == command_id) {
+                return Some(cmd.clone());
+            }
+        }
+        None
+    }
+
+    fn remove_command_by_id(&self, command_id: &str) -> Option<Command> {
         for mut entry in self.commands.iter_mut() {
             let queue = entry.value_mut();
             if let Some(pos) = queue.iter().position(|c| c.command_id == command_id) {
-                queue.remove(pos);
-                let command_id = command_id.to_string();
-                self.spawn_db_task("ack_command", move |db| async move {
-                    commands_db::ack_command(db.pool(), &command_id)
-                        .await
-                        .map(|_| ())
-                });
-                return true;
+                return queue.remove(pos);
             }
         }
-        false
+        None
+    }
+
+    fn apply_command_ack_effects(&self, command: &Command) {
+        match command.command_type {
+            atc_core::models::CommandType::Hold { duration_secs } => {
+                let now = Utc::now();
+                let mut hold_until = now + ChronoDuration::seconds(duration_secs as i64);
+                if let Some(expires_at) = command.expires_at {
+                    if expires_at < hold_until {
+                        hold_until = expires_at;
+                    }
+                }
+                if hold_until > now {
+                    self.active_holds.insert(command.drone_id.clone(), hold_until);
+                }
+            }
+            atc_core::models::CommandType::Resume => {
+                self.active_holds.remove(&command.drone_id);
+            }
+            _ => {}
+        }
     }
 
     /// Get all pending commands (for debugging/UI).
@@ -691,12 +1021,12 @@ impl AppState {
     // ========== GEOFENCE METHODS ==========
 
     /// Add a geofence.
-    pub fn add_geofence(&self, geofence: Geofence) {
-        let geofence_clone = geofence.clone();
+    pub async fn add_geofence(&self, geofence: Geofence) -> Result<()> {
+        if let Some(db) = self.database.clone() {
+            geofences_db::upsert_geofence(db.pool(), &geofence).await?;
+        }
         self.geofences.insert(geofence.id.clone(), geofence);
-        self.spawn_db_task("upsert_geofence", move |db| async move {
-            geofences_db::upsert_geofence(db.pool(), &geofence_clone).await
-        });
+        Ok(())
     }
 
     /// Replace external geofences from Blender/DSS.
@@ -767,21 +1097,19 @@ impl AppState {
     }
 
     /// Remove a geofence by ID.
-    pub fn remove_geofence(&self, id: &str) -> bool {
-        let removed = self.geofences.remove(id).is_some();
-        if removed {
-            let geofence_id = id.to_string();
-            self.spawn_db_task("delete_geofence", move |db| async move {
-                geofences_db::delete_geofence(db.pool(), &geofence_id)
-                    .await
-                    .map(|_| ())
-            });
+    pub async fn remove_geofence(&self, id: &str) -> Result<bool> {
+        if !self.geofences.contains_key(id) {
+            return Ok(false);
         }
-        removed
+        if let Some(db) = self.database.clone() {
+            geofences_db::delete_geofence(db.pool(), id)
+                .await
+                .map(|_| ())?;
+        }
+        Ok(self.geofences.remove(id).is_some())
     }
 
     /// Check if a point is inside any active geofence.
-    #[allow(dead_code)] // Will be used for routing avoidance
     pub fn check_point_in_geofences(&self, lat: f64, lon: f64, altitude_m: f64) -> Vec<String> {
         self.geofences
             .iter()
@@ -795,7 +1123,11 @@ impl AppState {
 
     /// Clear all state for demo reset.
     /// This removes all drones, conflicts, commands, flight plans, and geofences.
-    pub fn clear_all(&self) {
+    pub async fn clear_all(&self) -> Result<()> {
+        if let Some(db) = self.database.clone() {
+            db_persistence::clear_all(db.pool()).await?;
+        }
+
         self.drones.clear();
         self.drone_owners.clear();
         self.drone_tokens.clear();
@@ -803,13 +1135,17 @@ impl AppState {
         self.conflicts.clear();
         self.commands.clear();
         self.command_cooldowns.clear();
+        self.active_holds.clear();
         self.flight_plans.clear();
         self.geofences.clear();
         self.external_geofences.clear();
         self.conflict_geofences.clear();
         self.conformance.clear();
         self.daa_advisories.clear();
-        
+        if let Ok(mut guard) = self.telemetry_overflow.lock() {
+            guard.clear();
+        }
+
         // Reset the conflict detector
         if let Ok(mut detector) = self.detector.lock() {
             *detector = ConflictDetector::new(
@@ -819,14 +1155,11 @@ impl AppState {
                 self.rules.warning_multiplier,
             );
         }
-        
+
         // Reset drone counter
         self.drone_counter.store(1, Ordering::SeqCst);
 
-        self.spawn_db_task("clear_all", move |db| async move {
-            db_persistence::clear_all(db.pool()).await
-        });
-
         tracing::info!("All state cleared for demo reset");
+        Ok(())
     }
 }

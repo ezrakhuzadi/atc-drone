@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Observation sent to Flight Blender.
@@ -28,14 +28,6 @@ struct ObservationMetadata {
 #[derive(Debug, Serialize)]
 struct ObservationRequest {
     observations: Vec<Observation>,
-}
-
-/// Response from Flight Blender API.
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)] // Reserved for future response parsing
-pub struct BlenderResponse {
-    #[serde(default)]
-    pub message: Option<String>,
 }
 
 /// HTTP client for sending telemetry to Flight Blender.

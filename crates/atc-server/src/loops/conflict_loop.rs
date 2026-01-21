@@ -12,6 +12,7 @@ use tokio::time::interval;
 use chrono::{Duration as ChronoDuration, Utc};
 
 use crate::config::Config;
+use crate::blender_auth::BlenderAuthManager;
 use crate::route_planner::plan_airborne_route;
 use crate::state::AppState;
 use atc_blender::{BlenderClient, conflict_payload, conflict_to_geofence};
@@ -27,6 +28,7 @@ const COMMAND_COOLDOWN_SECS: u64 = 60;
 const CONFLICT_TTL_SECS: i64 = 3600;
 const CONFLICT_REFRESH_GRACE_SECS: i64 = 300;
 const FAILSAFE_HOLD_SECS: u32 = 120;
+const RESOLUTION_COOLDOWN_SECS: i64 = 120;
 
 struct BlenderConflictState {
     blender_id: String,
@@ -42,12 +44,14 @@ pub async fn run_conflict_loop(
     let mut ticker = interval(Duration::from_secs(1));
 
     // Create Blender client for geofence sync
-    let blender = BlenderClient::new(
+    let auth = BlenderAuthManager::new(&config);
+    let mut blender = BlenderClient::new(
         &config.blender_url,
         &config.blender_session_id,
         &config.blender_auth_token,
     );
     let mut tracked_conflicts: HashMap<String, BlenderConflictState> = HashMap::new();
+    let mut resolution_cooldowns: HashMap<String, i64> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -56,6 +60,9 @@ pub async fn run_conflict_loop(
                 break;
             }
             _ = ticker.tick() => {
+                if let Err(err) = auth.apply(&mut blender).await {
+                    tracing::warn!("Conflict loop Blender auth refresh failed: {}", err);
+                }
                 // Check for timed-out drones first
                 let lost_drones = state.check_timeouts();
                 for drone_id in &lost_drones {
@@ -70,17 +77,25 @@ pub async fn run_conflict_loop(
                             expires_at: Some(now + ChronoDuration::seconds(FAILSAFE_HOLD_SECS as i64)),
                             acknowledged: false,
                         };
-                        state.enqueue_command(cmd);
-                        state.mark_command_issued(drone_id);
-                        tracing::warn!("Failsafe HOLD queued for lost drone {}", drone_id);
+                        if let Err(err) = state.enqueue_command(cmd).await {
+                            tracing::warn!("Failed to enqueue failsafe HOLD for {}: {}", drone_id, err);
+                        } else {
+                            state.mark_command_issued(drone_id);
+                            tracing::warn!("Failsafe HOLD queued for lost drone {}", drone_id);
+                        }
                     }
                 }
                 
                 // Purge expired commands to prevent them from hiding drones
-                state.purge_expired_commands();
+                if let Err(err) = state.purge_expired_commands().await {
+                    tracing::warn!("Failed to purge expired commands: {}", err);
+                }
+                state.purge_expired_active_holds();
+                state.refresh_conflicts();
 
                 let conflicts = state.get_conflicts();
                 let loop_now = Utc::now();
+                resolution_cooldowns.retain(|_, expires_at| *expires_at > loop_now.timestamp());
                 state.purge_conflict_geofences(loop_now.timestamp());
                 let refresh_deadline = loop_now.timestamp() + CONFLICT_REFRESH_GRACE_SECS;
                 let mut active_daa_ids: HashSet<String> = HashSet::new();
@@ -114,7 +129,12 @@ pub async fn run_conflict_loop(
                 let mut geofences = Vec::with_capacity(conflicts.len());
                 let mut active_conflict_ids: HashSet<String> = HashSet::new();
                 for conflict in &conflicts {
-                    let conflict_key = format!("{}-{}", conflict.drone1_id, conflict.drone2_id);
+                    let (id_a, id_b) = if conflict.drone1_id < conflict.drone2_id {
+                        (&conflict.drone1_id, &conflict.drone2_id)
+                    } else {
+                        (&conflict.drone2_id, &conflict.drone1_id)
+                    };
+                    let conflict_key = format!("{}-{}", id_a, id_b);
                     let now = Utc::now();
                     // Find drone positions
                     let drone1 = drones.iter().find(|d| d.drone_id == conflict.drone1_id);
@@ -202,12 +222,20 @@ pub async fn run_conflict_loop(
 
                         let drone1_external = drone1.is_none() && external1.is_some();
                         let drone2_external = drone2.is_none() && external2.is_some();
+                        let resolution_ready = resolution_cooldowns
+                            .get(&conflict_key)
+                            .map(|expires_at| *expires_at <= now.timestamp())
+                            .unwrap_or(true);
+
                         if drone1_external ^ drone2_external {
                             let local_drone = if drone1_external { drone2 } else { drone1 };
                             let external = if drone1_external { external1 } else { external2 };
 
                             if let Some(gw) = local_drone {
                                 let give_way_id = gw.drone_id.clone();
+                                if !resolution_ready {
+                                    continue;
+                                }
                                 if state.can_issue_command(&give_way_id, COMMAND_COOLDOWN_SECS) {
                                     let conflict_point = Waypoint {
                                         lat: conflict.cpa_lat,
@@ -275,12 +303,23 @@ pub async fn run_conflict_loop(
                                         expires_at: Some(now + ChronoDuration::seconds(60)),
                                         acknowledged: false,
                                     };
-                                    state.enqueue_command(cmd);
-                                    state.mark_command_issued(&give_way_id);
-                                    tracing::info!(
-                                        "Auto-issued REROUTE to {} due to external traffic",
-                                        give_way_id
-                                    );
+                                    if let Err(err) = state.enqueue_command(cmd).await {
+                                        tracing::warn!(
+                                            "Failed to enqueue REROUTE for {}: {}",
+                                            give_way_id,
+                                            err
+                                        );
+                                    } else {
+                                        state.mark_command_issued(&give_way_id);
+                                        resolution_cooldowns.insert(
+                                            conflict_key.clone(),
+                                            now.timestamp() + RESOLUTION_COOLDOWN_SECS,
+                                        );
+                                        tracing::info!(
+                                            "Auto-issued REROUTE to {} due to external traffic",
+                                            give_way_id
+                                        );
+                                    }
                                 }
                             }
                             continue;
@@ -296,7 +335,7 @@ pub async fn run_conflict_loop(
                         let give_way_drone = if give_way_id == &conflict.drone1_id { drone1 } else { drone2 };
                         
                         // Only issue if we can find both drones and cooldown has passed
-                        if state.can_issue_command(give_way_id, COMMAND_COOLDOWN_SECS) {
+                        if resolution_ready && state.can_issue_command(give_way_id, COMMAND_COOLDOWN_SECS) {
                             if let (Some(gw), Some(pri)) = (give_way_drone, priority_drone) {
                                 // === HOLD-AWARE LOGIC ===
                                 // If the priority drone is holding/rerouting, check if it's actually blocking
@@ -416,14 +455,25 @@ pub async fn run_conflict_loop(
                                     expires_at: Some(now + ChronoDuration::seconds(60)),
                                     acknowledged: false,
                                 };
-                                state.enqueue_command(cmd);
-                                state.mark_command_issued(give_way_id);
-                                tracing::info!(
-                                    "Auto-issued REROUTE ({:?}) to {} (gives way to {})", 
-                                    avoidance_type,
-                                    give_way_id,
-                                    if give_way_id == &conflict.drone1_id { &conflict.drone2_id } else { &conflict.drone1_id }
-                                );
+                                if let Err(err) = state.enqueue_command(cmd).await {
+                                    tracing::warn!(
+                                        "Failed to enqueue REROUTE for {}: {}",
+                                        give_way_id,
+                                        err
+                                    );
+                                } else {
+                                    state.mark_command_issued(give_way_id);
+                                    resolution_cooldowns.insert(
+                                        conflict_key.clone(),
+                                        now.timestamp() + RESOLUTION_COOLDOWN_SECS,
+                                    );
+                                    tracing::info!(
+                                        "Auto-issued REROUTE ({:?}) to {} (gives way to {})",
+                                        avoidance_type,
+                                        give_way_id,
+                                        if give_way_id == &conflict.drone1_id { &conflict.drone2_id } else { &conflict.drone1_id }
+                                    );
+                                }
                             } else {
                                 // Fallback: issue HOLD if we can't compute reroute
                                 let cmd = Command {
@@ -434,9 +484,20 @@ pub async fn run_conflict_loop(
                                     expires_at: Some(now + ChronoDuration::seconds(30)),
                                     acknowledged: false,
                                 };
-                                state.enqueue_command(cmd);
-                                state.mark_command_issued(give_way_id);
-                                tracing::info!("Fallback: issued HOLD to {}", give_way_id);
+                                if let Err(err) = state.enqueue_command(cmd).await {
+                                    tracing::warn!(
+                                        "Failed to enqueue fallback HOLD for {}: {}",
+                                        give_way_id,
+                                        err
+                                    );
+                                } else {
+                                    state.mark_command_issued(give_way_id);
+                                    resolution_cooldowns.insert(
+                                        conflict_key.clone(),
+                                        now.timestamp() + RESOLUTION_COOLDOWN_SECS,
+                                    );
+                                    tracing::info!("Fallback: issued HOLD to {}", give_way_id);
+                                }
                             }
                         }
                     }

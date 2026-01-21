@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use atc_core::{Conflict, ConflictSeverity};
+use atc_core::spatial::offset_by_bearing;
 use chrono::{Duration as ChronoDuration, Utc};
 use serde::Serialize;
 use serde_json::Value;
@@ -86,12 +87,10 @@ fn generate_circle_polygon(center_lat: f64, center_lon: f64, radius_m: f64) -> V
     for i in 0..=NUM_POINTS {
         let angle = 2.0 * PI * (i as f64) / (NUM_POINTS as f64);
         
-        // Convert radius from meters to degrees (approximate)
-        let lat_offset = (radius_m / 111_320.0) * angle.cos();
-        let lon_offset = (radius_m / (111_320.0 * center_lat.to_radians().cos())) * angle.sin();
-        
+        let (lat, lon) = offset_by_bearing(center_lat, center_lon, radius_m, angle);
+
         // GeoJSON uses [lon, lat] order!
-        coords.push([center_lon + lon_offset, center_lat + lat_offset]);
+        coords.push([lon, lat]);
     }
     
     coords

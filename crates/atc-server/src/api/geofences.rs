@@ -12,6 +12,7 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use crate::state::AppState;
+use crate::altitude::altitude_to_amsl;
 use atc_core::{Geofence, GeofenceType, CreateGeofenceRequest, UpdateGeofenceRequest};
 
 /// Create a new geofence.
@@ -19,13 +20,24 @@ pub async fn create_geofence(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateGeofenceRequest>,
 ) -> Result<(StatusCode, Json<Geofence>), (StatusCode, Json<serde_json::Value>)> {
+    let config = state.config();
+    let lower_altitude_m = altitude_to_amsl(
+        req.lower_altitude_m.unwrap_or(0.0),
+        config.altitude_reference,
+        config.geoid_offset_m,
+    );
+    let upper_altitude_m = altitude_to_amsl(
+        req.upper_altitude_m.unwrap_or(120.0),
+        config.altitude_reference,
+        config.geoid_offset_m,
+    );
     let geofence = Geofence {
         id: Uuid::new_v4().to_string(),
         name: req.name,
         geofence_type: req.geofence_type,
         polygon: req.polygon,
-        lower_altitude_m: req.lower_altitude_m.unwrap_or(0.0),
-        upper_altitude_m: req.upper_altitude_m.unwrap_or(120.0), // Default 120m ceiling
+        lower_altitude_m,
+        upper_altitude_m, // Default 120m ceiling
         active: true,
         created_at: Utc::now(),
     };
@@ -42,7 +54,16 @@ pub async fn create_geofence(
         ));
     }
     
-    state.add_geofence(geofence.clone());
+    if let Err(err) = state.add_geofence(geofence.clone()).await {
+        tracing::error!("Failed to persist geofence {}: {}", geofence.id, err);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "Failed to create geofence",
+                "id": geofence.id
+            }))
+        ));
+    }
     tracing::info!("Created geofence '{}' ({})", geofence.name, geofence.id);
     
     Ok((StatusCode::CREATED, Json(geofence)))
@@ -94,6 +115,7 @@ pub async fn update_geofence(
         }
     };
 
+    let config = state.config();
     if let Some(name) = req.name {
         geofence.name = name;
     }
@@ -104,10 +126,18 @@ pub async fn update_geofence(
         geofence.polygon = polygon;
     }
     if let Some(lower_altitude_m) = req.lower_altitude_m {
-        geofence.lower_altitude_m = lower_altitude_m;
+        geofence.lower_altitude_m = altitude_to_amsl(
+            lower_altitude_m,
+            config.altitude_reference,
+            config.geoid_offset_m,
+        );
     }
     if let Some(upper_altitude_m) = req.upper_altitude_m {
-        geofence.upper_altitude_m = upper_altitude_m;
+        geofence.upper_altitude_m = altitude_to_amsl(
+            upper_altitude_m,
+            config.altitude_reference,
+            config.geoid_offset_m,
+        );
     }
     if let Some(active) = req.active {
         geofence.active = active;
@@ -124,7 +154,16 @@ pub async fn update_geofence(
         ));
     }
 
-    state.add_geofence(geofence.clone());
+    if let Err(err) = state.add_geofence(geofence.clone()).await {
+        tracing::error!("Failed to persist geofence {}: {}", geofence.id, err);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "Failed to update geofence",
+                "id": geofence.id
+            }))
+        ));
+    }
     tracing::info!("Updated geofence '{}' ({})", geofence.name, geofence.id);
 
     Ok(Json(geofence))
@@ -139,11 +178,16 @@ pub async fn delete_geofence(
         return StatusCode::FORBIDDEN;
     }
 
-    if state.remove_geofence(&id) {
-        tracing::info!("Deleted geofence {}", id);
-        StatusCode::NO_CONTENT
-    } else {
-        StatusCode::NOT_FOUND
+    match state.remove_geofence(&id).await {
+        Ok(true) => {
+            tracing::info!("Deleted geofence {}", id);
+            StatusCode::NO_CONTENT
+        }
+        Ok(false) => StatusCode::NOT_FOUND,
+        Err(err) => {
+            tracing::error!("Failed to delete geofence {}: {}", id, err);
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
     }
 }
 
@@ -165,15 +209,15 @@ pub async fn check_point(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<PointCheckQuery>,
 ) -> Json<PointCheckResponse> {
-    let altitude = query.altitude_m.unwrap_or(50.0);
-    let geofences = state.get_geofences();
-    
-    let matching: Vec<String> = geofences
-        .iter()
-        .filter(|g| g.active && g.contains_point(query.lat, query.lon, altitude))
-        .map(|g| g.id.clone())
-        .collect();
-    
+    let config = state.config();
+    let altitude = altitude_to_amsl(
+        query.altitude_m.unwrap_or(50.0),
+        config.altitude_reference,
+        config.geoid_offset_m,
+    );
+
+    let matching = state.check_point_in_geofences(query.lat, query.lon, altitude);
+
     Json(PointCheckResponse {
         inside_geofence: !matching.is_empty(),
         geofence_ids: matching,
@@ -203,13 +247,26 @@ pub async fn check_route(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RouteCheckRequest>,
 ) -> Json<RouteCheckResponse> {
+    let config = state.config();
+    let waypoints: Vec<atc_core::Waypoint> = req
+        .waypoints
+        .into_iter()
+        .map(|wp| atc_core::Waypoint {
+            altitude_m: altitude_to_amsl(
+                wp.altitude_m,
+                config.altitude_reference,
+                config.geoid_offset_m,
+            ),
+            ..wp
+        })
+        .collect();
     let geofences = state.get_geofences();
     let mut conflicts = Vec::new();
     
     // Check each segment of the route against all active geofences
-    for i in 0..req.waypoints.len().saturating_sub(1) {
-        let wp1 = &req.waypoints[i];
-        let wp2 = &req.waypoints[i + 1];
+    for i in 0..waypoints.len().saturating_sub(1) {
+        let wp1 = &waypoints[i];
+        let wp2 = &waypoints[i + 1];
         
         for geofence in geofences
             .iter()

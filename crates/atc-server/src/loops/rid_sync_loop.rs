@@ -13,6 +13,7 @@ use tokio::sync::broadcast;
 use tokio::time::interval;
 
 use atc_blender::BlenderClient;
+use crate::blender_auth::BlenderAuthManager;
 use crate::config::Config;
 use crate::state::{AppState, ExternalTraffic};
 
@@ -26,7 +27,8 @@ pub async fn run_rid_loop(
     config: Config,
     mut shutdown: broadcast::Receiver<()>,
 ) {
-    let blender = BlenderClient::new(
+    let auth = BlenderAuthManager::new(&config);
+    let mut blender = BlenderClient::new(
         &config.blender_url,
         &config.blender_session_id,
         &config.blender_auth_token,
@@ -46,6 +48,10 @@ pub async fn run_rid_loop(
                 break;
             }
             _ = ticker.tick() => {
+                if let Err(err) = auth.apply(&mut blender).await {
+                    tracing::warn!("RID sync Blender auth refresh failed: {}", err);
+                    continue;
+                }
                 let current_view = state.get_rid_view_bbox();
                 if current_view != last_view {
                     last_view = current_view.clone();

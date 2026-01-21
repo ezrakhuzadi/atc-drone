@@ -24,6 +24,8 @@ pub async fn clear_all(pool: &SqlitePool) -> Result<()> {
     sqlx::query("DELETE FROM commands").execute(&mut *tx).await?;
     sqlx::query("DELETE FROM flight_plans").execute(&mut *tx).await?;
     sqlx::query("DELETE FROM geofences").execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM geofence_sync_state").execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM drone_tokens").execute(&mut *tx).await?;
     sqlx::query("DELETE FROM drones").execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())

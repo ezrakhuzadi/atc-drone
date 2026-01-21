@@ -1,14 +1,15 @@
 //! Authentication middleware for protected endpoints.
 
 use axum::{
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
     http::{header, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
 };
 use axum::http::HeaderMap;
-use std::sync::Arc;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 
 use crate::state::AppState;
 
@@ -73,16 +74,22 @@ use std::time::Instant;
 #[derive(Clone)]
 pub struct RateLimiter {
     requests: Arc<DashMap<String, Vec<Instant>>>,
+    last_cleanup: Arc<Mutex<Instant>>,
+    cleanup_interval: std::time::Duration,
     max_rps: u32,
     enabled: bool,
+    trust_proxy: bool,
 }
 
 impl RateLimiter {
-    pub fn new(max_rps: u32, enabled: bool) -> Self {
+    pub fn new(max_rps: u32, enabled: bool, trust_proxy: bool) -> Self {
         Self {
             requests: Arc::new(DashMap::new()),
+            last_cleanup: Arc::new(Mutex::new(Instant::now())),
+            cleanup_interval: std::time::Duration::from_secs(60),
             max_rps,
             enabled,
+            trust_proxy,
         }
     }
 
@@ -94,6 +101,21 @@ impl RateLimiter {
         
         let now = Instant::now();
         let window = std::time::Duration::from_secs(1);
+        let do_cleanup = {
+            let mut last_cleanup = self
+                .last_cleanup
+                .lock()
+                .expect("Rate limiter cleanup lock poisoned");
+            if now.duration_since(*last_cleanup) >= self.cleanup_interval {
+                *last_cleanup = now;
+                true
+            } else {
+                false
+            }
+        };
+        if do_cleanup {
+            self.purge_stale_entries(now, window);
+        }
         
         let mut entry = self.requests.entry(ip.to_string()).or_default();
         let timestamps = entry.value_mut();
@@ -108,6 +130,18 @@ impl RateLimiter {
             false
         }
     }
+
+    fn purge_stale_entries(&self, now: Instant, window: std::time::Duration) {
+        let stale: Vec<String> = self
+            .requests
+            .iter()
+            .filter(|entry| entry.value().iter().all(|t| now.duration_since(*t) >= window))
+            .map(|entry| entry.key().clone())
+            .collect();
+        for ip in stale {
+            self.requests.remove(&ip);
+        }
+    }
 }
 
 /// Rate limiting middleware for telemetry endpoint.
@@ -116,13 +150,23 @@ pub async fn rate_limit(
     request: Request,
     next: Next,
 ) -> Response {
-    // Extract IP from request (X-Forwarded-For or socket addr)
-    let ip = request
-        .headers()
-        .get("X-Forwarded-For")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').next().unwrap_or("unknown").trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+    // Extract IP from request (socket addr, optionally X-Forwarded-For if trusted)
+    let ip = if limiter.trust_proxy {
+        request
+            .headers()
+            .get("X-Forwarded-For")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.split(',').next().unwrap_or("unknown").trim().to_string())
+    } else {
+        None
+    }
+    .or_else(|| {
+        request
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|info| info.0.ip().to_string())
+    })
+    .unwrap_or_else(|| "unknown".to_string());
 
     if limiter.check(&ip) {
         next.run(request).await
