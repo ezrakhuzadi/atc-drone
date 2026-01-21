@@ -1,12 +1,20 @@
-use crate::state::store::AppState;
-use crate::compliance::{self, ComplianceEvaluation, RoutePoint};
 use crate::altitude::altitude_to_amsl;
-use crate::config::Config;
 use crate::blender_auth::BlenderAuthManager;
-use atc_core::models::{FlightPlan, FlightPlanMetadata, FlightPlanRequest, FlightStatus, GeofenceType, TrajectoryPoint, Waypoint};
+use crate::compliance::{self, ComplianceEvaluation, RoutePoint};
+use crate::config::Config;
+use crate::state::store::AppState;
 use atc_blender::BlenderClient;
+use atc_core::models::{
+    FlightPlan, FlightPlanMetadata, FlightPlanRequest, FlightStatus, GeofenceType, TrajectoryPoint,
+    Waypoint,
+};
 use atc_core::routing::generate_random_route;
-use axum::{extract::{State, Query}, http::StatusCode, response::IntoResponse, Json};
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::json;
@@ -90,7 +98,11 @@ pub async fn create_flight_plan(
     Json(payload): Json<FlightPlanRequest>,
 ) -> Result<(StatusCode, Json<FlightPlan>), (StatusCode, Json<serde_json::Value>)> {
     let mut payload = payload;
-    enforce_owner_for_drone(state.as_ref(), &payload.drone_id, payload.owner_id.as_deref())?;
+    enforce_owner_for_drone(
+        state.as_ref(),
+        &payload.drone_id,
+        payload.owner_id.as_deref(),
+    )?;
     normalize_flight_plan_request(&mut payload, state.config());
     let validation = validate_flight_plan(state.as_ref(), &payload).await;
     if !validation.violations.is_empty() {
@@ -103,15 +115,17 @@ pub async fn create_flight_plan(
         ));
     }
     apply_compliance_metadata(&mut payload.metadata, validation.compliance.as_ref());
-    let plan = build_plan(state.as_ref(), payload, None).await.map_err(|err| {
-        tracing::error!("Failed to persist flight plan: {}", err);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "error": "Failed to persist flight plan"
-            })),
-        )
-    })?;
+    let plan = build_plan(state.as_ref(), payload, None)
+        .await
+        .map_err(|err| {
+            tracing::error!("Failed to persist flight plan: {}", err);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "Failed to persist flight plan"
+                })),
+            )
+        })?;
     Ok((StatusCode::CREATED, Json(plan)))
 }
 
@@ -128,7 +142,11 @@ pub(crate) async fn create_flight_plan_compat(
     };
 
     if requires_trajectory {
-        let trajectory_len = request.trajectory_log.as_ref().map(|log| log.len()).unwrap_or(0);
+        let trajectory_len = request
+            .trajectory_log
+            .as_ref()
+            .map(|log| log.len())
+            .unwrap_or(0);
         if trajectory_len < 2 {
             return Err((
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -143,7 +161,11 @@ pub(crate) async fn create_flight_plan_compat(
         }
     }
 
-    enforce_owner_for_drone(state.as_ref(), &request.drone_id, request.owner_id.as_deref())?;
+    enforce_owner_for_drone(
+        state.as_ref(),
+        &request.drone_id,
+        request.owner_id.as_deref(),
+    )?;
     normalize_flight_plan_request(&mut request, state.config());
     let validation = validate_flight_plan(state.as_ref(), &request).await;
     if !validation.violations.is_empty() {
@@ -156,15 +178,17 @@ pub(crate) async fn create_flight_plan_compat(
         ));
     }
     apply_compliance_metadata(&mut request.metadata, validation.compliance.as_ref());
-    let plan = build_plan(state.as_ref(), request, requested_flight_id).await.map_err(|err| {
-        tracing::error!("Failed to persist flight plan: {}", err);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "error": "Failed to persist flight plan"
-            })),
-        )
-    })?;
+    let plan = build_plan(state.as_ref(), request, requested_flight_id)
+        .await
+        .map_err(|err| {
+            tracing::error!("Failed to persist flight plan: {}", err);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "Failed to persist flight plan"
+                })),
+            )
+        })?;
     Ok((StatusCode::CREATED, Json(plan)))
 }
 
@@ -373,7 +397,7 @@ async fn validate_flight_plan(state: &AppState, request: &FlightPlanRequest) -> 
             continue;
         }
 
-        if !( -90.0..=90.0).contains(&point.lat) || !( -180.0..=180.0).contains(&point.lon) {
+        if !(-90.0..=90.0).contains(&point.lat) || !(-180.0..=180.0).contains(&point.lon) {
             violations.push(json!({
                 "type": "coordinate",
                 "point_index": idx,
@@ -426,7 +450,10 @@ async fn validate_flight_plan(state: &AppState, request: &FlightPlanRequest) -> 
     for i in 0..points.len().saturating_sub(1) {
         let start = points[i];
         let end = points[i + 1];
-        for geofence in geofences.iter().filter(|g| g.active && g.geofence_type != GeofenceType::Advisory) {
+        for geofence in geofences
+            .iter()
+            .filter(|g| g.active && g.geofence_type != GeofenceType::Advisory)
+        {
             if geofence.intersects_segment(
                 start.lat,
                 start.lon,
@@ -564,7 +591,7 @@ fn apply_compliance_metadata(
     }
 }
 
-async fn build_plan(
+pub(crate) async fn build_plan(
     state: &AppState,
     payload: FlightPlanRequest,
     requested_flight_id: Option<String>,
@@ -582,6 +609,7 @@ async fn build_plan(
     } = payload;
     let departure = departure_time.unwrap_or_else(Utc::now);
     let mut metadata = metadata;
+    let _booking_guard = state.flight_plan_booking_lock().lock().await;
 
     // Gather existing active plans for deconfliction
     let existing_plans = state.get_flight_plans();
@@ -594,15 +622,15 @@ async fn build_plan(
 
     // Determine candidate routes
     let candidates = if let Some(wp) = waypoints {
-         // User provided specific route - wrap as single option
-         vec![atc_core::routing::RouteOption {
-             option_id: "user".to_string(),
-             name: "User Defined".to_string(),
-             description: "Custom route".to_string(),
-             waypoints: wp,
-             estimated_duration_secs: 0,
-             conflict_risk: atc_core::routing::ConflictRisk::High,
-         }]
+        // User provided specific route - wrap as single option
+        vec![atc_core::routing::RouteOption {
+            option_id: "user".to_string(),
+            name: "User Defined".to_string(),
+            description: "Custom route".to_string(),
+            waypoints: wp,
+            estimated_duration_secs: 0,
+            conflict_risk: atc_core::routing::ConflictRisk::High,
+        }]
     } else if let (Some(origin), Some(dest)) = (origin, destination) {
         atc_core::routing::generate_route_options(origin, dest, 50.0)
     } else {
@@ -620,47 +648,68 @@ async fn build_plan(
     // Select the first safe route
     let mut selected_waypoints = None;
     let mut flight_status = FlightStatus::Rejected;
-
     let mut selected_log: Option<Vec<TrajectoryPoint>> = None;
+    let mut selected_departure = departure;
 
-    for option in &candidates {
-        let candidate_log = resolve_candidate_trajectory(
-            &option.waypoints,
-            trajectory_log.as_ref(),
-            metadata.as_ref(),
-            has_custom_waypoints,
-        );
-        // Create a temp plan to test against
-        let test_plan = FlightPlan {
-            flight_id: flight_id.clone(),
-            drone_id: drone_id.clone(),
-            owner_id: owner_id.clone(),
-            waypoints: option.waypoints.clone(),
-            trajectory_log: candidate_log.clone(),
-            metadata: metadata.clone(),
-            status: FlightStatus::Pending,
-            departure_time: departure,
-            arrival_time: None,
-            created_at: Utc::now(),
-        };
+    let max_delay_secs = if state.config().strategic_scheduling_enabled {
+        state.config().strategic_max_delay_secs
+    } else {
+        0
+    };
+    let delay_step_secs = state.config().strategic_delay_step_secs.max(1);
 
-        let has_conflict = active_plans.iter().any(|existing| {
-            atc_core::spatial::check_plan_conflict(&test_plan, existing)
-        });
+    let mut delay_secs = 0u64;
+    'schedule: while delay_secs <= max_delay_secs {
+        let scheduled_departure = departure + chrono::Duration::seconds(delay_secs as i64);
+        for option in &candidates {
+            let candidate_log = resolve_candidate_trajectory(
+                &option.waypoints,
+                trajectory_log.as_ref(),
+                metadata.as_ref(),
+                has_custom_waypoints,
+            );
+            // Create a temp plan to test against
+            let test_plan = FlightPlan {
+                flight_id: flight_id.clone(),
+                drone_id: drone_id.clone(),
+                owner_id: owner_id.clone(),
+                waypoints: option.waypoints.clone(),
+                trajectory_log: candidate_log.clone(),
+                metadata: metadata.clone(),
+                status: FlightStatus::Pending,
+                departure_time: scheduled_departure,
+                arrival_time: None,
+                created_at: Utc::now(),
+            };
 
-        if !has_conflict {
-            selected_waypoints = Some(option.waypoints.clone());
-            selected_log = candidate_log;
-            flight_status = FlightStatus::Approved;
-            break; // Found a good one!
+            let has_conflict = active_plans.iter().any(|existing| {
+                atc_core::spatial::check_plan_conflict_with_rules(
+                    &test_plan,
+                    existing,
+                    state.rules(),
+                )
+            });
+
+            if !has_conflict {
+                selected_waypoints = Some(option.waypoints.clone());
+                selected_log = candidate_log;
+                selected_departure = scheduled_departure;
+                flight_status = FlightStatus::Approved;
+                break 'schedule; // Found earliest available slot!
+            }
         }
+
+        delay_secs = delay_secs.saturating_add(delay_step_secs);
     }
-    
+
     // If approved, use selected. If rejected, use first option (but mark rejected) or empty?
     // We should probably return the rejected plan so user sees why (or which path failed).
     let final_waypoints = selected_waypoints.unwrap_or_else(|| {
         // If rejected, just take the first candidate to show what failed
-        candidates.first().map(|c| c.waypoints.clone()).unwrap_or_default()
+        candidates
+            .first()
+            .map(|c| c.waypoints.clone())
+            .unwrap_or_default()
     });
     let final_log = selected_log.or_else(|| {
         resolve_candidate_trajectory(
@@ -678,7 +727,7 @@ async fn build_plan(
         &final_waypoints,
         final_log.as_ref(),
         metadata.as_ref(),
-        departure,
+        selected_departure,
     );
 
     let plan = FlightPlan {
@@ -689,11 +738,11 @@ async fn build_plan(
         trajectory_log: final_log,
         metadata,
         status: flight_status,
-        departure_time: departure,
+        departure_time: selected_departure,
         arrival_time,
         created_at: Utc::now(),
     };
-    
+
     state.add_flight_plan(plan.clone()).await?;
 
     Ok(plan)
@@ -736,7 +785,8 @@ pub async fn get_flight_plans(
 ) -> impl IntoResponse {
     let plans = state.get_flight_plans();
     if let Some(owner_id) = query.owner_id {
-        let owner_drone_ids: HashSet<String> = state.get_all_drones()
+        let owner_drone_ids: HashSet<String> = state
+            .get_all_drones()
             .into_iter()
             .filter(|drone| drone.owner_id.as_ref() == Some(&owner_id))
             .map(|drone| drone.drone_id)
@@ -776,7 +826,7 @@ fn estimate_arrival_time(
     if waypoints.len() < 2 {
         return None;
     }
-    
+
     // Calculate total route distance
     let total_distance_m = total_distance_from_waypoints(waypoints);
     let speed_mps = resolve_default_speed_mps(metadata);
@@ -785,7 +835,7 @@ fn estimate_arrival_time(
     } else {
         0.0
     };
-    
+
     Some(departure + chrono::Duration::milliseconds((duration_secs * 1000.0) as i64))
 }
 
@@ -1016,12 +1066,8 @@ fn total_distance_from_waypoints(waypoints: &[Waypoint]) -> f64 {
 fn total_distance_from_trajectory(log: &[TrajectoryPoint]) -> f64 {
     let mut total_distance_m = 0.0;
     for i in 0..log.len().saturating_sub(1) {
-        total_distance_m += haversine_distance(
-            log[i].lat,
-            log[i].lon,
-            log[i + 1].lat,
-            log[i + 1].lon,
-        );
+        total_distance_m +=
+            haversine_distance(log[i].lat, log[i].lon, log[i + 1].lat, log[i + 1].lon);
     }
     total_distance_m
 }

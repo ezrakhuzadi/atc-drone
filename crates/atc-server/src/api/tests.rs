@@ -1,3 +1,4 @@
+use atc_core::models::{FlightPlanMetadata, FlightPlanRequest, FlightStatus, Waypoint};
 use axum::{
     body::Body,
     http::{Request, StatusCode},
@@ -9,7 +10,7 @@ use tower::ServiceExt;
 
 use crate::{api, config::Config, persistence, state::AppState};
 
-async fn setup_app() -> (axum::Router, Arc<AppState>) {
+async fn setup_app_with(overrides: impl FnOnce(&mut Config)) -> (axum::Router, Arc<AppState>) {
     let mut config = Config::from_env();
     config.database_path = std::env::temp_dir()
         .join(format!("atc-test-{}.db", uuid::Uuid::new_v4()))
@@ -21,10 +22,9 @@ async fn setup_app() -> (axum::Router, Arc<AppState>) {
     config.allow_admin_reset = true;
     config.admin_token = "test-admin-token".to_string();
 
-    let db = persistence::init_database(
-        &config.database_path,
-        config.database_max_connections,
-    )
+    overrides(&mut config);
+
+    let db = persistence::init_database(&config.database_path, config.database_max_connections)
         .await
         .expect("init db");
     let state = Arc::new(AppState::with_database(db, config.clone()));
@@ -32,6 +32,10 @@ async fn setup_app() -> (axum::Router, Arc<AppState>) {
 
     let app = api::routes(&config).with_state(state.clone());
     (app, state)
+}
+
+async fn setup_app() -> (axum::Router, Arc<AppState>) {
+    setup_app_with(|_config| {}).await
 }
 
 async fn read_json(response: axum::response::Response) -> Value {
@@ -205,4 +209,81 @@ async fn admin_reset_requires_confirmation() {
 
     let reset_res = app.clone().oneshot(reset_req).await.unwrap();
     assert_eq!(reset_res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn strategic_scheduling_delays_conflicting_flight_plan() {
+    let (_app, state) = setup_app_with(|config| {
+        config.strategic_scheduling_enabled = true;
+        config.strategic_max_delay_secs = 30;
+        config.strategic_delay_step_secs = 1;
+    })
+    .await;
+
+    let departure = Utc::now() + chrono::Duration::seconds(60);
+    state
+        .register_drone("DRONE_A", None)
+        .await
+        .expect("register DRONE_A");
+    state
+        .register_drone("DRONE_B", None)
+        .await
+        .expect("register DRONE_B");
+    let waypoints = vec![
+        Waypoint {
+            lat: 33.0,
+            lon: -117.0,
+            altitude_m: 50.0,
+            speed_mps: None,
+        },
+        Waypoint {
+            lat: 33.0,
+            lon: -116.999,
+            altitude_m: 50.0,
+            speed_mps: None,
+        },
+    ];
+    let metadata = Some(FlightPlanMetadata {
+        drone_speed_mps: Some(10.0),
+        ..Default::default()
+    });
+
+    let plan1 = crate::api::flights::build_plan(
+        state.as_ref(),
+        FlightPlanRequest {
+            drone_id: "DRONE_A".to_string(),
+            owner_id: None,
+            waypoints: Some(waypoints.clone()),
+            trajectory_log: None,
+            metadata: metadata.clone(),
+            origin: None,
+            destination: None,
+            departure_time: Some(departure),
+        },
+        None,
+    )
+    .await
+    .expect("plan1");
+    assert_eq!(plan1.status, FlightStatus::Approved);
+    assert_eq!(plan1.departure_time, departure);
+
+    let plan2 = crate::api::flights::build_plan(
+        state.as_ref(),
+        FlightPlanRequest {
+            drone_id: "DRONE_B".to_string(),
+            owner_id: None,
+            waypoints: Some(waypoints.clone()),
+            trajectory_log: None,
+            metadata,
+            origin: None,
+            destination: None,
+            departure_time: Some(departure),
+        },
+        None,
+    )
+    .await
+    .expect("plan2");
+    assert_eq!(plan2.status, FlightStatus::Approved);
+    assert!(plan2.departure_time > departure);
+    assert!(plan2.departure_time <= departure + chrono::Duration::seconds(30));
 }

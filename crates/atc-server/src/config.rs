@@ -1,8 +1,8 @@
 //! Server configuration from environment.
 
-use std::env;
-use atc_core::rules::{AltitudeBand, SafetyRules};
 use crate::altitude::AltitudeReference;
+use atc_core::rules::{AltitudeBand, SafetyRules};
+use std::env;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -92,6 +92,12 @@ pub struct Config {
     pub tls_cert_path: Option<String>,
     pub tls_key_path: Option<String>,
     pub require_tls: bool,
+    /// Enable strategic flight plan scheduling (slotting) during plan creation.
+    pub strategic_scheduling_enabled: bool,
+    /// Maximum delay applied when searching for a conflict-free departure slot.
+    pub strategic_max_delay_secs: u64,
+    /// Increment used when searching for a conflict-free departure slot.
+    pub strategic_delay_step_secs: u64,
     pub rules_min_horizontal_separation_m: f64,
     pub rules_min_vertical_separation_m: f64,
     pub rules_lookahead_seconds: f64,
@@ -109,11 +115,11 @@ pub struct BlenderOAuthConfig {
     pub scope: Option<String>,
 }
 
-
 impl Config {
     pub fn from_env() -> Self {
-        let is_dev = env::var("ATC_ENV").unwrap_or_else(|_| "development".to_string()) == "development";
-        
+        let is_dev =
+            env::var("ATC_ENV").unwrap_or_else(|_| "development".to_string()) == "development";
+
         // Generate admin token if not provided
         let admin_token = env::var("ATC_ADMIN_TOKEN").unwrap_or_else(|_| {
             let token = uuid::Uuid::new_v4().to_string();
@@ -125,7 +131,7 @@ impl Config {
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
-        
+
         let default_rules = SafetyRules::default();
 
         Self {
@@ -401,6 +407,17 @@ impl Config {
             require_tls: env::var("ATC_REQUIRE_TLS")
                 .map(|v| v != "0" && v.to_lowercase() != "false")
                 .unwrap_or(!is_dev),
+            strategic_scheduling_enabled: env::var("ATC_STRATEGIC_SCHEDULING")
+                .map(|v| v != "0" && v.to_lowercase() != "false")
+                .unwrap_or(true),
+            strategic_max_delay_secs: env::var("ATC_STRATEGIC_MAX_DELAY_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(300),
+            strategic_delay_step_secs: env::var("ATC_STRATEGIC_DELAY_STEP_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5),
             rules_min_horizontal_separation_m: env::var("ATC_RULES_MIN_HORIZONTAL_SEPARATION_M")
                 .ok()
                 .and_then(|s| s.parse().ok())

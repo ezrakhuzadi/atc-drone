@@ -1,20 +1,29 @@
 //! In-memory state store using DashMap.
 
-use atc_core::models::{Command, DroneState, FlightPlan, Telemetry, Geofence, ConformanceStatus, DaaAdvisory, DroneStatus};
+use anyhow::Result;
+use atc_core::models::{
+    Command, ConformanceStatus, DaaAdvisory, DroneState, DroneStatus, FlightPlan, Geofence,
+    Telemetry,
+};
 use atc_core::rules::SafetyRules;
 use atc_core::{Conflict, ConflictDetector, DronePosition};
-use dashmap::DashMap;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{atomic::{AtomicU32, Ordering}, RwLock};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use anyhow::Result;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{
+    atomic::{AtomicU32, Ordering},
+    RwLock,
+};
 
-use tokio::sync::{broadcast, mpsc};
-use crate::persistence::{Database, commands as commands_db, drones as drones_db, flight_plans as flight_plans_db, geofences as geofences_db, drone_tokens as drone_tokens_db};
-use crate::persistence::db as db_persistence;
-use crate::config::Config;
 use crate::altitude::altitude_to_amsl;
+use crate::config::Config;
+use crate::persistence::db as db_persistence;
+use crate::persistence::{
+    commands as commands_db, drone_tokens as drone_tokens_db, drones as drones_db,
+    flight_plans as flight_plans_db, geofences as geofences_db, Database,
+};
+use tokio::sync::{broadcast, mpsc, Mutex};
 
 const TELEMETRY_QUEUE_DEPTH: usize = 4096;
 const DETECTOR_QUEUE_DEPTH: usize = 4096;
@@ -26,6 +35,7 @@ pub struct AppState {
     drone_tokens: DashMap<String, String>,
     external_traffic: DashMap<String, ExternalTraffic>,
     pub flight_plans: DashMap<String, FlightPlan>,
+    flight_plan_booking_lock: Mutex<()>,
     detector: std::sync::Mutex<ConflictDetector>,
     detector_tx: mpsc::Sender<DetectorUpdate>,
     detector_rx: std::sync::Mutex<mpsc::Receiver<DetectorUpdate>>,
@@ -88,8 +98,6 @@ enum DetectorUpdate {
 }
 
 impl AppState {
-
-    
     /// Create new AppState with database for persistence.
     pub fn with_database(db: Database, config: Config) -> Self {
         let rules = config.safety_rules();
@@ -100,14 +108,13 @@ impl AppState {
 
     /// Create new AppState with custom safety rules.
 
-
     /// Create new AppState with custom rules and config.
     pub fn with_rules_and_config(rules: SafetyRules, config: Config) -> Self {
         let (tx, _) = broadcast::channel(100);
         let (command_tx, _) = broadcast::channel(100);
         let (telemetry_tx, telemetry_rx) = mpsc::channel(TELEMETRY_QUEUE_DEPTH);
         let (detector_tx, detector_rx) = mpsc::channel(DETECTOR_QUEUE_DEPTH);
-        
+
         // Create detector with configurable thresholds from rules
         let detector = ConflictDetector::new(
             rules.lookahead_seconds,
@@ -115,13 +122,14 @@ impl AppState {
             rules.min_vertical_separation_m,
             rules.warning_multiplier,
         );
-        
+
         Self {
             drones: DashMap::new(),
             drone_owners: DashMap::new(),
             drone_tokens: DashMap::new(),
             external_traffic: DashMap::new(),
             flight_plans: DashMap::new(),
+            flight_plan_booking_lock: Mutex::new(()),
             detector: std::sync::Mutex::new(detector),
             detector_tx,
             detector_rx: std::sync::Mutex::new(detector_rx),
@@ -146,7 +154,7 @@ impl AppState {
             config,
         }
     }
-    
+
     /// Get database reference (if available).
     #[allow(dead_code)]
     pub fn database(&self) -> Option<&Database> {
@@ -213,7 +221,11 @@ impl AppState {
                         drone.lon,
                         drone.altitude_m,
                     )
-                    .with_velocity(drone.heading_deg, drone.speed_mps, drone.velocity_z),
+                    .with_velocity(
+                        drone.heading_deg,
+                        drone.speed_mps,
+                        drone.velocity_z,
+                    ),
                 );
             }
             self.update_conflicts_from_detector(&mut detector);
@@ -239,7 +251,8 @@ impl AppState {
 
         let tokens = drone_tokens_db::load_all_drone_tokens(&pool).await?;
         for token in tokens {
-            self.drone_tokens.insert(token.drone_id, token.session_token);
+            self.drone_tokens
+                .insert(token.drone_id, token.session_token);
         }
 
         Ok(())
@@ -287,6 +300,11 @@ impl AppState {
         &self.rules
     }
 
+    /// Serialize flight plan creation to avoid double-booking.
+    pub fn flight_plan_booking_lock(&self) -> &Mutex<()> {
+        &self.flight_plan_booking_lock
+    }
+
     /// Subscribe to command broadcasts (for WS streaming).
     pub fn subscribe_commands(&self) -> broadcast::Receiver<Command> {
         self.command_tx.subscribe()
@@ -320,7 +338,8 @@ impl AppState {
             }
         }
         if max_id > 0 {
-            self.drone_counter.store(max_id.saturating_add(1), Ordering::SeqCst);
+            self.drone_counter
+                .store(max_id.saturating_add(1), Ordering::SeqCst);
         }
     }
 
@@ -363,9 +382,11 @@ impl AppState {
         owner_id: Option<String>,
         token: Option<String>,
     ) -> Result<RegisterDroneOutcome> {
-        let owner_for_state = owner_id
-            .clone()
-            .or_else(|| self.drone_owners.get(drone_id).map(|entry| entry.value().clone()));
+        let owner_for_state = owner_id.clone().or_else(|| {
+            self.drone_owners
+                .get(drone_id)
+                .map(|entry| entry.value().clone())
+        });
         let now = Utc::now();
         let mut state_for_db = self
             .drones
@@ -562,7 +583,11 @@ impl AppState {
                 telemetry.lon,
                 telemetry.altitude_m,
             )
-            .with_velocity(telemetry.heading_deg, telemetry.speed_mps, telemetry.velocity_z),
+            .with_velocity(
+                telemetry.heading_deg,
+                telemetry.speed_mps,
+                telemetry.velocity_z,
+            ),
         ));
     }
 
@@ -580,28 +605,29 @@ impl AppState {
             self.config.altitude_reference,
             self.config.geoid_offset_m,
         );
-        self.external_traffic.insert(traffic_id.clone(), traffic.clone());
+        self.external_traffic
+            .insert(traffic_id.clone(), traffic.clone());
 
         self.queue_detector_update(DetectorUpdate::Upsert(
-            DronePosition::new(
-                &traffic_id,
-                traffic.lat,
-                traffic.lon,
-                traffic.altitude_m,
-            )
-            .with_velocity(traffic.heading_deg, traffic.speed_mps, 0.0),
+            DronePosition::new(&traffic_id, traffic.lat, traffic.lon, traffic.altitude_m)
+                .with_velocity(traffic.heading_deg, traffic.speed_mps, 0.0),
         ));
     }
 
     /// Get all external traffic tracks.
     pub fn get_external_traffic(&self) -> Vec<ExternalTraffic> {
-        self.external_traffic.iter().map(|r| r.value().clone()).collect()
+        self.external_traffic
+            .iter()
+            .map(|r| r.value().clone())
+            .collect()
     }
 
     /// Remove stale external tracks and purge them from the conflict detector.
     pub fn purge_external_traffic(&self, max_age_secs: i64) -> Vec<String> {
         let now = Utc::now();
-        let stale_ids: Vec<String> = self.external_traffic.iter()
+        let stale_ids: Vec<String> = self
+            .external_traffic
+            .iter()
             .filter_map(|entry| {
                 let age = (now - entry.last_update).num_seconds();
                 if age > max_age_secs {
@@ -663,19 +689,19 @@ impl AppState {
     pub fn check_timeouts(&self) -> Vec<String> {
         use atc_core::models::DroneStatus;
         use chrono::Utc;
-        
+
         let timeout_secs = self.rules.drone_timeout_secs as i64;
         let now = Utc::now();
         let mut lost_drones = Vec::new();
-        
+
         for mut entry in self.drones.iter_mut() {
             let drone = entry.value_mut();
-            
+
             // Skip if already marked lost or inactive
             if matches!(drone.status, DroneStatus::Lost | DroneStatus::Inactive) {
                 continue;
             }
-            
+
             // Check if last update is older than timeout
             let elapsed = (now - drone.last_update).num_seconds();
             if elapsed > timeout_secs {
@@ -684,7 +710,7 @@ impl AppState {
                 self.queue_detector_update(DetectorUpdate::Remove(drone.drone_id.clone()));
             }
         }
-        
+
         lost_drones
     }
 
@@ -723,14 +749,20 @@ impl AppState {
 
     /// Get all DAA advisories.
     pub fn get_daa_advisories(&self) -> Vec<DaaAdvisory> {
-        self.daa_advisories.iter().map(|r| r.value().clone()).collect()
+        self.daa_advisories
+            .iter()
+            .map(|r| r.value().clone())
+            .collect()
     }
-    
+
     /// Get all flight plans
     pub fn get_flight_plans(&self) -> Vec<FlightPlan> {
-        self.flight_plans.iter().map(|r| r.value().clone()).collect()
+        self.flight_plans
+            .iter()
+            .map(|r| r.value().clone())
+            .collect()
     }
-    
+
     /// Add or update a flight plan, persisting before updating in-memory state.
     pub async fn add_flight_plan(&self, plan: FlightPlan) -> Result<()> {
         let blender_linked = plan
@@ -779,7 +811,8 @@ impl AppState {
 
     /// Mark that a command was just issued (start cooldown).
     pub fn mark_command_issued(&self, drone_id: &str) {
-        self.command_cooldowns.insert(drone_id.to_string(), std::time::Instant::now());
+        self.command_cooldowns
+            .insert(drone_id.to_string(), std::time::Instant::now());
     }
 
     /// Get the next pending command for a drone (does not remove it).
@@ -816,16 +849,15 @@ impl AppState {
         if let Some(queue) = self.commands.get(drone_id) {
             queue.iter().any(|cmd| {
                 // Must be a control command (HOLD or REROUTE)
-                let is_control = matches!(cmd.command_type, 
-                    atc_core::models::CommandType::Hold { .. } | 
-                    atc_core::models::CommandType::Reroute { .. }
+                let is_control = matches!(
+                    cmd.command_type,
+                    atc_core::models::CommandType::Hold { .. }
+                        | atc_core::models::CommandType::Reroute { .. }
                 );
                 let awaiting_ack = self.command_waiting_for_ack(cmd, now);
                 // Must not be expired
-                let not_expired = cmd.expires_at
-                    .map(|exp| exp > now)
-                    .unwrap_or(true); // No expiry = never expires
-                
+                let not_expired = cmd.expires_at.map(|exp| exp > now).unwrap_or(true); // No expiry = never expires
+
                 is_control && awaiting_ack && not_expired
             })
         } else {
@@ -859,9 +891,7 @@ impl AppState {
             .map(|queue| {
                 queue.iter().any(|cmd| {
                     let awaiting_ack = self.command_waiting_for_ack(cmd, now);
-                    let not_expired = cmd.expires_at
-                        .map(|exp| exp > now)
-                        .unwrap_or(true);
+                    let not_expired = cmd.expires_at.map(|exp| exp > now).unwrap_or(true);
                     awaiting_ack && not_expired
                 })
             })
@@ -882,7 +912,7 @@ impl AppState {
         }
         expired.len()
     }
-    
+
     /// Purge expired commands from all queues.
     /// Should be called periodically (e.g., from conflict loop).
     pub async fn purge_expired_commands(&self) -> Result<usize> {
@@ -900,15 +930,13 @@ impl AppState {
             }
             cmd.issued_at + ChronoDuration::seconds(ack_timeout) > now
         };
-        
+
         for mut entry in self.commands.iter_mut() {
             let queue = entry.value_mut();
             let before_len = queue.len();
             queue.retain(|cmd| {
                 // Keep if no expiry or not yet expired
-                let not_expired = cmd.expires_at
-                    .map(|exp| exp > now)
-                    .unwrap_or(true);
+                let not_expired = cmd.expires_at.map(|exp| exp > now).unwrap_or(true);
                 let awaiting_ack = waiting_for_ack(cmd);
                 if not_expired && !awaiting_ack && !cmd.acknowledged {
                     stale_count += 1;
@@ -922,7 +950,7 @@ impl AppState {
         for drone_id in stale_drone_ids {
             self.command_cooldowns.remove(&drone_id);
         }
-        
+
         if purged_count > 0 {
             tracing::debug!("Purged {} expired commands", purged_count);
             if let Some(db) = self.database.clone() {
@@ -972,7 +1000,11 @@ impl AppState {
 
     fn find_command(&self, command_id: &str) -> Option<Command> {
         for entry in self.commands.iter() {
-            if let Some(cmd) = entry.value().iter().find(|cmd| cmd.command_id == command_id) {
+            if let Some(cmd) = entry
+                .value()
+                .iter()
+                .find(|cmd| cmd.command_id == command_id)
+            {
                 return Some(cmd.clone());
             }
         }
@@ -1000,7 +1032,8 @@ impl AppState {
                     }
                 }
                 if hold_until > now {
-                    self.active_holds.insert(command.drone_id.clone(), hold_until);
+                    self.active_holds
+                        .insert(command.drone_id.clone(), hold_until);
                 }
             }
             atc_core::models::CommandType::Resume => {
@@ -1033,7 +1066,8 @@ impl AppState {
     pub fn set_external_geofences(&self, geofences: Vec<Geofence>) {
         self.external_geofences.clear();
         for geofence in geofences {
-            self.external_geofences.insert(geofence.id.clone(), geofence);
+            self.external_geofences
+                .insert(geofence.id.clone(), geofence);
         }
     }
 
@@ -1072,8 +1106,6 @@ impl AppState {
     pub fn get_local_geofences(&self) -> Vec<Geofence> {
         self.geofences.iter().map(|e| e.value().clone()).collect()
     }
-
-
 
     /// Get all geofences.
     pub fn get_geofences(&self) -> Vec<Geofence> {
