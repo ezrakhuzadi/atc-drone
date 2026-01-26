@@ -105,6 +105,24 @@ pub async fn plan_route(
         };
     }
 
+    let max_waypoints = config.route_planner_max_waypoints;
+    if max_waypoints > 0 && request.waypoints.len() > max_waypoints {
+        return RoutePlanResponse {
+            ok: false,
+            waypoints: Vec::new(),
+            stats: None,
+            nodes_visited: 0,
+            optimized_points: 0,
+            sample_points: 0,
+            hazards: Vec::new(),
+            errors: vec![format!(
+                "too many waypoints ({} > max {})",
+                request.waypoints.len(),
+                max_waypoints
+            )],
+        };
+    }
+
     let mut validation_errors = Vec::new();
     for (idx, wp) in request.waypoints.iter().enumerate() {
         if !wp.lat.is_finite() || !wp.lon.is_finite() {
@@ -179,6 +197,26 @@ pub async fn plan_route(
     request.safety_buffer_m = clamp_opt(request.safety_buffer_m, 0.0, HARD_MAX_SAFETY_BUFFER_M);
     request.lane_expansion_step_m = clamp_opt(request.lane_expansion_step_m, 5.0, 2_000.0);
     let route_distance_total = route_distance_m(&request.waypoints);
+    let max_distance_m = config.route_planner_max_distance_m;
+    if max_distance_m.is_finite()
+        && max_distance_m > 0.0
+        && route_distance_total > max_distance_m + f64::EPSILON
+    {
+        return RoutePlanResponse {
+            ok: false,
+            waypoints: Vec::new(),
+            stats: None,
+            nodes_visited: 0,
+            optimized_points: 0,
+            sample_points: 0,
+            hazards: Vec::new(),
+            errors: vec![format!(
+                "route too long ({:.0}m > max {:.0}m)",
+                route_distance_total,
+                max_distance_m
+            )],
+        };
+    }
     if route_distance_total <= f64::EPSILON {
         return RoutePlanResponse {
             ok: false,

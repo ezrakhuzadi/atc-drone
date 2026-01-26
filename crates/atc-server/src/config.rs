@@ -75,6 +75,10 @@ pub struct Config {
     pub route_planner_building_min_height_m: f64,
     /// Minimum building levels included in route-planner obstacle queries.
     pub route_planner_building_min_levels: u32,
+    /// Hard cap on the number of waypoints accepted by the route planner (DoS protection).
+    pub route_planner_max_waypoints: usize,
+    /// Hard cap on the total route distance (meters) accepted by the route planner (DoS protection).
+    pub route_planner_max_distance_m: f64,
     pub altitude_reference: AltitudeReference,
     pub geoid_offset_m: f64,
     pub terrain_provider_url: String,
@@ -335,6 +339,15 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(15),
+            route_planner_max_waypoints: env::var("ATC_ROUTE_PLANNER_MAX_WAYPOINTS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(256),
+            route_planner_max_distance_m: env::var("ATC_ROUTE_PLANNER_MAX_DISTANCE_M")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|v: &f64| v.is_finite())
+                .unwrap_or(200_000.0),
             altitude_reference: match env::var("ATC_ALTITUDE_REFERENCE") {
                 Ok(value) => {
                     if value.trim().eq_ignore_ascii_case("agl") {
