@@ -69,23 +69,46 @@ async fn handle_socket(
 ) {
     let mut rx = state.tx.subscribe();
 
-    tokio::spawn(async move {
-        while let Ok(msg) = rx.recv().await {
-            if let Some(owner_id) = owner_filter.as_deref() {
-                if msg.owner_id.as_deref() != Some(owner_id) {
-                    continue;
+    loop {
+        tokio::select! {
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(Message::Ping(payload))) => {
+                        if socket.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) => break,
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) | None => break,
                 }
             }
-            if let Some(drone_id) = drone_filter.as_deref() {
-                if msg.drone_id != drone_id {
-                    continue;
-                }
-            }
-            if let Ok(json) = serde_json::to_string(&msg) {
-                if socket.send(Message::Text(json)).await.is_err() {
-                    break;
+            event = rx.recv() => {
+                match event {
+                    Ok(msg) => {
+                        if let Some(owner_id) = owner_filter.as_deref() {
+                            if msg.owner_id.as_deref() != Some(owner_id) {
+                                continue;
+                            }
+                        }
+                        if let Some(drone_id) = drone_filter.as_deref() {
+                            if msg.drone_id != drone_id {
+                                continue;
+                            }
+                        }
+                        if let Ok(json) = serde_json::to_string(&msg) {
+                            if socket.send(Message::Text(json)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Drop missed updates; a newer snapshot will arrive soon.
+                        continue;
+                    }
+                    Err(_) => break,
                 }
             }
         }
-    });
+    }
 }
