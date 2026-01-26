@@ -10,25 +10,87 @@ mod config;
 mod blender_auth;
 mod persistence;
 mod route_planner;
-mod terrain;
-
-use anyhow::{Result, bail};
-use axum::routing::get;
-use std::net::SocketAddr;
-use std::future::Future;
-use std::time::Duration;
-use tower_http::cors::{CorsLayer, Any};
+	mod terrain;
+	
+	use anyhow::{Result, bail};
+	use axum::{Json, extract::State, routing::get};
+	use axum::http::StatusCode;
+	use axum::response::IntoResponse;
+	use serde::Serialize;
+	use std::net::SocketAddr;
+	use std::future::Future;
+	use std::time::Duration;
+	use tower_http::cors::{CorsLayer, Any};
 use axum::http::{HeaderValue, Method};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use axum_server::tls_rustls::RustlsConfig;
 use tokio::sync::broadcast;
 
 use crate::state::AppState;
-use crate::config::Config;
-use std::sync::Arc;
-
-#[tokio::main]
-async fn main() -> Result<()> {
+	use crate::config::Config;
+	use std::sync::Arc;
+	use std::time::Instant;
+	
+	#[derive(Debug, Serialize)]
+	struct ReadyResponse {
+	    ok: bool,
+	    db_ok: bool,
+	    db_latency_ms: Option<u128>,
+	    error: Option<String>,
+	}
+	
+	async fn ready_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+	    let Some(db) = state.database() else {
+	        return (
+	            StatusCode::OK,
+	            Json(ReadyResponse {
+	                ok: true,
+	                db_ok: true,
+	                db_latency_ms: None,
+	                error: None,
+	            }),
+	        );
+	    };
+	
+	    let started_at = Instant::now();
+	    let result = tokio::time::timeout(
+	        Duration::from_millis(750),
+	        sqlx::query("SELECT 1").execute(db.pool()),
+	    )
+	    .await;
+	    match result {
+	        Ok(Ok(_)) => (
+	            StatusCode::OK,
+	            Json(ReadyResponse {
+	                ok: true,
+	                db_ok: true,
+	                db_latency_ms: Some(started_at.elapsed().as_millis()),
+	                error: None,
+	            }),
+	        ),
+	        Ok(Err(err)) => (
+	            StatusCode::SERVICE_UNAVAILABLE,
+	            Json(ReadyResponse {
+	                ok: false,
+	                db_ok: false,
+	                db_latency_ms: Some(started_at.elapsed().as_millis()),
+	                error: Some(err.to_string()),
+	            }),
+	        ),
+	        Err(_) => (
+	            StatusCode::SERVICE_UNAVAILABLE,
+	            Json(ReadyResponse {
+	                ok: false,
+	                db_ok: false,
+	                db_latency_ms: Some(started_at.elapsed().as_millis()),
+	                error: Some("database ping timed out".to_string()),
+	            }),
+	        ),
+	    }
+	}
+	
+	#[tokio::main]
+	async fn main() -> Result<()> {
     // Initialize tracing
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
@@ -155,11 +217,12 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Build CORS layer
-    // Build the app
-    let app = api::routes(&config)
-        .route("/health", get(|| async { "OK" }))
-        .with_state(state);
+	    // Build CORS layer
+	    // Build the app
+	    let app = api::routes(&config)
+	        .route("/health", get(|| async { "OK" }))
+	        .route("/ready", get(ready_handler))
+	        .with_state(state);
 
     let app = if config.allowed_origins.is_empty() {
         tracing::warn!("No CORS origins configured - CORS disabled (same-origin only)");
