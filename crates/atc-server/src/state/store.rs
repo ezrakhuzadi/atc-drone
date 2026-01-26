@@ -42,8 +42,8 @@ pub struct AppState {
     flight_plan_booking_lock: Mutex<()>,
     detector: std::sync::Mutex<ConflictDetector>,
     detector_tx: mpsc::Sender<DetectorUpdate>,
-    detector_rx: std::sync::Mutex<mpsc::Receiver<DetectorUpdate>>,
-    detector_overflow: std::sync::Mutex<HashMap<String, DetectorUpdate>>,
+    detector_rx: Mutex<mpsc::Receiver<DetectorUpdate>>,
+    detector_overflow: Mutex<HashMap<String, DetectorUpdate>>,
     detector_queue_warn_last: AtomicU64,
     detector_overflow_warn_last: AtomicU64,
     conflicts: DashMap<String, Conflict>,
@@ -150,8 +150,8 @@ impl AppState {
             flight_plan_booking_lock: Mutex::new(()),
             detector: std::sync::Mutex::new(detector),
             detector_tx,
-            detector_rx: std::sync::Mutex::new(detector_rx),
-            detector_overflow: std::sync::Mutex::new(HashMap::new()),
+            detector_rx: Mutex::new(detector_rx),
+            detector_overflow: Mutex::new(HashMap::new()),
             detector_queue_warn_last: AtomicU64::new(0),
             detector_overflow_warn_last: AtomicU64::new(0),
             conflicts: DashMap::new(),
@@ -306,21 +306,19 @@ impl AppState {
         }
     }
 
-    fn queue_detector_update(&self, update: DetectorUpdate) {
+    async fn queue_detector_update(&self, update: DetectorUpdate) {
         let key = update.key().to_string();
         match self.detector_tx.try_send(update) {
             Ok(_) => {
-                if let Ok(mut guard) = self.detector_overflow.lock() {
-                    guard.remove(&key);
-                }
+                self.detector_overflow.lock().await.remove(&key);
             }
             Err(mpsc::error::TrySendError::Full(update)) => {
                 self.warn_detector_backpressure("full");
-                self.store_detector_overflow(key, update);
+                self.store_detector_overflow(key, update).await;
             }
             Err(mpsc::error::TrySendError::Closed(update)) => {
                 self.warn_detector_backpressure("closed");
-                self.store_detector_overflow(key, update);
+                self.store_detector_overflow(key, update).await;
             }
         }
     }
@@ -348,20 +346,19 @@ impl AppState {
         }
     }
 
-    fn store_detector_overflow(&self, key: String, update: DetectorUpdate) {
+    async fn store_detector_overflow(&self, key: String, update: DetectorUpdate) {
         if self.config.max_overflow_entries == 0 {
             return;
         }
-        if let Ok(mut guard) = self.detector_overflow.lock() {
-            if guard.len() >= self.config.max_overflow_entries && !guard.contains_key(&key) {
-                self.warn_state_cap(
-                    &self.detector_overflow_warn_last,
-                    "Conflict detector overflow cap reached; dropping updates",
-                );
-                return;
-            }
-            guard.insert(key, update);
+        let mut guard = self.detector_overflow.lock().await;
+        if guard.len() >= self.config.max_overflow_entries && !guard.contains_key(&key) {
+            self.warn_state_cap(
+                &self.detector_overflow_warn_last,
+                "Conflict detector overflow cap reached; dropping updates",
+            );
+            return;
         }
+        guard.insert(key, update);
     }
 
     fn warn_state_cap(&self, last: &AtomicU64, message: &'static str) {
@@ -619,7 +616,7 @@ impl AppState {
     }
 
     /// Update drone state from telemetry.
-    pub fn update_telemetry(&self, telemetry: Telemetry) {
+    pub async fn update_telemetry(&self, telemetry: Telemetry) {
         let drone_id = telemetry.drone_id.clone();
         let mut telemetry = telemetry;
         let hold_active = self.has_active_hold_command(&drone_id);
@@ -679,7 +676,8 @@ impl AppState {
                 telemetry.speed_mps,
                 telemetry.velocity_z,
             ),
-        ));
+        ))
+        .await;
     }
 
     /// Get all drone states.
@@ -688,7 +686,7 @@ impl AppState {
     }
 
     /// Upsert external traffic and feed it into conflict detection.
-    pub fn upsert_external_traffic(&self, traffic: ExternalTraffic) {
+    pub async fn upsert_external_traffic(&self, traffic: ExternalTraffic) {
         let mut traffic = traffic;
         let traffic_id = traffic.traffic_id.clone();
         let is_new = !self.external_traffic.contains_key(&traffic_id);
@@ -713,7 +711,8 @@ impl AppState {
         self.queue_detector_update(DetectorUpdate::Upsert(
             DronePosition::new(&traffic_id, traffic.lat, traffic.lon, traffic.altitude_m)
                 .with_velocity(traffic.heading_deg, traffic.speed_mps, 0.0),
-        ));
+        ))
+        .await;
     }
 
     /// Get all external traffic tracks.
@@ -725,7 +724,7 @@ impl AppState {
     }
 
     /// Remove stale external tracks and purge them from the conflict detector.
-    pub fn purge_external_traffic(&self, max_age_secs: i64) -> Vec<String> {
+    pub async fn purge_external_traffic(&self, max_age_secs: i64) -> Vec<String> {
         let now = Utc::now();
         let stale_ids: Vec<String> = self
             .external_traffic
@@ -742,7 +741,7 @@ impl AppState {
 
         for id in &stale_ids {
             self.external_traffic.remove(id);
-            self.queue_detector_update(DetectorUpdate::Remove(id.clone()));
+            self.queue_detector_update(DetectorUpdate::Remove(id.clone())).await;
         }
 
         stale_ids
@@ -762,20 +761,14 @@ impl AppState {
     pub async fn refresh_conflicts(self: &Arc<Self>) {
         let mut updates = Vec::new();
         {
-            let mut rx = self
-                .detector_rx
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut rx = self.detector_rx.lock().await;
             while let Ok(update) = rx.try_recv() {
                 updates.push(update);
             }
         }
 
         let overflow_updates = {
-            let mut guard = self
-                .detector_overflow
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut guard = self.detector_overflow.lock().await;
             std::mem::take(&mut *guard)
         };
 
@@ -816,7 +809,7 @@ impl AppState {
 
     /// Check for drones that haven't reported in and mark them as Lost.
     /// Returns the IDs of newly-lost drones.
-    pub fn check_timeouts(&self) -> Vec<String> {
+    pub async fn check_timeouts(&self) -> Vec<String> {
         use atc_core::models::DroneStatus;
         use chrono::Utc;
 
@@ -837,8 +830,12 @@ impl AppState {
             if elapsed > timeout_secs {
                 drone.status = DroneStatus::Lost;
                 lost_drones.push(drone.drone_id.clone());
-                self.queue_detector_update(DetectorUpdate::Remove(drone.drone_id.clone()));
             }
+        }
+
+        for drone_id in &lost_drones {
+            self.queue_detector_update(DetectorUpdate::Remove(drone_id.clone()))
+                .await;
         }
 
         lost_drones
@@ -1299,9 +1296,7 @@ impl AppState {
         if let Ok(mut guard) = self.telemetry_overflow.lock() {
             guard.clear();
         }
-        if let Ok(mut guard) = self.detector_overflow.lock() {
-            guard.clear();
-        }
+        self.detector_overflow.lock().await.clear();
 
         // Reset the conflict detector
         if let Ok(mut detector) = self.detector.lock() {

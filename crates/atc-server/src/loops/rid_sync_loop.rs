@@ -101,9 +101,9 @@ pub async fn run_rid_loop(
                     Ok(payload) => {
                         let tracks = normalize_rid_payload(payload);
                         for track in tracks {
-                            state.upsert_external_traffic(track);
+                            state.upsert_external_traffic(track).await;
                         }
-                        state.purge_external_traffic(RID_TRACK_TTL_SECS);
+                        state.purge_external_traffic(RID_TRACK_TTL_SECS).await;
                     }
                     Err(err) => {
                         tracing::warn!("RID data fetch failed: {}", err);

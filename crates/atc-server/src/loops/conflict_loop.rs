@@ -67,7 +67,7 @@ pub async fn run_conflict_loop(
                     tracing::warn!("Conflict loop Blender auth refresh failed: {}", err);
                 }
                 // Check for timed-out drones first
-                let lost_drones = state.check_timeouts();
+                let lost_drones = state.check_timeouts().await;
                 for drone_id in &lost_drones {
                     tracing::warn!("Drone {} marked LOST (no telemetry)", drone_id);
                     if state.can_issue_command(drone_id, COMMAND_COOLDOWN_SECS) {

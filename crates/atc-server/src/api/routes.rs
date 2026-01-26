@@ -373,7 +373,7 @@ async fn receive_telemetry(
     if let Err(response) = validate_telemetry(&telemetry, state.config(), now) {
         return response;
     }
-    state.update_telemetry(telemetry);
+    state.update_telemetry(telemetry).await;
     (StatusCode::ACCEPTED, Json(serde_json::json!({})))
 }
 
