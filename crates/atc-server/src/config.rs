@@ -37,6 +37,12 @@ pub struct Config {
     pub registration_rate_limit_rps: u32,
     /// Max requests per second per IP for expensive endpoints (route planning, compliance evaluation).
     pub expensive_rate_limit_rps: u32,
+    /// Hard cap for the number of drones tracked in memory (DoS protection).
+    pub max_tracked_drones: usize,
+    /// Hard cap for the number of external RID traffic tracks kept in memory (DoS protection).
+    pub max_external_traffic_tracks: usize,
+    /// Hard cap for overflow maps (telemetry/detector) keyed by drone ID (DoS protection).
+    pub max_overflow_entries: usize,
     /// Trust X-Forwarded-For headers for rate limiting
     pub trust_proxy: bool,
     /// Path to SQLite database file
@@ -218,6 +224,18 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(2),
+            max_tracked_drones: env::var("ATC_MAX_TRACKED_DRONES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10_000),
+            max_external_traffic_tracks: env::var("ATC_MAX_EXTERNAL_TRAFFIC_TRACKS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10_000),
+            max_overflow_entries: env::var("ATC_MAX_OVERFLOW_ENTRIES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5_000),
             trust_proxy: env::var("ATC_TRUST_PROXY")
                 .map(|v| v == "1" || v.to_lowercase() == "true")
                 .unwrap_or(false),

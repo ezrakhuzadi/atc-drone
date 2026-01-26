@@ -29,6 +29,7 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 const TELEMETRY_QUEUE_DEPTH: usize = 4096;
 const DETECTOR_QUEUE_DEPTH: usize = 4096;
 const DETECTOR_QUEUE_WARN_INTERVAL_SECS: u64 = 5;
+const STATE_CAP_WARN_INTERVAL_SECS: u64 = 10;
 
 /// Application state - thread-safe store for drones and conflicts.
 pub struct AppState {
@@ -36,6 +37,7 @@ pub struct AppState {
     drone_owners: DashMap<String, String>,
     drone_tokens: DashMap<String, String>,
     external_traffic: DashMap<String, ExternalTraffic>,
+    external_traffic_cap_warn_last: AtomicU64,
     pub flight_plans: DashMap<String, FlightPlan>,
     flight_plan_booking_lock: Mutex<()>,
     detector: std::sync::Mutex<ConflictDetector>,
@@ -43,6 +45,7 @@ pub struct AppState {
     detector_rx: std::sync::Mutex<mpsc::Receiver<DetectorUpdate>>,
     detector_overflow: std::sync::Mutex<HashMap<String, DetectorUpdate>>,
     detector_queue_warn_last: AtomicU64,
+    detector_overflow_warn_last: AtomicU64,
     conflicts: DashMap<String, Conflict>,
     /// Command queues per drone (FIFO)
     commands: DashMap<String, VecDeque<Command>>,
@@ -57,6 +60,7 @@ pub struct AppState {
     telemetry_tx: mpsc::Sender<DroneState>,
     telemetry_rx: std::sync::Mutex<Option<mpsc::Receiver<DroneState>>>,
     telemetry_overflow: std::sync::Mutex<HashMap<String, DroneState>>,
+    telemetry_overflow_warn_last: AtomicU64,
     /// Safety rules (for timeout checks, etc.)
     rules: SafetyRules,
     /// Geofences/No-fly zones
@@ -141,6 +145,7 @@ impl AppState {
             drone_owners: DashMap::new(),
             drone_tokens: DashMap::new(),
             external_traffic: DashMap::new(),
+            external_traffic_cap_warn_last: AtomicU64::new(0),
             flight_plans: DashMap::new(),
             flight_plan_booking_lock: Mutex::new(()),
             detector: std::sync::Mutex::new(detector),
@@ -148,6 +153,7 @@ impl AppState {
             detector_rx: std::sync::Mutex::new(detector_rx),
             detector_overflow: std::sync::Mutex::new(HashMap::new()),
             detector_queue_warn_last: AtomicU64::new(0),
+            detector_overflow_warn_last: AtomicU64::new(0),
             conflicts: DashMap::new(),
             commands: DashMap::new(),
             command_cooldowns: DashMap::new(),
@@ -158,6 +164,7 @@ impl AppState {
             telemetry_tx,
             telemetry_rx: std::sync::Mutex::new(Some(telemetry_rx)),
             telemetry_overflow: std::sync::Mutex::new(HashMap::new()),
+            telemetry_overflow_warn_last: AtomicU64::new(0),
             rules,
             geofences: DashMap::new(),
             external_geofences: DashMap::new(),
@@ -195,7 +202,19 @@ impl AppState {
     }
 
     fn store_telemetry_overflow(&self, state: DroneState) {
+        if self.config.max_overflow_entries == 0 {
+            return;
+        }
         if let Ok(mut guard) = self.telemetry_overflow.lock() {
+            if guard.len() >= self.config.max_overflow_entries
+                && !guard.contains_key(&state.drone_id)
+            {
+                self.warn_state_cap(
+                    &self.telemetry_overflow_warn_last,
+                    "Telemetry overflow cap reached; dropping snapshots",
+                );
+                return;
+            }
             guard.insert(state.drone_id.clone(), state);
         }
     }
@@ -330,8 +349,35 @@ impl AppState {
     }
 
     fn store_detector_overflow(&self, key: String, update: DetectorUpdate) {
+        if self.config.max_overflow_entries == 0 {
+            return;
+        }
         if let Ok(mut guard) = self.detector_overflow.lock() {
+            if guard.len() >= self.config.max_overflow_entries && !guard.contains_key(&key) {
+                self.warn_state_cap(
+                    &self.detector_overflow_warn_last,
+                    "Conflict detector overflow cap reached; dropping updates",
+                );
+                return;
+            }
             guard.insert(key, update);
+        }
+    }
+
+    fn warn_state_cap(&self, last: &AtomicU64, message: &'static str) {
+        let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+            return;
+        };
+        let now_secs = now.as_secs();
+        let prev = last.load(Ordering::Relaxed);
+        if now_secs.saturating_sub(prev) < STATE_CAP_WARN_INTERVAL_SECS {
+            return;
+        }
+        if last
+            .compare_exchange(prev, now_secs, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            tracing::warn!("{}", message);
         }
     }
 
@@ -397,6 +443,10 @@ impl AppState {
     /// Get next drone ID number.
     pub fn next_drone_id(&self) -> u32 {
         self.drone_counter.fetch_add(1, Ordering::SeqCst)
+    }
+
+    pub fn drone_count(&self) -> usize {
+        self.drones.len()
     }
 
     /// Register a new drone, persisting before updating in-memory state.
@@ -641,6 +691,17 @@ impl AppState {
     pub fn upsert_external_traffic(&self, traffic: ExternalTraffic) {
         let mut traffic = traffic;
         let traffic_id = traffic.traffic_id.clone();
+        let is_new = !self.external_traffic.contains_key(&traffic_id);
+        if is_new
+            && self.config.max_external_traffic_tracks > 0
+            && self.external_traffic.len() >= self.config.max_external_traffic_tracks
+        {
+            self.warn_state_cap(
+                &self.external_traffic_cap_warn_last,
+                "External traffic cap reached; dropping new RID tracks",
+            );
+            return;
+        }
         traffic.altitude_m = altitude_to_amsl(
             traffic.altitude_m,
             self.config.altitude_reference,

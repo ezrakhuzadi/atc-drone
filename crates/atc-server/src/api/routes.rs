@@ -266,7 +266,22 @@ async fn register_drone(
         format!("DRONE{:04}", state.next_drone_id())
     });
 
-    if let Some(existing) = state.get_drone(&drone_id) {
+    let existing = state.get_drone(&drone_id);
+    if existing.is_none()
+        && config.max_tracked_drones > 0
+        && state.drone_count() >= config.max_tracked_drones
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "Drone registration capacity reached",
+                "hint": "Try again later or increase ATC_MAX_TRACKED_DRONES",
+                "limit": config.max_tracked_drones,
+            })),
+        );
+    }
+
+    if let Some(existing) = existing {
         if let Some(expected_owner) = existing.owner_id.as_deref() {
             match req.owner_id.as_deref() {
                 Some(owner_id) if owner_id == expected_owner => {}
