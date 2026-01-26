@@ -1,7 +1,7 @@
 //! Drone persistence operations.
 
 use anyhow::Result;
-use sqlx::SqlitePool;
+use sqlx::{Sqlite, SqlitePool};
 use atc_core::models::{DroneState, DroneStatus};
 use chrono::{DateTime, Utc};
 
@@ -34,6 +34,41 @@ pub async fn upsert_drone(pool: &SqlitePool, drone: &DroneState) -> Result<()> {
     .execute(pool)
     .await?;
     
+    Ok(())
+}
+
+/// Upsert a drone state into the database within an existing transaction.
+pub async fn upsert_drone_tx(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    drone: &DroneState,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO drones (drone_id, owner_id, lat, lon, altitude_m, heading_deg, speed_mps, velocity_x, velocity_y, velocity_z, status, last_update)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        ON CONFLICT(drone_id) DO UPDATE SET
+            owner_id = COALESCE(?2, owner_id),
+            lat = ?3, lon = ?4, altitude_m = ?5,
+            heading_deg = ?6, speed_mps = ?7,
+            velocity_x = ?8, velocity_y = ?9, velocity_z = ?10,
+            status = ?11, last_update = ?12
+        "#,
+    )
+    .bind(&drone.drone_id)
+    .bind(&drone.owner_id)
+    .bind(drone.lat)
+    .bind(drone.lon)
+    .bind(drone.altitude_m)
+    .bind(drone.heading_deg)
+    .bind(drone.speed_mps)
+    .bind(drone.velocity_x)
+    .bind(drone.velocity_y)
+    .bind(drone.velocity_z)
+    .bind(format!("{:?}", drone.status))
+    .bind(drone.last_update.to_rfc3339())
+    .execute(&mut **tx)
+    .await?;
+
     Ok(())
 }
 

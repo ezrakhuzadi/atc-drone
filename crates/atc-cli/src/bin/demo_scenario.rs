@@ -9,12 +9,17 @@
 //! 5. LANDED: Stay on ground, keep sending telemetry
 //!
 //! Usage:
-//!   cargo run -p atc-cli --bin demo_scenario
+//!   cargo run -p atc-cli --bin demo_scenario -- --url http://localhost:3000 --owner guest
+//!
+//! If running against the unified Docker stack, default tokens match `docker-compose.unified.yml`:
+//!   --registration-token change-me --admin-token change-me-admin
 
 use atc_core::models::{Command, CommandType};
 use atc_core::spatial::{bearing, haversine_distance, offset_by_bearing};
 use atc_sdk::AtcClient;
 use clap::Parser;
+use serde_json::json;
+use std::env;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
@@ -78,6 +83,14 @@ struct Args {
     /// Reset state before running
     #[arg(long, default_value_t = true)]
     reset: bool,
+
+    /// Shared registration token for `/v1/drones/register` (sent as `X-Registration-Token`)
+    #[arg(long)]
+    registration_token: Option<String>,
+
+    /// Admin token for `/v1/admin/reset` (sent as `Authorization: Bearer <token>`)
+    #[arg(long)]
+    admin_token: Option<String>,
 
     /// Owner ID for user-specific drone tracking (e.g., 'guest')
     #[arg(long, default_value = "guest")]
@@ -362,6 +375,16 @@ async fn handle_command(drone: &mut DemoState, cmd: Command) {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    let registration_token = args
+        .registration_token
+        .clone()
+        .or_else(|| env::var("ATC_REGISTRATION_TOKEN").ok())
+        .unwrap_or_else(|| "change-me".to_string());
+    let admin_token = args
+        .admin_token
+        .clone()
+        .or_else(|| env::var("ATC_ADMIN_TOKEN").ok())
+        .unwrap_or_else(|| "change-me-admin".to_string());
 
     println!("╔═══════════════════════════════════════════════════════════════╗");
     println!("║    ATC-DRONE: REALISTIC LIFECYCLE DEMO                        ║");
@@ -373,10 +396,24 @@ async fn main() -> anyhow::Result<()> {
     if args.reset {
         println!("[SETUP] Resetting server state...");
         let client = reqwest::Client::new();
-        match client.post(format!("{}/v1/admin/reset", args.url)).send().await {
+        let response = client
+            .post(format!("{}/v1/admin/reset", args.url))
+            .bearer_auth(&admin_token)
+            .json(&json!({ "confirm": "RESET", "require_idle": false }))
+            .send()
+            .await;
+
+        match response {
             Ok(resp) if resp.status().is_success() => println!("[SETUP] ✓ Server state cleared"),
-            Ok(resp) => println!("[SETUP] ⚠ Reset status: {}", resp.status()),
-            Err(e) => println!("[SETUP] ⚠ Could not reset: {}", e),
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                println!("[SETUP] ⚠ Reset status: {} {}", status, body.trim());
+            }
+            Err(e) => println!(
+                "[SETUP] ⚠ Could not reset: {} (check --admin-token / ATC_ADMIN_TOKEN)",
+                e
+            ),
         }
     }
 
@@ -392,8 +429,10 @@ async fn main() -> anyhow::Result<()> {
     let mut beta_client = AtcClient::new(&args.url);
 
     println!("[REGISTER] Registering drones...");
-    alpha_client.register(Some("demo-alpha")).await?;
-    beta_client.register(Some("demo-beta")).await?;
+    alpha_client.set_registration_token(Some(registration_token.clone()));
+    beta_client.set_registration_token(Some(registration_token.clone()));
+    alpha_client.register_with_owner(Some("demo-alpha"), Some(&args.owner)).await?;
+    beta_client.register_with_owner(Some("demo-beta"), Some(&args.owner)).await?;
     println!("[REGISTER] ✓ Both drones registered\n");
 
     let alpha_command_rx = spawn_command_listener("demo-alpha", &alpha_client).await;

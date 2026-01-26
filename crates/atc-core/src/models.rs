@@ -185,6 +185,18 @@ pub struct FlightPlanMetadata {
     pub compliance_override_notes: Option<String>,
     #[serde(default)]
     pub compliance_report: Option<serde_json::Value>,
+    /// Optional scheduling priority (lower = higher priority).
+    #[serde(default)]
+    pub scheduling_priority: Option<u32>,
+    /// Original requested departure time (RFC3339) before ATC scheduling/slotting.
+    #[serde(default)]
+    pub requested_departure_time: Option<String>,
+    /// Scheduled delay applied by ATC, in seconds.
+    #[serde(default)]
+    pub scheduled_delay_s: Option<u64>,
+    /// If the plan is reserved, the time (RFC3339) when the reservation expires.
+    #[serde(default)]
+    pub reservation_expires_at: Option<String>,
 }
 
 impl Default for FlightPlanMetadata {
@@ -206,6 +218,10 @@ impl Default for FlightPlanMetadata {
             compliance_override_enabled: None,
             compliance_override_notes: None,
             compliance_report: None,
+            scheduling_priority: None,
+            requested_departure_time: None,
+            scheduled_delay_s: None,
+            reservation_expires_at: None,
         }
     }
 }
@@ -213,6 +229,8 @@ impl Default for FlightPlanMetadata {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FlightStatus {
+    /// Reserved (slot held), not yet confirmed for execution.
+    Reserved,
     /// Received but not yet approved
     Pending,
     /// Approved by ATC, ready for takeoff

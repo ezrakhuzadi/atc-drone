@@ -15,7 +15,10 @@ use tokio::task;
 use tokio::sync::Semaphore;
 
 use crate::altitude::altitude_to_amsl;
-use crate::compliance::{fetch_obstacles, ObstacleAnalysis, ObstacleHazard, ObstacleQueryMode, RoutePoint};
+use crate::compliance::{
+    fetch_obstacles, ObstacleAnalysis, ObstacleCandidate, ObstacleHazard, ObstacleQueryMode,
+    RoutePoint,
+};
 use crate::config::Config;
 use crate::state::AppState;
 use crate::terrain::{fetch_terrain_grid, TerrainGrid};
@@ -241,17 +244,28 @@ async fn plan_route_single(
         .safety_buffer_m
         .unwrap_or(config.compliance_default_clearance_m);
     let client = Client::new();
-    let obstacles_started_at = Instant::now();
-    let analysis = match fetch_obstacles(
-        &client,
-        config,
-        &points,
-        clearance_m,
-        Some(max_lane_radius + clearance_m),
-        ObstacleQueryMode::RoutePlanner,
-    )
-    .await
-    {
+    let ((analysis_result, obstacles_elapsed), (terrain_result, terrain_elapsed)) = tokio::join!(
+        async {
+            let started_at = Instant::now();
+            let result = fetch_obstacles(
+                &client,
+                config,
+                &points,
+                clearance_m,
+                Some(max_lane_radius + clearance_m),
+                ObstacleQueryMode::RoutePlanner,
+            )
+            .await;
+            (result, started_at.elapsed())
+        },
+        async {
+            let started_at = Instant::now();
+            let result = fetch_terrain_grid(&client, config, &points, base_spacing).await;
+            (result, started_at.elapsed())
+        }
+    );
+
+    let analysis = match analysis_result {
         Ok(result) => result,
         Err(err) => {
             if config.route_planner_require_obstacles {
@@ -270,15 +284,45 @@ async fn plan_route_single(
             empty_obstacle_analysis()
         }
     };
+
+    let terrain = match terrain_result {
+        Ok(grid) => grid.map(Arc::new),
+        Err(err) => {
+            if config.terrain_require {
+                return RoutePlanResponse {
+                    ok: false,
+                    waypoints: Vec::new(),
+                    stats: None,
+                    nodes_visited: 0,
+                    optimized_points: 0,
+                    sample_points: 0,
+                    hazards: Vec::new(),
+                    errors: vec![format!("terrain fetch failed: {}", err)],
+                };
+            }
+            tracing::warn!("Terrain fetch failed, continuing without terrain: {}", err);
+            None
+        }
+    };
+
+    let ObstacleAnalysis {
+        candidates,
+        hazards,
+        footprints,
+        obstacle_count,
+        truncated,
+        ..
+    } = analysis;
+
     tracing::info!(
         "RoutePlan obstacles: {} candidate(s), {} footprint(s), truncated={}, {} ms",
-        analysis.obstacle_count,
-        analysis.footprints.len(),
-        analysis.truncated,
-        obstacles_started_at.elapsed().as_millis()
+        obstacle_count,
+        footprints.len(),
+        truncated,
+        obstacles_elapsed.as_millis()
     );
 
-    if analysis.truncated {
+    if truncated {
         if config.route_planner_allow_truncated_obstacles {
             tracing::warn!("Obstacle dataset truncated; continuing with partial data");
         } else {
@@ -298,42 +342,10 @@ async fn plan_route_single(
         }
     }
 
-    let hazards = analysis.hazards.clone();
-    let obstacles: Vec<RouteObstacle> = analysis
-        .candidates
-        .iter()
-        .map(|candidate| RouteObstacle {
-            lat: candidate.lat,
-            lon: candidate.lon,
-            radius_m: candidate.radius_m,
-            height_m: Some(candidate.height_m),
-        })
-        .collect();
-
-    let terrain_started_at = Instant::now();
-    let terrain = match fetch_terrain_grid(&client, config, &points, base_spacing).await {
-        Ok(grid) => grid.map(Arc::new),
-        Err(err) => {
-            if config.terrain_require {
-                return RoutePlanResponse {
-                    ok: false,
-                    waypoints: Vec::new(),
-                    stats: None,
-                    nodes_visited: 0,
-                    optimized_points: 0,
-                    sample_points: 0,
-                    hazards: Vec::new(),
-                    errors: vec![format!("terrain fetch failed: {}", err)],
-                };
-            }
-            tracing::warn!("Terrain fetch failed, continuing without terrain: {}", err);
-            None
-        }
-    };
     tracing::info!(
         "RoutePlan terrain: enabled={}, {} ms",
         terrain.is_some(),
-        terrain_started_at.elapsed().as_millis()
+        terrain_elapsed.as_millis()
     );
 
     let geofences: Arc<Vec<Geofence>> = Arc::new(
@@ -345,7 +357,7 @@ async fn plan_route_single(
     );
 
     let waypoints: Arc<Vec<Waypoint>> = Arc::new(waypoints);
-    let obstacles: Arc<Vec<RouteObstacle>> = Arc::new(obstacles);
+    let candidates: Arc<Vec<ObstacleCandidate>> = Arc::new(candidates);
 
     let mut last_errors = Vec::new();
     let mut last_sample_points = 0usize;
@@ -356,6 +368,8 @@ async fn plan_route_single(
     let phase_all = grid_phase_candidates();
 
     for (radius_idx, lane_radius) in radius_candidates.iter().copied().enumerate() {
+        let obstacles: Arc<Vec<RouteObstacle>> =
+            Arc::new(obstacles_for_lane_radius(&candidates, lane_radius));
         let is_last_radius = radius_idx + 1 == radius_candidates.len();
         let primary_spacing = spacing_candidates.first().copied().unwrap_or(lane_spacing);
         let spacing_single = [primary_spacing];
@@ -857,17 +871,28 @@ async fn fetch_segment_inputs(
         })
         .collect();
 
-    let obstacles_started_at = Instant::now();
-    let analysis = match fetch_obstacles(
-        client,
-        config,
-        &points,
-        safety_buffer_m,
-        Some(max_lane_radius + safety_buffer_m),
-        ObstacleQueryMode::RoutePlanner,
-    )
-    .await
-    {
+    let ((analysis_result, obstacles_elapsed), (terrain_result, terrain_elapsed)) = tokio::join!(
+        async {
+            let started_at = Instant::now();
+            let result = fetch_obstacles(
+                client,
+                config,
+                &points,
+                safety_buffer_m,
+                Some(max_lane_radius + safety_buffer_m),
+                ObstacleQueryMode::RoutePlanner,
+            )
+            .await;
+            (result, started_at.elapsed())
+        },
+        async {
+            let started_at = Instant::now();
+            let result = fetch_terrain_grid(client, config, &points, base_spacing).await;
+            (result, started_at.elapsed())
+        }
+    );
+
+    let analysis = match analysis_result {
         Ok(result) => result,
         Err(err) => {
             if config.route_planner_require_obstacles {
@@ -882,7 +907,7 @@ async fn fetch_segment_inputs(
         analysis.obstacle_count,
         analysis.footprints.len(),
         analysis.truncated,
-        obstacles_started_at.elapsed().as_millis()
+        obstacles_elapsed.as_millis()
     );
     if analysis.truncated {
         if config.route_planner_allow_truncated_obstacles {
@@ -904,8 +929,7 @@ async fn fetch_segment_inputs(
         })
         .collect();
 
-    let terrain_started_at = Instant::now();
-    let terrain = match fetch_terrain_grid(client, config, &points, base_spacing).await {
+    let terrain = match terrain_result {
         Ok(grid) => grid.map(Arc::new),
         Err(err) => {
             if config.terrain_require {
@@ -918,7 +942,7 @@ async fn fetch_segment_inputs(
     tracing::info!(
         "RoutePlan segment terrain: enabled={}, {} ms",
         terrain.is_some(),
-        terrain_started_at.elapsed().as_millis()
+        terrain_elapsed.as_millis()
     );
 
     Ok(SegmentInputs {
@@ -1250,6 +1274,33 @@ fn build_response(
         hazards,
         errors: result.errors,
     }
+}
+
+fn obstacles_for_lane_radius(
+    candidates: &[ObstacleCandidate],
+    lane_radius_m: f64,
+) -> Vec<RouteObstacle> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let mut obstacles = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let distance_m = candidate.distance_m.unwrap_or(0.0);
+        if distance_m.is_finite() && lane_radius_m.is_finite() {
+            let influence_radius = lane_radius_m.max(0.0) + candidate.radius_m.max(0.0);
+            if distance_m > influence_radius + f64::EPSILON {
+                continue;
+            }
+        }
+        obstacles.push(RouteObstacle {
+            lat: candidate.lat,
+            lon: candidate.lon,
+            radius_m: candidate.radius_m,
+            height_m: Some(candidate.height_m),
+        });
+    }
+    obstacles
 }
 
 fn route_distance_m(waypoints: &[Waypoint]) -> f64 {

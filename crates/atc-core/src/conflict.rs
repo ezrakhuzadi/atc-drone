@@ -322,10 +322,15 @@ impl ConflictDetector {
                             let cpa_lat = (drone1.lat + drone2.lat) / 2.0;
                             let cpa_lon = (drone1.lon + drone2.lon) / 2.0;
                             let cpa_altitude_m = (drone1.altitude_m + drone2.altitude_m) / 2.0;
-                            
+                            let (drone1_id, drone2_id) = if drone1.drone_id <= drone2.drone_id {
+                                (drone1.drone_id.clone(), drone2.drone_id.clone())
+                            } else {
+                                (drone2.drone_id.clone(), drone1.drone_id.clone())
+                            };
+
                             conflicts.push(Conflict {
-                                drone1_id: drone1.drone_id.clone(),
-                                drone2_id: drone2.drone_id.clone(),
+                                drone1_id,
+                                drone2_id,
                                 severity: ConflictSeverity::Critical,
                                 distance_m: current_distance,
                                 time_to_closest: 0.0,
@@ -344,9 +349,15 @@ impl ConflictDetector {
                             continue;
                         };
 
+                        let (drone1_id, drone2_id) = if drone1.drone_id <= drone2.drone_id {
+                            (drone1.drone_id.clone(), drone2.drone_id.clone())
+                        } else {
+                            (drone2.drone_id.clone(), drone1.drone_id.clone())
+                        };
+
                         conflicts.push(Conflict {
-                            drone1_id: drone1.drone_id.clone(),
-                            drone2_id: drone2.drone_id.clone(),
+                            drone1_id,
+                            drone2_id,
                             severity,
                             distance_m: current_distance,
                             time_to_closest,

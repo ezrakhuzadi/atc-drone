@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tokio::time::interval;
 use chrono::{Duration as ChronoDuration, Utc};
@@ -29,6 +29,7 @@ const CONFLICT_TTL_SECS: i64 = 3600;
 const CONFLICT_REFRESH_GRACE_SECS: i64 = 300;
 const FAILSAFE_HOLD_SECS: u32 = 120;
 const RESOLUTION_COOLDOWN_SECS: i64 = 120;
+const CONFLICT_SUMMARY_LOG_INTERVAL_SECS: u64 = 30;
 
 struct BlenderConflictState {
     blender_id: String,
@@ -52,6 +53,8 @@ pub async fn run_conflict_loop(
     );
     let mut tracked_conflicts: HashMap<String, BlenderConflictState> = HashMap::new();
     let mut resolution_cooldowns: HashMap<String, i64> = HashMap::new();
+    let mut last_conflict_count: usize = 0;
+    let mut last_conflict_log_at: Instant = Instant::now();
 
     loop {
         tokio::select! {
@@ -91,7 +94,7 @@ pub async fn run_conflict_loop(
                     tracing::warn!("Failed to purge expired commands: {}", err);
                 }
                 state.purge_expired_active_holds();
-                state.refresh_conflicts();
+                state.refresh_conflicts().await;
 
                 let conflicts = state.get_conflicts();
                 let loop_now = Utc::now();
@@ -100,6 +103,10 @@ pub async fn run_conflict_loop(
                 let refresh_deadline = loop_now.timestamp() + CONFLICT_REFRESH_GRACE_SECS;
                 let mut active_daa_ids: HashSet<String> = HashSet::new();
                 if conflicts.is_empty() {
+                    if last_conflict_count != 0 {
+                        tracing::info!("No conflicts detected");
+                        last_conflict_count = 0;
+                    }
                     if !tracked_conflicts.is_empty() {
                         for (_, existing) in tracked_conflicts.drain() {
                             if let Err(err) = blender.delete_geofence(&existing.blender_id).await {
@@ -112,10 +119,41 @@ pub async fn run_conflict_loop(
                     continue;
                 }
 
-                tracing::warn!(
-                    "Detected {} conflict(s)",
-                    conflicts.len()
-                );
+                if conflicts.len() != last_conflict_count
+                    || last_conflict_log_at.elapsed() >= Duration::from_secs(CONFLICT_SUMMARY_LOG_INTERVAL_SECS)
+                {
+                    let mut critical = 0usize;
+                    let mut warning = 0usize;
+                    let mut info = 0usize;
+                    for conflict in &conflicts {
+                        match conflict.severity {
+                            ConflictSeverity::Critical => critical += 1,
+                            ConflictSeverity::Warning => warning += 1,
+                            ConflictSeverity::Info => info += 1,
+                        }
+                    }
+
+                    if critical > 0 {
+                        tracing::warn!(
+                            conflicts = conflicts.len(),
+                            critical,
+                            warning,
+                            info,
+                            "Detected conflicts"
+                        );
+                    } else {
+                        tracing::info!(
+                            conflicts = conflicts.len(),
+                            critical,
+                            warning,
+                            info,
+                            "Detected conflicts"
+                        );
+                    }
+
+                    last_conflict_count = conflicts.len();
+                    last_conflict_log_at = Instant::now();
+                }
 
                 // Get current drone positions for geofence generation
                 let drones = state.get_all_drones();

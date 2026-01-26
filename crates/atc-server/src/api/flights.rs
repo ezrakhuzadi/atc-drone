@@ -10,7 +10,7 @@ use atc_core::models::{
 };
 use atc_core::routing::generate_random_route;
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
@@ -115,7 +115,7 @@ pub async fn create_flight_plan(
         ));
     }
     apply_compliance_metadata(&mut payload.metadata, validation.compliance.as_ref());
-    let plan = build_plan(state.as_ref(), payload, None)
+    let plan = build_plan(state.as_ref(), payload, None, FlightStatus::Approved)
         .await
         .map_err(|err| {
             tracing::error!("Failed to persist flight plan: {}", err);
@@ -126,6 +126,16 @@ pub async fn create_flight_plan(
                 })),
             )
         })?;
+    if plan.status == FlightStatus::Rejected {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "Flight plan rejected",
+                "message": "No conflict-free slot found for this plan",
+                "plan": plan
+            })),
+        ));
+    }
     Ok((StatusCode::CREATED, Json(plan)))
 }
 
@@ -178,7 +188,12 @@ pub(crate) async fn create_flight_plan_compat(
         ));
     }
     apply_compliance_metadata(&mut request.metadata, validation.compliance.as_ref());
-    let plan = build_plan(state.as_ref(), request, requested_flight_id)
+    let plan = build_plan(
+        state.as_ref(),
+        request,
+        requested_flight_id,
+        FlightStatus::Approved,
+    )
         .await
         .map_err(|err| {
             tracing::error!("Failed to persist flight plan: {}", err);
@@ -189,6 +204,16 @@ pub(crate) async fn create_flight_plan_compat(
                 })),
             )
         })?;
+    if plan.status == FlightStatus::Rejected {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "Flight plan rejected",
+                "message": "No conflict-free slot found for this plan",
+                "plan": plan
+            })),
+        ));
+    }
     Ok((StatusCode::CREATED, Json(plan)))
 }
 
@@ -244,6 +269,10 @@ fn planner_metadata_to_flight_metadata(metadata: PlannerMetadata) -> FlightPlanM
         compliance_override_enabled: metadata.compliance_override_enabled,
         compliance_override_notes: metadata.compliance_override_notes,
         compliance_report: None,
+        scheduling_priority: None,
+        requested_departure_time: None,
+        scheduled_delay_s: None,
+        reservation_expires_at: None,
     }
 }
 
@@ -595,6 +624,7 @@ pub(crate) async fn build_plan(
     state: &AppState,
     payload: FlightPlanRequest,
     requested_flight_id: Option<String>,
+    ok_status: FlightStatus,
 ) -> anyhow::Result<FlightPlan> {
     let flight_id = requested_flight_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let FlightPlanRequest {
@@ -611,12 +641,7 @@ pub(crate) async fn build_plan(
     let mut metadata = metadata;
     let _booking_guard = state.flight_plan_booking_lock().lock().await;
 
-    // Gather existing active plans for deconfliction
-    let existing_plans = state.get_flight_plans();
-    let active_plans: Vec<FlightPlan> = existing_plans
-        .into_iter()
-        .filter(|p| p.status == FlightStatus::Approved || p.status == FlightStatus::Active)
-        .collect();
+    let pool = state.database().map(|db| db.pool().clone());
 
     let has_custom_waypoints = waypoints.is_some();
 
@@ -645,11 +670,74 @@ pub(crate) async fn build_plan(
         }]
     };
 
-    // Select the first safe route
+    // Select the first safe route / slot
     let mut selected_waypoints = None;
     let mut flight_status = FlightStatus::Rejected;
     let mut selected_log: Option<Vec<TrajectoryPoint>> = None;
     let mut selected_departure = departure;
+
+    // Gather existing active plans for deconfliction.
+    let mut scheduling_tx = if let Some(pool) = pool.as_ref() {
+        Some(pool.begin().await?)
+    } else {
+        None
+    };
+    if let Some(tx) = scheduling_tx.as_mut() {
+        crate::persistence::flight_plans::lock_scheduler(tx).await?;
+    }
+
+    let existing_plans = if let Some(tx) = scheduling_tx.as_mut() {
+        crate::persistence::flight_plans::load_all_flight_plans_tx(tx).await?
+    } else {
+        state.get_flight_plans()
+    };
+
+    let active_plans: Vec<FlightPlan> = existing_plans
+        .iter()
+        .cloned()
+        .filter(|p| {
+            matches!(
+                p.status,
+                FlightStatus::Reserved | FlightStatus::Approved | FlightStatus::Active
+            )
+        })
+        .filter(|p| p.flight_id != flight_id)
+        .collect();
+
+    // For reserved operational intents, run a prioritized batch rescheduler so this reservation
+    // can move other lower-priority reservations if needed.
+    if ok_status == FlightStatus::Reserved {
+        if let Some(mut tx) = scheduling_tx.take() {
+            match schedule_reserved_batch(
+                state,
+                &existing_plans,
+                &flight_id,
+                &drone_id,
+                owner_id.as_deref(),
+                &candidates,
+                trajectory_log.as_ref(),
+                metadata.clone(),
+                has_custom_waypoints,
+                departure,
+            ) {
+                ReservedBatchOutcome::Accepted { new_plan, updates } => {
+                    for plan in &updates {
+                        crate::persistence::flight_plans::upsert_flight_plan_tx(&mut tx, plan)
+                            .await?;
+                    }
+                    tx.commit().await?;
+                    for plan in &updates {
+                        state.flight_plans.insert(plan.flight_id.clone(), plan.clone());
+                    }
+                    return Ok(new_plan);
+                }
+                ReservedBatchOutcome::Rejected { rejected_plan } => {
+                    tx.rollback().await.ok();
+                    return Ok(rejected_plan);
+                }
+            }
+        }
+    }
 
     let max_delay_secs = if state.config().strategic_scheduling_enabled {
         state.config().strategic_max_delay_secs
@@ -694,7 +782,7 @@ pub(crate) async fn build_plan(
                 selected_waypoints = Some(option.waypoints.clone());
                 selected_log = candidate_log;
                 selected_departure = scheduled_departure;
-                flight_status = FlightStatus::Approved;
+                flight_status = ok_status;
                 break 'schedule; // Found earliest available slot!
             }
         }
@@ -722,6 +810,28 @@ pub(crate) async fn build_plan(
 
     fill_flight_metadata(&mut metadata, &final_waypoints, final_log.as_ref());
 
+    // Record scheduling metadata (for UI/debug).
+    if metadata.is_none() {
+        metadata = Some(FlightPlanMetadata::default());
+    }
+    if let Some(meta) = metadata.as_mut() {
+        if meta.requested_departure_time.is_none() {
+            meta.requested_departure_time = Some(departure.to_rfc3339());
+        }
+        if flight_status != FlightStatus::Rejected {
+            let delay = selected_departure
+                .signed_duration_since(departure)
+                .num_seconds()
+                .max(0) as u64;
+            meta.scheduled_delay_s = Some(delay);
+            if flight_status == FlightStatus::Reserved {
+                let ttl_secs = state.config().operational_intent_ttl_secs as i64;
+                let expires_at = chrono::Utc::now() + chrono::Duration::seconds(ttl_secs);
+                meta.reservation_expires_at = Some(expires_at.to_rfc3339());
+            }
+        }
+    }
+
     // Estimate arrival time based on route distance
     let arrival_time = estimate_arrival_time(
         &final_waypoints,
@@ -743,9 +853,321 @@ pub(crate) async fn build_plan(
         created_at: Utc::now(),
     };
 
-    state.add_flight_plan(plan.clone()).await?;
+    if plan.status != FlightStatus::Rejected {
+        if let Some(mut tx) = scheduling_tx {
+            crate::persistence::flight_plans::upsert_flight_plan_tx(&mut tx, &plan).await?;
+            tx.commit().await?;
+            state.flight_plans.insert(plan.flight_id.clone(), plan.clone());
+        } else {
+            state.add_flight_plan(plan.clone()).await?;
+        }
+    } else if let Some(tx) = scheduling_tx {
+        tx.rollback().await.ok();
+    }
 
     Ok(plan)
+}
+
+#[derive(Debug)]
+enum ReservedBatchOutcome {
+    Accepted { new_plan: FlightPlan, updates: Vec<FlightPlan> },
+    Rejected { rejected_plan: FlightPlan },
+}
+
+fn schedule_reserved_batch(
+    state: &AppState,
+    existing_plans: &[FlightPlan],
+    flight_id: &str,
+    drone_id: &str,
+    owner_id: Option<&str>,
+    candidates: &[atc_core::routing::RouteOption],
+    payload_trajectory: Option<&Vec<TrajectoryPoint>>,
+    payload_metadata: Option<FlightPlanMetadata>,
+    allow_payload_log: bool,
+    requested_departure: chrono::DateTime<chrono::Utc>,
+) -> ReservedBatchOutcome {
+    let now = chrono::Utc::now();
+
+    let max_delay_secs = if state.config().strategic_scheduling_enabled {
+        state.config().strategic_max_delay_secs
+    } else {
+        0
+    };
+    let delay_step_secs = state.config().strategic_delay_step_secs.max(1);
+
+    let fixed_obstacles: Vec<FlightPlan> = existing_plans
+        .iter()
+        .filter(|plan| matches!(plan.status, FlightStatus::Approved | FlightStatus::Active))
+        .cloned()
+        .collect();
+
+    let mut reserved_plans: Vec<FlightPlan> = existing_plans
+        .iter()
+        .filter(|plan| plan.status == FlightStatus::Reserved)
+        .filter(|plan| plan.flight_id != flight_id)
+        .cloned()
+        .collect();
+
+    // Include the new reservation as a schedulable item.
+    let new_plan_template = FlightPlan {
+        flight_id: flight_id.to_string(),
+        drone_id: drone_id.to_string(),
+        owner_id: owner_id.map(str::to_string),
+        waypoints: Vec::new(),
+        trajectory_log: None,
+        metadata: payload_metadata.clone(),
+        status: FlightStatus::Reserved,
+        departure_time: requested_departure,
+        arrival_time: None,
+        created_at: now,
+    };
+
+    // Sort by priority then requested time (earliest first).
+    reserved_plans.sort_by(|a, b| {
+        let pa = scheduling_priority(a.metadata.as_ref());
+        let pb = scheduling_priority(b.metadata.as_ref());
+        pa.cmp(&pb)
+            .then_with(|| earliest_departure_for_reserved(a).cmp(&earliest_departure_for_reserved(b)))
+            .then_with(|| a.created_at.cmp(&b.created_at))
+            .then_with(|| a.flight_id.cmp(&b.flight_id))
+    });
+
+    let mut scheduled: Vec<FlightPlan> = fixed_obstacles.clone();
+    let mut updates: Vec<FlightPlan> = Vec::new();
+
+    // Schedule existing reservations first (stable), then insert the new one according to priority.
+    // If the new reservation has higher priority than some existing reservations, it will be
+    // scheduled earlier and may push lower-priority reservations later.
+    let new_priority = scheduling_priority(payload_metadata.as_ref());
+    let insert_index = reserved_plans
+        .iter()
+        .position(|plan| scheduling_priority(plan.metadata.as_ref()) > new_priority)
+        .unwrap_or(reserved_plans.len());
+    reserved_plans.insert(insert_index, new_plan_template.clone());
+
+    for mut plan in reserved_plans {
+        let is_new = plan.flight_id == flight_id;
+        let earliest = if is_new {
+            requested_departure
+        } else {
+            earliest_departure_for_reserved(&plan)
+        };
+
+        let route_options: Vec<atc_core::routing::RouteOption> = if is_new {
+            candidates.to_vec()
+        } else {
+            vec![atc_core::routing::RouteOption {
+                option_id: "existing".to_string(),
+                name: "Existing".to_string(),
+                description: "Existing reserved route".to_string(),
+                waypoints: plan.waypoints.clone(),
+                estimated_duration_secs: 0,
+                conflict_risk: atc_core::routing::ConflictRisk::High,
+            }]
+        };
+
+        let payload_log = if is_new {
+            payload_trajectory
+        } else {
+            plan.trajectory_log.as_ref()
+        };
+        let allow_log = if is_new { allow_payload_log } else { true };
+
+        let Some((scheduled_plan, accepted)) = try_schedule_plan(
+            state,
+            &plan,
+            &route_options,
+            payload_log,
+            allow_log,
+            earliest,
+            &scheduled,
+            max_delay_secs,
+            delay_step_secs,
+        ) else {
+            if is_new {
+                // Reject without impacting existing reservations.
+                let rejected = build_rejected_plan(
+                    &new_plan_template,
+                    candidates,
+                    payload_trajectory,
+                    payload_metadata.as_ref(),
+                    allow_payload_log,
+                    requested_departure,
+                );
+                return ReservedBatchOutcome::Rejected { rejected_plan: rejected };
+            }
+
+            plan.status = FlightStatus::Rejected;
+            updates.push(plan);
+            continue;
+        };
+
+        if accepted {
+            updates.push(scheduled_plan.clone());
+            scheduled.push(scheduled_plan);
+        } else if is_new {
+            return ReservedBatchOutcome::Rejected {
+                rejected_plan: scheduled_plan,
+            };
+        } else {
+            updates.push(scheduled_plan);
+        }
+    }
+
+    // Determine the final scheduled version of the new plan.
+    let new_plan = updates
+        .iter()
+        .find(|plan| plan.flight_id == flight_id)
+        .cloned()
+        .unwrap_or_else(|| new_plan_template.clone());
+
+    ReservedBatchOutcome::Accepted { new_plan, updates }
+}
+
+fn scheduling_priority(metadata: Option<&FlightPlanMetadata>) -> u32 {
+    metadata
+        .and_then(|meta| meta.scheduling_priority)
+        .unwrap_or(100)
+}
+
+fn earliest_departure_for_reserved(plan: &FlightPlan) -> chrono::DateTime<chrono::Utc> {
+    let requested = plan
+        .metadata
+        .as_ref()
+        .and_then(|meta| meta.requested_departure_time.as_deref())
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or(plan.departure_time);
+    requested.max(plan.departure_time)
+}
+
+fn try_schedule_plan(
+    state: &AppState,
+    plan_template: &FlightPlan,
+    route_options: &[atc_core::routing::RouteOption],
+    payload_log: Option<&Vec<TrajectoryPoint>>,
+    allow_payload_log: bool,
+    earliest_departure: chrono::DateTime<chrono::Utc>,
+    obstacles: &[FlightPlan],
+    max_delay_secs: u64,
+    delay_step_secs: u64,
+) -> Option<(FlightPlan, bool)> {
+    let mut delay_secs = 0u64;
+    while delay_secs <= max_delay_secs {
+        let scheduled_departure = earliest_departure + chrono::Duration::seconds(delay_secs as i64);
+
+        for option in route_options {
+            let candidate_log = resolve_candidate_trajectory(
+                &option.waypoints,
+                payload_log,
+                plan_template.metadata.as_ref(),
+                allow_payload_log,
+            );
+            let test_plan = FlightPlan {
+                flight_id: plan_template.flight_id.clone(),
+                drone_id: plan_template.drone_id.clone(),
+                owner_id: plan_template.owner_id.clone(),
+                waypoints: option.waypoints.clone(),
+                trajectory_log: candidate_log.clone(),
+                metadata: plan_template.metadata.clone(),
+                status: FlightStatus::Pending,
+                departure_time: scheduled_departure,
+                arrival_time: None,
+                created_at: chrono::Utc::now(),
+            };
+
+            let has_conflict = obstacles.iter().any(|existing| {
+                atc_core::spatial::check_plan_conflict_with_rules(&test_plan, existing, state.rules())
+            });
+            if has_conflict {
+                continue;
+            }
+
+            let mut metadata = plan_template.metadata.clone();
+            fill_flight_metadata(&mut metadata, &option.waypoints, candidate_log.as_ref());
+            if metadata.is_none() {
+                metadata = Some(FlightPlanMetadata::default());
+            }
+            if let Some(meta) = metadata.as_mut() {
+                if meta.requested_departure_time.is_none() {
+                    meta.requested_departure_time = Some(plan_template.departure_time.to_rfc3339());
+                }
+                let requested_base = meta
+                    .requested_departure_time
+                    .as_deref()
+                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or(plan_template.departure_time);
+                let total_delay_s = scheduled_departure
+                    .signed_duration_since(requested_base)
+                    .num_seconds()
+                    .max(0) as u64;
+                meta.scheduled_delay_s = Some(total_delay_s);
+                let ttl_secs = state.config().operational_intent_ttl_secs as i64;
+                let expires_at = chrono::Utc::now() + chrono::Duration::seconds(ttl_secs);
+                meta.reservation_expires_at = Some(expires_at.to_rfc3339());
+            }
+
+            let arrival_time = estimate_arrival_time(
+                &option.waypoints,
+                candidate_log.as_ref(),
+                metadata.as_ref(),
+                scheduled_departure,
+            );
+
+            return Some((
+                FlightPlan {
+                    flight_id: plan_template.flight_id.clone(),
+                    drone_id: plan_template.drone_id.clone(),
+                    owner_id: plan_template.owner_id.clone(),
+                    waypoints: option.waypoints.clone(),
+                    trajectory_log: candidate_log,
+                    metadata,
+                    status: FlightStatus::Reserved,
+                    departure_time: scheduled_departure,
+                    arrival_time,
+                    created_at: chrono::Utc::now(),
+                },
+                true,
+            ));
+        }
+
+        delay_secs = delay_secs.saturating_add(delay_step_secs);
+    }
+
+    None
+}
+
+fn build_rejected_plan(
+    template: &FlightPlan,
+    candidates: &[atc_core::routing::RouteOption],
+    payload_log: Option<&Vec<TrajectoryPoint>>,
+    metadata: Option<&FlightPlanMetadata>,
+    allow_payload_log: bool,
+    requested_departure: chrono::DateTime<chrono::Utc>,
+) -> FlightPlan {
+    let fallback_waypoints = candidates
+        .first()
+        .map(|option| option.waypoints.clone())
+        .unwrap_or_default();
+    let fallback_log = resolve_candidate_trajectory(
+        &fallback_waypoints,
+        payload_log,
+        metadata,
+        allow_payload_log,
+    );
+    FlightPlan {
+        flight_id: template.flight_id.clone(),
+        drone_id: template.drone_id.clone(),
+        owner_id: template.owner_id.clone(),
+        waypoints: fallback_waypoints,
+        trajectory_log: fallback_log,
+        metadata: template.metadata.clone(),
+        status: FlightStatus::Rejected,
+        departure_time: requested_departure,
+        arrival_time: None,
+        created_at: chrono::Utc::now(),
+    }
 }
 
 fn enforce_owner_for_drone(
@@ -803,6 +1225,495 @@ pub async fn get_flight_plans(
     }
 
     Json(plans)
+}
+
+// =============================
+// Operational intent endpoints
+// =============================
+
+pub async fn reserve_operational_intent(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<FlightPlanRequest>,
+) -> Result<(StatusCode, Json<FlightPlan>), (StatusCode, Json<serde_json::Value>)> {
+    let mut payload = payload;
+    enforce_owner_for_drone(
+        state.as_ref(),
+        &payload.drone_id,
+        payload.owner_id.as_deref(),
+    )?;
+    normalize_flight_plan_request(&mut payload, state.config());
+    let validation = validate_flight_plan(state.as_ref(), &payload).await;
+    if !validation.violations.is_empty() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "Operational intent rejected",
+                "violations": validation.violations
+            })),
+        ));
+    }
+    apply_compliance_metadata(&mut payload.metadata, validation.compliance.as_ref());
+    let plan = build_plan(state.as_ref(), payload, None, FlightStatus::Reserved)
+        .await
+        .map_err(|err| {
+            tracing::error!("Failed to persist operational intent: {}", err);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "Failed to persist operational intent"
+                })),
+            )
+        })?;
+    if plan.status == FlightStatus::Rejected {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "Operational intent rejected",
+                "message": "No conflict-free slot found for this reservation",
+                "plan": plan
+            })),
+        ));
+    }
+    Ok((StatusCode::CREATED, Json(plan)))
+}
+
+pub async fn confirm_operational_intent(
+    State(state): State<Arc<AppState>>,
+    Path(flight_id): Path<String>,
+) -> Result<(StatusCode, Json<FlightPlan>), (StatusCode, Json<serde_json::Value>)> {
+    let _booking_guard = state.flight_plan_booking_lock().lock().await;
+    let pool = state.database().map(|db| db.pool().clone());
+
+    let Some(pool) = pool else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "Operational intent confirmation unavailable",
+                "message": "Database is not configured"
+            })),
+        ));
+    };
+
+    let mut tx = pool.begin().await.map_err(|err| {
+        tracing::error!("Failed to start DB tx: {}", err);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":"Failed to confirm operational intent"})),
+        )
+    })?;
+    crate::persistence::flight_plans::lock_scheduler(&mut tx)
+        .await
+        .map_err(|err| {
+            tracing::error!("Failed to lock scheduler: {}", err);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"Failed to confirm operational intent"})),
+            )
+        })?;
+
+    let existing = crate::persistence::flight_plans::load_flight_plan_tx(&mut tx, &flight_id)
+        .await
+        .map_err(|err| {
+            tracing::error!("Failed to load operational intent: {}", err);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"Failed to confirm operational intent"})),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": "Not found",
+                    "message": "Operational intent not found",
+                    "flight_id": flight_id
+                })),
+            )
+        })?;
+
+    if existing.status != FlightStatus::Reserved && existing.status != FlightStatus::Approved {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "Invalid state transition",
+                "message": "Only reserved intents can be confirmed",
+                "flight_id": flight_id,
+                "status": existing.status
+            })),
+        ));
+    }
+
+    if existing.status == FlightStatus::Approved {
+        tx.commit().await.ok();
+        return Ok((StatusCode::OK, Json(existing)));
+    }
+
+    let mut updated = existing.clone();
+    updated.status = FlightStatus::Approved;
+
+    // Re-check conflicts before confirming.
+    let existing_plans =
+        crate::persistence::flight_plans::load_all_flight_plans_tx(&mut tx)
+            .await
+            .unwrap_or_default();
+    let has_conflict = existing_plans.iter().any(|plan| {
+        plan.flight_id != updated.flight_id
+            && matches!(
+                plan.status,
+                FlightStatus::Reserved | FlightStatus::Approved | FlightStatus::Active
+            )
+            && atc_core::spatial::check_plan_conflict_with_rules(&updated, plan, state.rules())
+    });
+    if has_conflict {
+        tx.rollback().await.ok();
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "Reservation conflict",
+                "message": "Reservation is no longer conflict-free; reserve again",
+                "flight_id": flight_id
+            })),
+        ));
+    }
+
+    crate::persistence::flight_plans::upsert_flight_plan_tx(&mut tx, &updated)
+        .await
+        .map_err(|err| {
+            tracing::error!("Failed to persist confirmed intent: {}", err);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "Failed to confirm operational intent"
+                })),
+            )
+        })?;
+    tx.commit().await.map_err(|err| {
+        tracing::error!("Failed to commit operational intent confirm: {}", err);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": "Failed to confirm operational intent"
+            })),
+        )
+    })?;
+
+    state
+        .flight_plans
+        .insert(updated.flight_id.clone(), updated.clone());
+
+    Ok((StatusCode::OK, Json(updated)))
+}
+
+pub async fn cancel_operational_intent(
+    State(state): State<Arc<AppState>>,
+    Path(flight_id): Path<String>,
+) -> Result<(StatusCode, Json<FlightPlan>), (StatusCode, Json<serde_json::Value>)> {
+    let _booking_guard = state.flight_plan_booking_lock().lock().await;
+    let pool = state.database().map(|db| db.pool().clone());
+
+    let Some(pool) = pool else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "Operational intent cancellation unavailable",
+                "message": "Database is not configured"
+            })),
+        ));
+    };
+
+    let mut tx = pool.begin().await.map_err(|err| {
+        tracing::error!("Failed to start DB tx: {}", err);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":"Failed to cancel operational intent"})),
+        )
+    })?;
+    crate::persistence::flight_plans::lock_scheduler(&mut tx)
+        .await
+        .map_err(|err| {
+            tracing::error!("Failed to lock scheduler: {}", err);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"Failed to cancel operational intent"})),
+            )
+        })?;
+
+    let existing = crate::persistence::flight_plans::load_flight_plan_tx(&mut tx, &flight_id)
+        .await
+        .map_err(|err| {
+            tracing::error!("Failed to load operational intent: {}", err);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"Failed to cancel operational intent"})),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": "Not found",
+                    "message": "Operational intent not found",
+                    "flight_id": flight_id
+                })),
+            )
+        })?;
+
+    let mut updated = existing.clone();
+    updated.status = FlightStatus::Cancelled;
+
+    crate::persistence::flight_plans::upsert_flight_plan_tx(&mut tx, &updated)
+        .await
+        .map_err(|err| {
+            tracing::error!("Failed to persist cancelled intent: {}", err);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "Failed to cancel operational intent"
+                })),
+            )
+        })?;
+    tx.commit().await.map_err(|err| {
+        tracing::error!("Failed to commit operational intent cancel: {}", err);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": "Failed to cancel operational intent"
+            })),
+        )
+    })?;
+
+    state
+        .flight_plans
+        .insert(updated.flight_id.clone(), updated.clone());
+
+    Ok((StatusCode::OK, Json(updated)))
+}
+
+pub async fn update_operational_intent(
+    State(state): State<Arc<AppState>>,
+    Path(flight_id): Path<String>,
+    Json(payload): Json<FlightPlanRequest>,
+) -> Result<(StatusCode, Json<FlightPlan>), (StatusCode, Json<serde_json::Value>)> {
+    let _booking_guard = state.flight_plan_booking_lock().lock().await;
+    let pool = state.database().map(|db| db.pool().clone());
+
+    let Some(pool) = pool else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "Operational intent update unavailable",
+                "message": "Database is not configured"
+            })),
+        ));
+    };
+
+    let mut tx = pool.begin().await.map_err(|err| {
+        tracing::error!("Failed to start DB tx: {}", err);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":"Failed to update operational intent"})),
+        )
+    })?;
+    crate::persistence::flight_plans::lock_scheduler(&mut tx)
+        .await
+        .map_err(|err| {
+            tracing::error!("Failed to lock scheduler: {}", err);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"Failed to update operational intent"})),
+            )
+        })?;
+
+    let existing = crate::persistence::flight_plans::load_flight_plan_tx(&mut tx, &flight_id)
+        .await
+        .map_err(|err| {
+            tracing::error!("Failed to load operational intent: {}", err);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"Failed to update operational intent"})),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": "Not found",
+                    "message": "Operational intent not found",
+                    "flight_id": flight_id
+                })),
+            )
+        })?;
+
+    if existing.status != FlightStatus::Reserved {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "Invalid state transition",
+                "message": "Only reserved intents can be updated",
+                "flight_id": flight_id,
+                "status": existing.status
+            })),
+        ));
+    }
+
+    let mut payload = payload;
+    if payload.drone_id != existing.drone_id {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "Invalid update",
+                "message": "drone_id cannot be changed for an existing operational intent",
+                "flight_id": flight_id,
+                "drone_id": payload.drone_id,
+                "expected_drone_id": existing.drone_id
+            })),
+        ));
+    }
+    if payload.owner_id.is_none() {
+        payload.owner_id = existing.owner_id.clone();
+    }
+    if let Some(existing_priority) = existing
+        .metadata
+        .as_ref()
+        .and_then(|meta| meta.scheduling_priority)
+    {
+        let missing_priority = payload
+            .metadata
+            .as_ref()
+            .and_then(|meta| meta.scheduling_priority)
+            .is_none();
+        if missing_priority {
+            if payload.metadata.is_none() {
+                payload.metadata = Some(FlightPlanMetadata::default());
+            }
+            if let Some(meta) = payload.metadata.as_mut() {
+                meta.scheduling_priority = Some(existing_priority);
+            }
+        }
+    }
+
+    enforce_owner_for_drone(
+        state.as_ref(),
+        &payload.drone_id,
+        payload.owner_id.as_deref(),
+    )?;
+    normalize_flight_plan_request(&mut payload, state.config());
+    let validation = validate_flight_plan(state.as_ref(), &payload).await;
+    if !validation.violations.is_empty() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "Operational intent rejected",
+                "violations": validation.violations
+            })),
+        ));
+    }
+    apply_compliance_metadata(&mut payload.metadata, validation.compliance.as_ref());
+
+    let FlightPlanRequest {
+        drone_id,
+        owner_id,
+        waypoints,
+        trajectory_log,
+        metadata,
+        origin,
+        destination,
+        departure_time,
+    } = payload;
+
+    let default_departure = existing
+        .metadata
+        .as_ref()
+        .and_then(|meta| meta.requested_departure_time.as_deref())
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or(existing.departure_time);
+    let departure = departure_time.unwrap_or(default_departure);
+
+    let has_custom_waypoints = waypoints.is_some();
+
+    let candidates = if let Some(wp) = waypoints {
+        vec![atc_core::routing::RouteOption {
+            option_id: "user".to_string(),
+            name: "User Defined".to_string(),
+            description: "Custom route".to_string(),
+            waypoints: wp,
+            estimated_duration_secs: 0,
+            conflict_risk: atc_core::routing::ConflictRisk::High,
+        }]
+    } else if let (Some(origin), Some(dest)) = (origin, destination) {
+        atc_core::routing::generate_route_options(origin, dest, 50.0)
+    } else {
+        vec![atc_core::routing::RouteOption {
+            option_id: "random".to_string(),
+            name: "Random".to_string(),
+            description: "Randomly generated".to_string(),
+            waypoints: generate_random_route(),
+            estimated_duration_secs: 0,
+            conflict_risk: atc_core::routing::ConflictRisk::High,
+        }]
+    };
+
+    let existing_plans = crate::persistence::flight_plans::load_all_flight_plans_tx(&mut tx)
+        .await
+        .map_err(|err| {
+            tracing::error!("Failed to load existing plans: {}", err);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"Failed to update operational intent"})),
+            )
+        })?;
+
+    match schedule_reserved_batch(
+        state.as_ref(),
+        &existing_plans,
+        &flight_id,
+        &drone_id,
+        owner_id.as_deref(),
+        &candidates,
+        trajectory_log.as_ref(),
+        metadata.clone(),
+        has_custom_waypoints,
+        departure,
+    ) {
+        ReservedBatchOutcome::Accepted { new_plan, updates } => {
+            for plan in &updates {
+                crate::persistence::flight_plans::upsert_flight_plan_tx(&mut tx, plan)
+                    .await
+                    .map_err(|err| {
+                        tracing::error!("Failed to persist updated intents: {}", err);
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"error":"Failed to update operational intent"})),
+                        )
+                    })?;
+            }
+            tx.commit().await.map_err(|err| {
+                tracing::error!("Failed to commit operational intent update: {}", err);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error":"Failed to update operational intent"})),
+                )
+            })?;
+
+            for plan in &updates {
+                state.flight_plans.insert(plan.flight_id.clone(), plan.clone());
+            }
+
+            Ok((StatusCode::OK, Json(new_plan)))
+        }
+        ReservedBatchOutcome::Rejected { rejected_plan } => {
+            tx.rollback().await.ok();
+            Err((
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "Operational intent rejected",
+                    "message": "No conflict-free slot found for this reservation update",
+                    "plan": rejected_plan
+                })),
+            ))
+        }
+    }
 }
 
 /// Estimate arrival time based on trajectory timing or waypoint distances.

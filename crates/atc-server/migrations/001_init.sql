@@ -79,6 +79,13 @@ CREATE TABLE IF NOT EXISTS geofence_sync_state (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Scheduler lock: single-row table used to serialize strategic scheduling transactions across processes.
+CREATE TABLE IF NOT EXISTS scheduler_lock (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+INSERT OR IGNORE INTO scheduler_lock (id) VALUES (1);
+
 -- Indexes for common queries
 CREATE INDEX IF NOT EXISTS idx_drones_owner ON drones(owner_id);
 CREATE INDEX IF NOT EXISTS idx_drones_status ON drones(status);

@@ -17,6 +17,17 @@ use crate::state::AppState;
 #[derive(Clone)]
 pub struct AdminToken(pub Arc<String>);
 
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (&left, &right) in a.iter().zip(b.iter()) {
+        diff |= left ^ right;
+    }
+    diff == 0
+}
+
 /// Middleware that requires a valid admin token in the Authorization header.
 /// 
 /// Expected header format: `Authorization: Bearer <admin_token>`
@@ -34,7 +45,7 @@ pub async fn require_admin(
     match auth_header {
         Some(auth) if auth.starts_with("Bearer ") => {
             let token = auth.trim_start_matches("Bearer ");
-            if token == admin_token.0.as_str() {
+            if constant_time_eq(token.as_bytes(), admin_token.0.as_bytes()) {
                 next.run(request).await
             } else {
                 (

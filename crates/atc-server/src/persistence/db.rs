@@ -3,7 +3,7 @@
 use anyhow::Result;
 use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
 use std::path::Path;
-use tracing::{info, warn};
+use tracing::info;
 
 /// Database connection wrapper.
 #[derive(Clone)]
@@ -60,37 +60,10 @@ pub async fn init_database(db_path: &str, max_connections: u32) -> Result<Databa
 
 /// Run database migrations.
 async fn run_migrations(pool: &SqlitePool) -> Result<()> {
-    // Read and execute the init migration
-    let migration_sql = include_str!("../../migrations/001_init.sql");
-    
     info!("Running database migrations...");
-    
-    // Split by semicolons and execute each statement
-    for statement in migration_sql.split(';') {
-        // Remove comment lines and trim whitespace
-        let statement: String = statement
-            .lines()
-            .filter(|line| !line.trim().starts_with("--"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let statement = statement.trim();
-        if statement.is_empty() {
-            continue;
-        }
-        
-        if let Err(e) = sqlx::query(statement).execute(pool).await {
-            let err_str = e.to_string();
-            // "already exists" is expected on re-runs
-            if err_str.contains("already exists") {
-                continue;
-            }
-            // CREATE TABLE and CREATE INDEX should fail fast
-            if statement.to_uppercase().starts_with("CREATE") {
-                anyhow::bail!("Migration failed on CREATE statement: {}", e);
-            }
-            warn!("Migration statement failed: {}", e);
-        }
-    }
+
+    static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+    MIGRATOR.run(pool).await?;
 
     ensure_flight_plan_columns(pool).await?;
     

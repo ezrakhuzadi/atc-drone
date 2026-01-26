@@ -561,12 +561,22 @@ fn evaluate_obstacles(
 
     let mut conflicts = Vec::new();
     let mut warnings = Vec::new();
+    let clearance_m = clearance_m.max(0.0);
     let warn_buffer = clearance_m * 1.5;
 
     for hazard in &hazard_list {
         let distance = distance_to_route_meters(hazard.lat, hazard.lon, points);
-        let conflict_threshold = hazard.radius_m + clearance_m;
-        let warn_threshold = hazard.radius_m + warn_buffer;
+        if !distance.is_finite() {
+            continue;
+        }
+        let hazard_radius = if hazard.radius_m.is_finite() {
+            hazard.radius_m.max(0.0)
+        } else {
+            0.0
+        };
+
+        let conflict_threshold = hazard_radius;
+        let warn_threshold = hazard_radius + warn_buffer;
         if distance <= conflict_threshold {
             conflicts.push(ObstacleConflict {
                 id: hazard.id.clone(),
@@ -720,7 +730,7 @@ pub(crate) async fn fetch_obstacles(
             "[out:json][timeout:{overpass_timeout_s}];\n(\n  node[\"man_made\"~\"tower|mast|chimney\"]({bbox});\n  node[\"power\"=\"tower\"]({bbox});\n  node[\"aeroway\"~\"helipad|heliport\"]({bbox});\n  way[\"man_made\"~\"tower|mast|chimney\"]({bbox});\n  way[\"power\"=\"tower\"]({bbox});\n  way[\"aeroway\"~\"helipad|heliport\"]({bbox});\n  way[\"building\"]({bbox});\n  way[\"building:part\"]({bbox});\n  relation[\"building\"]({bbox});\n  relation[\"building:part\"]({bbox});\n);\nout center tags;"
         ),
         ObstacleQueryMode::RoutePlanner => format!(
-            "[out:json][timeout:{overpass_timeout_s}];\n(\n  node[\"man_made\"~\"tower|mast|chimney\"]({bbox});\n  node[\"power\"=\"tower\"]({bbox});\n  node[\"aeroway\"~\"helipad|heliport\"]({bbox});\n  way[\"man_made\"~\"tower|mast|chimney\"]({bbox});\n  way[\"power\"=\"tower\"]({bbox});\n  way[\"aeroway\"~\"helipad|heliport\"]({bbox});\n  way[\"building\"][\"height\"]({bbox})(if:number(t[\"height\"])>{route_min_height_m});\n  way[\"building\"][\"building:height\"]({bbox})(if:number(t[\"building:height\"])>{route_min_height_m});\n  way[\"building\"][\"building:levels\"]({bbox})(if:number(t[\"building:levels\"])>{route_min_levels});\n  way[\"building\"][\"levels\"]({bbox})(if:number(t[\"levels\"])>{route_min_levels});\n  way[\"building:part\"][\"height\"]({bbox})(if:number(t[\"height\"])>{route_min_height_m});\n  way[\"building:part\"][\"building:height\"]({bbox})(if:number(t[\"building:height\"])>{route_min_height_m});\n  way[\"building:part\"][\"building:levels\"]({bbox})(if:number(t[\"building:levels\"])>{route_min_levels});\n  way[\"building:part\"][\"levels\"]({bbox})(if:number(t[\"levels\"])>{route_min_levels});\n  relation[\"building\"][\"height\"]({bbox})(if:number(t[\"height\"])>{route_min_height_m});\n  relation[\"building\"][\"building:height\"]({bbox})(if:number(t[\"building:height\"])>{route_min_height_m});\n  relation[\"building\"][\"building:levels\"]({bbox})(if:number(t[\"building:levels\"])>{route_min_levels});\n  relation[\"building\"][\"levels\"]({bbox})(if:number(t[\"levels\"])>{route_min_levels});\n  relation[\"building:part\"][\"height\"]({bbox})(if:number(t[\"height\"])>{route_min_height_m});\n  relation[\"building:part\"][\"building:height\"]({bbox})(if:number(t[\"building:height\"])>{route_min_height_m});\n  relation[\"building:part\"][\"building:levels\"]({bbox})(if:number(t[\"building:levels\"])>{route_min_levels});\n  relation[\"building:part\"][\"levels\"]({bbox})(if:number(t[\"levels\"])>{route_min_levels});\n);\nout center tags qt;"
+            "[out:json][timeout:{overpass_timeout_s}];\n(\n  node[\"man_made\"~\"tower|mast|chimney\"]({bbox});\n  node[\"power\"=\"tower\"]({bbox});\n  node[\"aeroway\"~\"helipad|heliport\"]({bbox});\n  way[\"man_made\"~\"tower|mast|chimney\"]({bbox});\n  way[\"power\"=\"tower\"]({bbox});\n  way[\"aeroway\"~\"helipad|heliport\"]({bbox});\n  way({bbox})[\"building\"][~\"^(height|building:height|building:levels|levels)$\"~\".+\"];\n  way({bbox})[\"building:part\"][~\"^(height|building:height|building:levels|levels)$\"~\".+\"];\n  relation({bbox})[\"building\"][~\"^(height|building:height|building:levels|levels)$\"~\".+\"];\n  relation({bbox})[\"building:part\"][~\"^(height|building:height|building:levels|levels)$\"~\".+\"];\n);\nout center tags qt;"
         ),
     };
 
@@ -790,12 +800,22 @@ pub(crate) async fn fetch_obstacles(
     }
     let default_height = config.compliance_default_building_height_m.max(1.0);
 
+    let empty_tags: HashMap<String, String> = HashMap::new();
     for element in elements {
-        let tags = element.tags.clone().unwrap_or_default();
+        let tags = element.tags.as_ref().unwrap_or(&empty_tags);
         let man_made = tags.get("man_made").map(String::as_str);
         let aeroway = tags.get("aeroway").map(String::as_str);
         let power = tags.get("power").map(String::as_str);
         let is_building = tags.get("building").is_some() || tags.get("building:part").is_some();
+        if matches!(mode, ObstacleQueryMode::RoutePlanner) && is_building {
+            let has_height_tag = tags.contains_key("height")
+                || tags.contains_key("building:height")
+                || tags.contains_key("building:levels")
+                || tags.contains_key("levels");
+            if !has_height_tag {
+                continue;
+            }
+        }
 
         let is_tower = matches!(man_made, Some("tower") | Some("mast") | Some("chimney"));
         let is_power_tower = matches!(power, Some("tower"));
@@ -839,6 +859,13 @@ pub(crate) async fn fetch_obstacles(
             .unwrap_or(default_height);
         if !height_m.is_finite() || height_m <= 0.0 {
             height_m = default_height;
+        }
+        if matches!(mode, ObstacleQueryMode::RoutePlanner) && is_building {
+            let tall_enough =
+                height_m + f64::EPSILON >= route_min_height_m || levels.unwrap_or(0.0) >= route_min_levels;
+            if !tall_enough {
+                continue;
+            }
         }
 
         let base_radius = clearance_m.max(50.0);

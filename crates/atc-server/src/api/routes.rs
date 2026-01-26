@@ -37,6 +37,11 @@ pub fn create_router(config: &Config) -> Router<Arc<AppState>> {
         config.rate_limit_enabled,
         config.trust_proxy,
     );
+    let expensive_limiter = RateLimiter::new(
+        config.expensive_rate_limit_rps,
+        config.rate_limit_enabled,
+        config.trust_proxy,
+    );
     
     // Create admin token extractor
     let admin_token = AdminToken(Arc::new(config.admin_token.clone()));
@@ -50,9 +55,7 @@ pub fn create_router(config: &Config) -> Router<Arc<AppState>> {
         .route("/v1/conformance", get(list_conformance))
         .route("/v1/daa", get(daa::list_daa))
         .route("/v1/compliance/limits", get(get_compliance_limits))
-        .route("/v1/compliance/evaluate", post(evaluate_compliance))
         .route("/v1/rid/view", post(update_rid_view))
-        .route("/v1/routes/plan", post(plan_route_handler))
         .route("/v1/flights", get(flights::get_flight_plans))
         // Command polling routes
         .route("/v1/commands/next", get(commands::get_next_command))
@@ -81,12 +84,33 @@ pub fn create_router(config: &Config) -> Router<Arc<AppState>> {
     let admin_flight_routes = Router::new()
         .route("/v1/flights/plan", post(flights::create_flight_plan))
         .route("/v1/flights", post(flights::create_flight_plan_compat))
+        .route(
+            "/v1/operational_intents/reserve",
+            post(flights::reserve_operational_intent),
+        )
+        .route(
+            "/v1/operational_intents/:flight_id/confirm",
+            post(flights::confirm_operational_intent),
+        )
+        .route(
+            "/v1/operational_intents/:flight_id",
+            put(flights::update_operational_intent),
+        )
+        .route(
+            "/v1/operational_intents/:flight_id/cancel",
+            post(flights::cancel_operational_intent),
+        )
         .layer(middleware::from_fn_with_state(admin_token.clone(), auth::require_admin));
     
     // Rate-limited telemetry route
     let telemetry_route = Router::new()
         .route("/v1/telemetry", post(receive_telemetry))
         .layer(middleware::from_fn_with_state(rate_limiter, auth::rate_limit));
+
+    let expensive_routes = Router::new()
+        .route("/v1/compliance/evaluate", post(evaluate_compliance))
+        .route("/v1/routes/plan", post(plan_route_handler))
+        .layer(middleware::from_fn_with_state(expensive_limiter, auth::rate_limit));
     
     // Admin routes (require admin token)
     let admin_routes = Router::new()
@@ -96,6 +120,7 @@ pub fn create_router(config: &Config) -> Router<Arc<AppState>> {
     public_routes
         .merge(registration_routes)
         .merge(telemetry_route)
+        .merge(expensive_routes)
         .merge(admin_command_routes)
         .merge(admin_flight_routes)
         .merge(admin_routes)

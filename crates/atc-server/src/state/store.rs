@@ -12,7 +12,8 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
-    atomic::{AtomicU32, Ordering},
+    atomic::{AtomicU32, AtomicU64, Ordering},
+    Arc,
     RwLock,
 };
 
@@ -27,6 +28,7 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 
 const TELEMETRY_QUEUE_DEPTH: usize = 4096;
 const DETECTOR_QUEUE_DEPTH: usize = 4096;
+const DETECTOR_QUEUE_WARN_INTERVAL_SECS: u64 = 5;
 
 /// Application state - thread-safe store for drones and conflicts.
 pub struct AppState {
@@ -39,6 +41,8 @@ pub struct AppState {
     detector: std::sync::Mutex<ConflictDetector>,
     detector_tx: mpsc::Sender<DetectorUpdate>,
     detector_rx: std::sync::Mutex<mpsc::Receiver<DetectorUpdate>>,
+    detector_overflow: std::sync::Mutex<HashMap<String, DetectorUpdate>>,
+    detector_queue_warn_last: AtomicU64,
     conflicts: DashMap<String, Conflict>,
     /// Command queues per drone (FIFO)
     commands: DashMap<String, VecDeque<Command>>,
@@ -97,6 +101,15 @@ enum DetectorUpdate {
     Remove(String),
 }
 
+impl DetectorUpdate {
+    fn key(&self) -> &str {
+        match self {
+            DetectorUpdate::Upsert(position) => &position.drone_id,
+            DetectorUpdate::Remove(drone_id) => drone_id,
+        }
+    }
+}
+
 impl AppState {
     /// Create new AppState with database for persistence.
     pub fn with_database(db: Database, config: Config) -> Self {
@@ -133,6 +146,8 @@ impl AppState {
             detector: std::sync::Mutex::new(detector),
             detector_tx,
             detector_rx: std::sync::Mutex::new(detector_rx),
+            detector_overflow: std::sync::Mutex::new(HashMap::new()),
+            detector_queue_warn_last: AtomicU64::new(0),
             conflicts: DashMap::new(),
             commands: DashMap::new(),
             command_cooldowns: DashMap::new(),
@@ -273,24 +288,50 @@ impl AppState {
     }
 
     fn queue_detector_update(&self, update: DetectorUpdate) {
-        let update = match self.detector_tx.try_send(update) {
-            Ok(_) => return,
+        let key = update.key().to_string();
+        match self.detector_tx.try_send(update) {
+            Ok(_) => {
+                if let Ok(mut guard) = self.detector_overflow.lock() {
+                    guard.remove(&key);
+                }
+            }
             Err(mpsc::error::TrySendError::Full(update)) => {
-                tracing::warn!("Conflict detector queue full; applying update synchronously");
-                update
+                self.warn_detector_backpressure("full");
+                self.store_detector_overflow(key, update);
             }
             Err(mpsc::error::TrySendError::Closed(update)) => {
-                tracing::warn!("Conflict detector queue closed; applying update synchronously");
-                update
+                self.warn_detector_backpressure("closed");
+                self.store_detector_overflow(key, update);
             }
-        };
+        }
+    }
 
-        if let Ok(mut detector) = self.detector.lock() {
-            match update {
-                DetectorUpdate::Upsert(position) => detector.update_position(position),
-                DetectorUpdate::Remove(drone_id) => detector.remove_drone(&drone_id),
-            }
-            self.update_conflicts_from_detector(&mut detector);
+    fn warn_detector_backpressure(&self, reason: &'static str) {
+        let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+            return;
+        };
+        let now_secs = now.as_secs();
+
+        let last = self.detector_queue_warn_last.load(Ordering::Relaxed);
+        if now_secs.saturating_sub(last) < DETECTOR_QUEUE_WARN_INTERVAL_SECS {
+            return;
+        }
+
+        if self
+            .detector_queue_warn_last
+            .compare_exchange(last, now_secs, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            tracing::warn!(
+                "Conflict detector queue {} (backpressure); stashing latest updates",
+                reason
+            );
+        }
+    }
+
+    fn store_detector_overflow(&self, key: String, update: DetectorUpdate) {
+        if let Ok(mut guard) = self.detector_overflow.lock() {
+            guard.insert(key, update);
         }
     }
 
@@ -657,25 +698,53 @@ impl AppState {
     }
 
     /// Recompute conflicts from the latest detector state.
-    pub fn refresh_conflicts(&self) {
-        let updates = {
-            let mut pending = Vec::new();
-            if let Ok(mut rx) = self.detector_rx.lock() {
-                while let Ok(update) = rx.try_recv() {
-                    pending.push(update);
-                }
+    pub async fn refresh_conflicts(self: &Arc<Self>) {
+        let mut updates = Vec::new();
+        {
+            let mut rx = self
+                .detector_rx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            while let Ok(update) = rx.try_recv() {
+                updates.push(update);
             }
-            pending
+        }
+
+        let overflow_updates = {
+            let mut guard = self
+                .detector_overflow
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *guard)
         };
 
-        if let Ok(mut detector) = self.detector.lock() {
+        if updates.is_empty() && overflow_updates.is_empty() {
+            return;
+        }
+
+        // Apply overflow updates after queued updates so they overwrite older channel entries.
+        updates.extend(overflow_updates.into_values());
+
+        let state = self.clone();
+        let refresh_task = tokio::task::spawn_blocking(move || {
+            let mut detector = match state.detector.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    tracing::error!("Conflict detector mutex poisoned; continuing with inner state");
+                    poisoned.into_inner()
+                }
+            };
             for update in updates {
                 match update {
                     DetectorUpdate::Upsert(position) => detector.update_position(position),
                     DetectorUpdate::Remove(drone_id) => detector.remove_drone(&drone_id),
                 }
             }
-            self.update_conflicts_from_detector(&mut detector);
+            state.update_conflicts_from_detector(&mut detector);
+        });
+
+        if let Err(err) = refresh_task.await {
+            tracing::warn!("Conflict detector refresh task failed: {}", err);
         }
     }
 
@@ -765,16 +834,8 @@ impl AppState {
 
     /// Add or update a flight plan, persisting before updating in-memory state.
     pub async fn add_flight_plan(&self, plan: FlightPlan) -> Result<()> {
-        let blender_linked = plan
-            .metadata
-            .as_ref()
-            .and_then(|meta| meta.blender_declaration_id.as_deref())
-            .map(|id| !id.trim().is_empty())
-            .unwrap_or(false);
-        if !blender_linked {
-            if let Some(db) = self.database.clone() {
-                flight_plans_db::upsert_flight_plan(db.pool(), &plan).await?;
-            }
+        if let Some(db) = self.database.clone() {
+            flight_plans_db::upsert_flight_plan(db.pool(), &plan).await?;
         }
         self.flight_plans.insert(plan.flight_id.clone(), plan);
         Ok(())
@@ -1175,6 +1236,9 @@ impl AppState {
         self.conformance.clear();
         self.daa_advisories.clear();
         if let Ok(mut guard) = self.telemetry_overflow.lock() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.detector_overflow.lock() {
             guard.clear();
         }
 

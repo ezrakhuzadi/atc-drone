@@ -6,7 +6,7 @@ use atc_core::spatial::{meters_per_deg_lat, meters_per_deg_lon};
 use crate::compliance::RoutePoint;
 use dashmap::DashMap;
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -105,6 +105,12 @@ struct TerrainBounds {
 #[derive(Debug, Deserialize)]
 struct OpenMeteoElevationResponse {
     elevation: Option<Vec<f64>>,
+}
+
+#[derive(Debug, Serialize)]
+struct TerrainBatchRequest<'a> {
+    latitude: &'a [f64],
+    longitude: &'a [f64],
 }
 
 pub async fn fetch_terrain_grid(
@@ -213,8 +219,6 @@ pub async fn fetch_terrain_grid(
         let end = (start + max_points).min(total);
         let lat_slice = &latitudes[start..end];
         let lon_slice = &longitudes[start..end];
-        let lat_param = join_params(lat_slice);
-        let lon_param = join_params(lon_slice);
 
         if let Some(last_request_at) = last_request_at {
             let elapsed = last_request_at.elapsed();
@@ -223,16 +227,36 @@ pub async fn fetch_terrain_grid(
             }
         }
 
-        let url = build_provider_url(&config.terrain_provider_url, &lat_param, &lon_param);
+        let (url, request_body) = if config.terrain_use_post {
+            (
+                config.terrain_provider_url.clone(),
+                Some(TerrainBatchRequest {
+                    latitude: lat_slice,
+                    longitude: lon_slice,
+                }),
+            )
+        } else {
+            let lat_param = join_params(lat_slice);
+            let lon_param = join_params(lon_slice);
+            (
+                build_provider_url(&config.terrain_provider_url, &lat_param, &lon_param),
+                None,
+            )
+        };
         let mut payload: Option<OpenMeteoElevationResponse> = None;
         let mut last_err: Option<String> = None;
 
         for attempt in 0..max_attempts {
-            let response = client
-                .get(&url)
-                .timeout(timeout)
-                .send()
-                .await;
+            let response = if let Some(body) = request_body.as_ref() {
+                client
+                    .post(&url)
+                    .timeout(timeout)
+                    .json(body)
+                    .send()
+                    .await
+            } else {
+                client.get(&url).timeout(timeout).send().await
+            };
 
             match response {
                 Ok(response) => {

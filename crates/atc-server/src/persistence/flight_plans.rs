@@ -1,12 +1,33 @@
 //! Flight plan persistence operations.
 
 use anyhow::Result;
-use sqlx::SqlitePool;
+use sqlx::{Sqlite, SqlitePool};
 use atc_core::models::{FlightPlan, FlightStatus, Waypoint, FlightPlanMetadata, TrajectoryPoint};
 use chrono::{DateTime, Utc};
 
+/// Serialize strategic scheduling across processes by taking a write lock early.
+pub async fn lock_scheduler(tx: &mut sqlx::Transaction<'_, Sqlite>) -> Result<()> {
+    sqlx::query("UPDATE scheduler_lock SET updated_at = CURRENT_TIMESTAMP WHERE id = 1")
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 /// Upsert a flight plan into the database.
 pub async fn upsert_flight_plan(pool: &SqlitePool, plan: &FlightPlan) -> Result<()> {
+    // Ensure the referenced drone exists so the flight plan FK doesn't fail (e.g. Blender-synced IDs).
+    sqlx::query(
+        r#"
+        INSERT INTO drones (drone_id, owner_id, last_update)
+        VALUES (?1, ?2, CURRENT_TIMESTAMP)
+        ON CONFLICT(drone_id) DO NOTHING
+        "#,
+    )
+    .bind(&plan.drone_id)
+    .bind(&plan.owner_id)
+    .execute(pool)
+    .await?;
+
     let waypoints_json = serde_json::to_string(&plan.waypoints)?;
     let trajectory_log_json = match &plan.trajectory_log {
         Some(log) => Some(serde_json::to_string(log)?),
@@ -63,15 +84,134 @@ pub async fn upsert_flight_plan(pool: &SqlitePool, plan: &FlightPlan) -> Result<
     Ok(())
 }
 
+/// Upsert a flight plan into the database within an existing transaction.
+pub async fn upsert_flight_plan_tx(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    plan: &FlightPlan,
+) -> Result<()> {
+    // Ensure the referenced drone exists so the flight plan FK doesn't fail (e.g. Blender-synced IDs).
+    sqlx::query(
+        r#"
+        INSERT INTO drones (drone_id, owner_id, last_update)
+        VALUES (?1, ?2, CURRENT_TIMESTAMP)
+        ON CONFLICT(drone_id) DO NOTHING
+        "#,
+    )
+    .bind(&plan.drone_id)
+    .bind(&plan.owner_id)
+    .execute(&mut **tx)
+    .await?;
+
+    let waypoints_json = serde_json::to_string(&plan.waypoints)?;
+    let trajectory_log_json = match &plan.trajectory_log {
+        Some(log) => Some(serde_json::to_string(log)?),
+        None => None,
+    };
+    let metadata_json = match &plan.metadata {
+        Some(metadata) => Some(serde_json::to_string(metadata)?),
+        None => None,
+    };
+    let status = format!("{:?}", plan.status);
+
+    let (origin_lat, origin_lon) = plan
+        .waypoints
+        .first()
+        .map(|w| (Some(w.lat), Some(w.lon)))
+        .unwrap_or((None, None));
+
+    let (dest_lat, dest_lon) = plan
+        .waypoints
+        .last()
+        .map(|w| (Some(w.lat), Some(w.lon)))
+        .unwrap_or((None, None));
+
+    sqlx::query(
+        r#"
+        INSERT INTO flight_plans (
+            flight_id, drone_id, owner_id,
+            origin_lat, origin_lon, dest_lat, dest_lon,
+            waypoints, trajectory_log, metadata,
+            status, start_time, end_time, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        ON CONFLICT(flight_id) DO UPDATE SET
+            drone_id = ?2, owner_id = ?3,
+            origin_lat = ?4, origin_lon = ?5,
+            dest_lat = ?6, dest_lon = ?7,
+            waypoints = ?8, trajectory_log = ?9, metadata = ?10,
+            status = ?11, start_time = ?12, end_time = ?13
+        "#,
+    )
+    .bind(&plan.flight_id)
+    .bind(&plan.drone_id)
+    .bind(&plan.owner_id)
+    .bind(origin_lat)
+    .bind(origin_lon)
+    .bind(dest_lat)
+    .bind(dest_lon)
+    .bind(&waypoints_json)
+    .bind(&trajectory_log_json)
+    .bind(&metadata_json)
+    .bind(&status)
+    .bind(plan.departure_time.to_rfc3339())
+    .bind(plan.arrival_time.map(|t| t.to_rfc3339()))
+    .bind(plan.created_at.to_rfc3339())
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
 /// Load all flight plans from the database.
 pub async fn load_all_flight_plans(pool: &SqlitePool) -> Result<Vec<FlightPlan>> {
+    load_all_flight_plans_impl(pool).await
+}
+
+/// Load all flight plans from the database within an existing transaction.
+pub async fn load_all_flight_plans_tx(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+) -> Result<Vec<FlightPlan>> {
+    load_all_flight_plans_impl(&mut **tx).await
+}
+
+async fn load_all_flight_plans_impl<'e, E>(executor: E) -> Result<Vec<FlightPlan>>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
     let rows = sqlx::query_as::<_, FlightPlanRow>(
-        "SELECT flight_id, drone_id, owner_id, waypoints, trajectory_log, metadata, status, start_time, end_time, created_at FROM flight_plans"
+        "SELECT flight_id, drone_id, owner_id, waypoints, trajectory_log, metadata, status, start_time, end_time, created_at FROM flight_plans",
     )
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
-    
+
     rows.into_iter().map(|r| r.try_into()).collect()
+}
+
+/// Load a single flight plan by ID.
+pub async fn load_flight_plan(pool: &SqlitePool, flight_id: &str) -> Result<Option<FlightPlan>> {
+    load_flight_plan_impl(pool, flight_id).await
+}
+
+/// Load a single flight plan by ID within an existing transaction.
+pub async fn load_flight_plan_tx(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    flight_id: &str,
+) -> Result<Option<FlightPlan>> {
+    load_flight_plan_impl(&mut **tx, flight_id).await
+}
+
+async fn load_flight_plan_impl<'e, E>(executor: E, flight_id: &str) -> Result<Option<FlightPlan>>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    let row = sqlx::query_as::<_, FlightPlanRow>(
+        "SELECT flight_id, drone_id, owner_id, waypoints, trajectory_log, metadata, status, start_time, end_time, created_at FROM flight_plans WHERE flight_id = ?1",
+    )
+    .bind(flight_id)
+    .fetch_optional(executor)
+    .await?;
+
+    row.map(|r| r.try_into()).transpose()
 }
 
 
@@ -96,6 +236,7 @@ impl TryFrom<FlightPlanRow> for FlightPlan {
     
     fn try_from(row: FlightPlanRow) -> Result<Self> {
         let status = match row.status.as_str() {
+            "Reserved" => FlightStatus::Reserved,
             "Pending" => FlightStatus::Pending,
             "Approved" => FlightStatus::Approved,
             "Active" => FlightStatus::Active,

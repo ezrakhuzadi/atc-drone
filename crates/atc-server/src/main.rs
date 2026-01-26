@@ -50,6 +50,12 @@ async fn main() -> Result<()> {
     {
         bail!("BLENDER_AUTH_TOKEN or BLENDER_OAUTH_* is required when ATC_ENV is not development");
     }
+    if !config.allow_dummy_blender_auth && config.admin_token.trim().is_empty() {
+        bail!("ATC_ADMIN_TOKEN must be set when ATC_ENV is not development");
+    }
+    if !config.allow_dummy_blender_auth && config.admin_token == "change-me-admin" {
+        bail!("ATC_ADMIN_TOKEN is still set to the insecure default 'change-me-admin'");
+    }
     
     // Initialize database
     tracing::info!("Initializing database: {}", config.database_path);
@@ -105,6 +111,15 @@ async fn main() -> Result<()> {
         let state = state.clone();
         spawn_supervised_loop("mission", shutdown_tx.clone(), move |shutdown| {
             loops::mission_loop::run_mission_loop(state.clone(), shutdown)
+        });
+    }
+    {
+        let state = state.clone();
+        spawn_supervised_loop("oi-expiry", shutdown_tx.clone(), move |shutdown| {
+            loops::operational_intent_expiry_loop::run_operational_intent_expiry_loop(
+                state.clone(),
+                shutdown,
+            )
         });
     }
     {

@@ -261,6 +261,7 @@ async fn strategic_scheduling_delays_conflicting_flight_plan() {
             departure_time: Some(departure),
         },
         None,
+        FlightStatus::Approved,
     )
     .await
     .expect("plan1");
@@ -280,10 +281,103 @@ async fn strategic_scheduling_delays_conflicting_flight_plan() {
             departure_time: Some(departure),
         },
         None,
+        FlightStatus::Approved,
     )
     .await
     .expect("plan2");
     assert_eq!(plan2.status, FlightStatus::Approved);
     assert!(plan2.departure_time > departure);
     assert!(plan2.departure_time <= departure + chrono::Duration::seconds(30));
+}
+
+#[tokio::test]
+async fn reserved_scheduler_moves_lower_priority_reservations() {
+    let (_app, state) = setup_app_with(|config| {
+        config.strategic_scheduling_enabled = true;
+        config.strategic_max_delay_secs = 30;
+        config.strategic_delay_step_secs = 1;
+    })
+    .await;
+
+    let departure = Utc::now() + chrono::Duration::seconds(60);
+    state
+        .register_drone("DRONE_A", None)
+        .await
+        .expect("register DRONE_A");
+    state
+        .register_drone("DRONE_B", None)
+        .await
+        .expect("register DRONE_B");
+
+    let waypoints = vec![
+        Waypoint {
+            lat: 33.0,
+            lon: -117.0,
+            altitude_m: 50.0,
+            speed_mps: None,
+        },
+        Waypoint {
+            lat: 33.0,
+            lon: -116.999,
+            altitude_m: 50.0,
+            speed_mps: None,
+        },
+    ];
+
+    let plan_a = crate::api::flights::build_plan(
+        state.as_ref(),
+        FlightPlanRequest {
+            drone_id: "DRONE_A".to_string(),
+            owner_id: None,
+            waypoints: Some(waypoints.clone()),
+            trajectory_log: None,
+            metadata: Some(FlightPlanMetadata {
+                drone_speed_mps: Some(10.0),
+                scheduling_priority: Some(200),
+                ..Default::default()
+            }),
+            origin: None,
+            destination: None,
+            departure_time: Some(departure),
+        },
+        None,
+        FlightStatus::Reserved,
+    )
+    .await
+    .expect("plan_a");
+    assert_eq!(plan_a.status, FlightStatus::Reserved);
+    assert_eq!(plan_a.departure_time, departure);
+
+    let plan_b = crate::api::flights::build_plan(
+        state.as_ref(),
+        FlightPlanRequest {
+            drone_id: "DRONE_B".to_string(),
+            owner_id: None,
+            waypoints: Some(waypoints.clone()),
+            trajectory_log: None,
+            metadata: Some(FlightPlanMetadata {
+                drone_speed_mps: Some(10.0),
+                scheduling_priority: Some(10),
+                ..Default::default()
+            }),
+            origin: None,
+            destination: None,
+            departure_time: Some(departure),
+        },
+        None,
+        FlightStatus::Reserved,
+    )
+    .await
+    .expect("plan_b");
+    assert_eq!(plan_b.status, FlightStatus::Reserved);
+    assert_eq!(plan_b.departure_time, departure);
+
+    let updated_a = state
+        .flight_plans
+        .get(&plan_a.flight_id)
+        .expect("plan_a still in state")
+        .value()
+        .clone();
+    assert_eq!(updated_a.status, FlightStatus::Reserved);
+    assert!(updated_a.departure_time > departure);
 }

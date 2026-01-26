@@ -35,6 +35,8 @@ pub struct Config {
     pub rate_limit_rps: u32,
     /// Max requests per second per IP for drone registration
     pub registration_rate_limit_rps: u32,
+    /// Max requests per second per IP for expensive endpoints (route planning, compliance evaluation).
+    pub expensive_rate_limit_rps: u32,
     /// Trust X-Forwarded-For headers for rate limiting
     pub trust_proxy: bool,
     /// Path to SQLite database file
@@ -70,6 +72,8 @@ pub struct Config {
     pub altitude_reference: AltitudeReference,
     pub geoid_offset_m: f64,
     pub terrain_provider_url: String,
+    /// Use POST with JSON body for terrain provider (avoids URL-length limits for large batches).
+    pub terrain_use_post: bool,
     pub terrain_sample_spacing_m: f64,
     pub terrain_max_points_per_request: usize,
     pub terrain_max_grid_points: usize,
@@ -98,6 +102,8 @@ pub struct Config {
     pub strategic_max_delay_secs: u64,
     /// Increment used when searching for a conflict-free departure slot.
     pub strategic_delay_step_secs: u64,
+    /// Reservation TTL for operational intents (seconds).
+    pub operational_intent_ttl_secs: u64,
     pub rules_min_horizontal_separation_m: f64,
     pub rules_min_vertical_separation_m: f64,
     pub rules_lookahead_seconds: f64,
@@ -120,12 +126,22 @@ impl Config {
         let is_dev =
             env::var("ATC_ENV").unwrap_or_else(|_| "development".to_string()) == "development";
 
-        // Generate admin token if not provided
-        let admin_token = env::var("ATC_ADMIN_TOKEN").unwrap_or_else(|_| {
-            let token = uuid::Uuid::new_v4().to_string();
-            tracing::warn!("No ATC_ADMIN_TOKEN set; generated a random token for this run");
-            token
-        });
+        let admin_token = env::var("ATC_ADMIN_TOKEN")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| {
+                if is_dev {
+                    let token = uuid::Uuid::new_v4().to_string();
+                    tracing::warn!(
+                        "No ATC_ADMIN_TOKEN set; generated a random token for this run (dev only)"
+                    );
+                    token
+                } else {
+                    // Keep empty; main.rs performs production validation and exits cleanly.
+                    String::new()
+                }
+            });
 
         let ws_token = env::var("ATC_WS_TOKEN")
             .ok()
@@ -198,6 +214,10 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(10),
+            expensive_rate_limit_rps: env::var("ATC_EXPENSIVE_RATE_LIMIT_RPS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2),
             trust_proxy: env::var("ATC_TRUST_PROXY")
                 .map(|v| v == "1" || v.to_lowercase() == "true")
                 .unwrap_or(false),
@@ -320,6 +340,9 @@ impl Config {
                 .unwrap_or(0.0),
             terrain_provider_url: env::var("ATC_TERRAIN_PROVIDER_URL")
                 .unwrap_or_else(|_| "https://api.open-meteo.com/v1/elevation".to_string()),
+            terrain_use_post: env::var("ATC_TERRAIN_USE_POST")
+                .map(|v| v != "0" && v.to_lowercase() != "false")
+                .unwrap_or(false),
             terrain_sample_spacing_m: env::var("ATC_TERRAIN_SAMPLE_SPACING_M")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -418,6 +441,10 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(5),
+            operational_intent_ttl_secs: env::var("ATC_OI_RESERVATION_TTL_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(300),
             rules_min_horizontal_separation_m: env::var("ATC_RULES_MIN_HORIZONTAL_SEPARATION_M")
                 .ok()
                 .and_then(|s| s.parse().ok())

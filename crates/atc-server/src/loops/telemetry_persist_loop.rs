@@ -84,8 +84,31 @@ async fn flush_pending(db: &Database, pending: &mut HashMap<String, DroneState>)
     }
 
     let batch = std::mem::take(pending);
-    for (_, state) in batch {
-        drones_db::upsert_drone(db.pool(), &state).await?;
+    let mut tx = match db.pool().begin().await {
+        Ok(tx) => tx,
+        Err(err) => {
+            pending.extend(batch);
+            return Err(err.into());
+        }
+    };
+
+    let mut write_error: Option<anyhow::Error> = None;
+    for (_, state) in batch.iter() {
+        if let Err(err) = drones_db::upsert_drone_tx(&mut tx, state).await {
+            write_error = Some(err);
+            break;
+        }
+    }
+
+    if let Some(err) = write_error {
+        tx.rollback().await.ok();
+        pending.extend(batch);
+        return Err(err);
+    }
+
+    if let Err(err) = tx.commit().await {
+        pending.extend(batch);
+        return Err(err.into());
     }
 
     Ok(())

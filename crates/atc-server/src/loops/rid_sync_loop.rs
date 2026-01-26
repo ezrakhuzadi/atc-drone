@@ -20,6 +20,7 @@ use crate::state::{AppState, ExternalTraffic};
 const RID_POLL_SECS: u64 = 2;
 const RID_SUBSCRIPTION_TTL_SECS: u64 = 20;
 const RID_TRACK_TTL_SECS: i64 = 30;
+const RID_SUBSCRIPTION_BACKOFF_MAX_SECS: u64 = 60;
 
 /// Start RID polling loop.
 pub async fn run_rid_loop(
@@ -39,6 +40,8 @@ pub async fn run_rid_loop(
     let mut last_subscription = Instant::now()
         .checked_sub(Duration::from_secs(RID_SUBSCRIPTION_TTL_SECS + 1))
         .unwrap_or_else(Instant::now);
+    let mut subscription_backoff_secs: u64 = RID_POLL_SECS;
+    let mut next_subscription_attempt = Instant::now();
     let mut last_view = state.get_rid_view_bbox();
 
     loop {
@@ -56,22 +59,36 @@ pub async fn run_rid_loop(
                 if current_view != last_view {
                     last_view = current_view.clone();
                     subscription_id = None;
+                    subscription_backoff_secs = RID_POLL_SECS;
+                    next_subscription_attempt = Instant::now();
                 }
 
                 if current_view.trim().is_empty() {
                     continue;
                 }
 
-                if subscription_id.is_none() || last_subscription.elapsed().as_secs() >= RID_SUBSCRIPTION_TTL_SECS {
+                let needs_refresh = subscription_id.is_none()
+                    || last_subscription.elapsed().as_secs() >= RID_SUBSCRIPTION_TTL_SECS;
+                if needs_refresh && Instant::now() >= next_subscription_attempt {
                     match blender.create_rid_subscription(&current_view).await {
                         Ok(id) => {
                             subscription_id = Some(id);
                             last_subscription = Instant::now();
+                            subscription_backoff_secs = RID_POLL_SECS;
+                            next_subscription_attempt = Instant::now();
                             tracing::info!("RID subscription refreshed");
                         }
                         Err(err) => {
-                            tracing::warn!("RID subscription failed: {}", err);
-                            continue;
+                            let delay_secs = subscription_backoff_secs.max(1);
+                            next_subscription_attempt = Instant::now()
+                                + Duration::from_secs(delay_secs);
+                            subscription_backoff_secs = (subscription_backoff_secs.saturating_mul(2))
+                                .min(RID_SUBSCRIPTION_BACKOFF_MAX_SECS);
+                            tracing::warn!(
+                                "RID subscription failed: {} (retrying in {}s)",
+                                err,
+                                delay_secs
+                            );
                         }
                     }
                 }

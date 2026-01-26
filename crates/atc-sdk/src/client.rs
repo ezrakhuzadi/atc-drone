@@ -10,6 +10,34 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
+#[derive(Debug, Deserialize)]
+struct PlanErrorWrapper {
+    plan: atc_core::models::FlightPlan,
+}
+
+async fn parse_json_or_error<T: serde::de::DeserializeOwned>(response: reqwest::Response) -> Result<T> {
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        anyhow::bail!("ATC request failed ({}): {}", status, body);
+    }
+    Ok(serde_json::from_str(&body)?)
+}
+
+async fn parse_flight_plan_response(response: reqwest::Response) -> Result<atc_core::models::FlightPlan> {
+    let status = response.status();
+    let body = response.text().await?;
+    if status.is_success() {
+        return Ok(serde_json::from_str(&body)?);
+    }
+    if status == reqwest::StatusCode::CONFLICT {
+        if let Ok(wrapper) = serde_json::from_str::<PlanErrorWrapper>(&body) {
+            return Ok(wrapper.plan);
+        }
+    }
+    anyhow::bail!("ATC request failed ({}): {}", status, body);
+}
+
 /// Client for connecting to the ATC server.
 pub struct AtcClient {
     pub(crate) base_url: String,
@@ -93,7 +121,7 @@ impl AtcClient {
             builder = builder.header("X-Registration-Token", token);
         }
 
-        let response: RegisterResponse = builder.send().await?.json().await?;
+        let response: RegisterResponse = parse_json_or_error(builder.send().await?).await?;
 
         self.drone_id = Some(response.drone_id.clone());
         if let Some(owner_id) = owner_id {
@@ -164,9 +192,105 @@ impl AtcClient {
             builder = builder.header("Authorization", format!("Bearer {}", token));
         }
 
-        let response: atc_core::models::FlightPlan = builder.send().await?.json().await?;
+        let response = builder.send().await?;
+        parse_flight_plan_response(response).await
+    }
 
-        Ok(response)
+    // ========== OPERATIONAL INTENTS ==========
+
+    /// Reserve an ATC operational intent (slot) for the given request.
+    ///
+    /// Returns a `FlightPlan` with status `reserved` on success. If the server returns a 409
+    /// conflict with a `plan` payload, this method returns that plan (typically `rejected`) so
+    /// the caller can inspect scheduling metadata.
+    pub async fn reserve_operational_intent(
+        &self,
+        request: &atc_core::models::FlightPlanRequest,
+    ) -> Result<atc_core::models::FlightPlan> {
+        let url = format!("{}/v1/operational_intents/reserve", self.base_url);
+
+        let mut req = request.clone();
+        if let Some(drone_id) = &self.drone_id {
+            req.drone_id = drone_id.clone();
+        }
+        if req.owner_id.is_none() {
+            req.owner_id = self.owner_id.clone();
+        }
+
+        let mut builder = self.client.post(&url).json(&req);
+        if let Some(token) = self.admin_token.as_deref() {
+            builder = builder.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let response = builder.send().await?;
+        parse_flight_plan_response(response).await
+    }
+
+    /// Confirm an existing reserved operational intent, transitioning it to `approved`.
+    pub async fn confirm_operational_intent(
+        &self,
+        flight_id: &str,
+    ) -> Result<atc_core::models::FlightPlan> {
+        let url = format!(
+            "{}/v1/operational_intents/{}/confirm",
+            self.base_url, flight_id
+        );
+
+        let mut builder = self.client.post(&url);
+        if let Some(token) = self.admin_token.as_deref() {
+            builder = builder.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let response = builder.send().await?;
+        parse_json_or_error(response).await
+    }
+
+    /// Cancel an existing operational intent, transitioning it to `cancelled`.
+    pub async fn cancel_operational_intent(
+        &self,
+        flight_id: &str,
+    ) -> Result<atc_core::models::FlightPlan> {
+        let url = format!(
+            "{}/v1/operational_intents/{}/cancel",
+            self.base_url, flight_id
+        );
+
+        let mut builder = self.client.post(&url);
+        if let Some(token) = self.admin_token.as_deref() {
+            builder = builder.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let response = builder.send().await?;
+        parse_json_or_error(response).await
+    }
+
+    /// Update an existing reserved operational intent.
+    ///
+    /// Returns the updated reserved plan on success. If the update cannot be scheduled, and the
+    /// server returns a 409 conflict with a `plan` payload, this method returns that plan so the
+    /// caller can inspect why the update was rejected.
+    pub async fn update_operational_intent(
+        &self,
+        flight_id: &str,
+        request: &atc_core::models::FlightPlanRequest,
+    ) -> Result<atc_core::models::FlightPlan> {
+        let url = format!("{}/v1/operational_intents/{}", self.base_url, flight_id);
+
+        let mut req = request.clone();
+        if let Some(drone_id) = &self.drone_id {
+            req.drone_id = drone_id.clone();
+        }
+        if req.owner_id.is_none() {
+            req.owner_id = self.owner_id.clone();
+        }
+
+        let mut builder = self.client.put(&url).json(&req);
+        if let Some(token) = self.admin_token.as_deref() {
+            builder = builder.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let response = builder.send().await?;
+        parse_flight_plan_response(response).await
     }
 
     // ========== COMMAND HANDLING ==========
