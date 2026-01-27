@@ -104,7 +104,7 @@ struct TerrainBounds {
 
 #[derive(Debug, Deserialize)]
 struct OpenMeteoElevationResponse {
-    elevation: Option<Vec<f64>>,
+    elevation: Option<Vec<Option<f64>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,10 +124,11 @@ pub async fn fetch_terrain_grid(
         return Err("terrain provider URL is empty".to_string());
     }
 
-    let bounds = match bounds_from_points(points) {
-        Some(bounds) => expand_bounds(&bounds, 0.2),
+    let core_bounds = match bounds_from_points(points) {
+        Some(bounds) => bounds,
         None => return Ok(None),
     };
+    let bounds = expand_bounds(&core_bounds, 0.2);
     let cache_ttl = Duration::from_secs(config.terrain_cache_ttl_s.max(30));
     let cache = terrain_cache();
     let mut stale_cache: Option<TerrainGrid> = None;
@@ -305,8 +306,45 @@ pub async fn fetch_terrain_grid(
             return Err("terrain provider returned unexpected sample count".to_string());
         }
 
-        for (idx, value) in chunk.into_iter().enumerate() {
-            elevations[start + idx] = if value.is_finite() { value } else { 0.0 };
+        let mut missing_required = 0usize;
+        for (idx, maybe_value) in chunk.into_iter().enumerate() {
+            let value = maybe_value.filter(|value| value.is_finite());
+            if let Some(value) = value {
+                elevations[start + idx] = value;
+                continue;
+            }
+
+            let lat = lat_slice[idx];
+            let lon = lon_slice[idx];
+            let in_core = lat >= core_bounds.min_lat
+                && lat <= core_bounds.max_lat
+                && lon >= core_bounds.min_lon
+                && lon <= core_bounds.max_lon;
+            if in_core {
+                missing_required += 1;
+            }
+        }
+
+        if missing_required > 0 {
+            tracing::warn!(
+                missing_required = missing_required,
+                requested = lat_slice.len(),
+                "Terrain provider returned missing samples"
+            );
+        }
+
+        if missing_required > 0 && config.terrain_require {
+            if let Some(stale) = stale_cache {
+                tracing::warn!(
+                    missing_required = missing_required,
+                    "Terrain provider returned missing required samples; using stale cache"
+                );
+                return Ok(Some(stale));
+            }
+            return Err(format!(
+                "terrain provider returned {} missing required samples",
+                missing_required
+            ));
         }
 
         last_request_at = Some(Instant::now());
