@@ -7,8 +7,9 @@ use atc_core::spatial::{meters_per_deg_lat, meters_per_deg_lon};
 use dashmap::DashMap;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 #[derive(Debug, Clone)]
@@ -39,6 +40,11 @@ impl cache::CacheEntry for TerrainCacheEntry {
 fn terrain_cache() -> &'static DashMap<String, TerrainCacheEntry> {
     static CACHE: OnceLock<DashMap<String, TerrainCacheEntry>> = OnceLock::new();
     CACHE.get_or_init(DashMap::new)
+}
+
+fn terrain_inflight() -> &'static DashMap<String, Arc<Mutex<()>>> {
+    static INFLIGHT: OnceLock<DashMap<String, Arc<Mutex<()>>>> = OnceLock::new();
+    INFLIGHT.get_or_init(DashMap::new)
 }
 
 const TERRAIN_CACHE_MAX_ENTRIES: usize = 256;
@@ -157,6 +163,24 @@ pub async fn fetch_terrain_grid(
             return Ok(Some(entry.grid.clone()));
         }
         if age <= cache_ttl.saturating_mul(2) {
+            stale_cache = Some(entry.grid.clone());
+        }
+    }
+
+    // Coalesce concurrent fetches for the same grid so many route-plans don’t stampede terrain-api.
+    let inflight_lock = terrain_inflight()
+        .entry(cache_key.clone())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone();
+    let _guard = inflight_lock.lock().await;
+
+    // Another request may have populated the cache while we waited.
+    if let Some(entry) = cache.get(&cache_key) {
+        let age = entry.fetched_at.elapsed();
+        if age <= cache_ttl {
+            return Ok(Some(entry.grid.clone()));
+        }
+        if stale_cache.is_none() && age <= cache_ttl.saturating_mul(2) {
             stale_cache = Some(entry.grid.clone());
         }
     }

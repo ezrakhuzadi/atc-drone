@@ -9,8 +9,9 @@ use dashmap::DashMap;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 #[derive(Debug, Clone, Copy)]
@@ -180,6 +181,11 @@ impl cache::CacheEntry for ObstacleCacheEntry {
 fn obstacle_cache() -> &'static DashMap<String, ObstacleCacheEntry> {
     static CACHE: OnceLock<DashMap<String, ObstacleCacheEntry>> = OnceLock::new();
     CACHE.get_or_init(DashMap::new)
+}
+
+fn obstacle_inflight() -> &'static DashMap<String, Arc<Mutex<()>>> {
+    static INFLIGHT: OnceLock<DashMap<String, Arc<Mutex<()>>>> = OnceLock::new();
+    INFLIGHT.get_or_init(DashMap::new)
 }
 
 const OBSTACLE_CACHE_MAX_ENTRIES: usize = 256;
@@ -740,6 +746,25 @@ pub(crate) async fn fetch_obstacles(
             stale_cache = Some(entry.analysis.clone());
         }
     }
+
+    // Coalesce concurrent fetches for the same key so many route-plans don’t stampede Overpass.
+    let inflight_lock = obstacle_inflight()
+        .entry(cache_key.clone())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone();
+    let _guard = inflight_lock.lock().await;
+
+    // Another request may have populated the cache while we waited.
+    if let Some(entry) = cache.get(&cache_key) {
+        let age = entry.fetched_at.elapsed();
+        if age <= cache_ttl {
+            return Ok(entry.analysis.clone());
+        }
+        if stale_cache.is_none() && age <= cache_ttl.saturating_mul(2) {
+            stale_cache = Some(entry.analysis.clone());
+        }
+    }
+
     let area_km2 = bounds_area_km2(&bounds);
     let bbox = format!(
         "{},{},{},{}",
