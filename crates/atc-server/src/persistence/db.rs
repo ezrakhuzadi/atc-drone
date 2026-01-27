@@ -59,6 +59,26 @@ pub async fn init_database(db_path: &str, max_connections: u32) -> Result<Databa
     // Create connection pool
     let pool = SqlitePoolOptions::new()
         .max_connections(max_connections)
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                // Reduce "database is locked" errors under contention and improve read concurrency.
+                // WAL isn't supported for in-memory DBs; ignore failures there.
+                let _ = sqlx::query("PRAGMA journal_mode = WAL;")
+                    .fetch_one(&mut *conn)
+                    .await;
+                let _ = sqlx::query("PRAGMA synchronous = NORMAL;")
+                    .execute(&mut *conn)
+                    .await;
+
+                sqlx::query("PRAGMA foreign_keys = ON;")
+                    .execute(&mut *conn)
+                    .await?;
+                sqlx::query("PRAGMA busy_timeout = 5000;")
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(())
+            })
+        })
         .connect(&db_url)
         .await?;
 
