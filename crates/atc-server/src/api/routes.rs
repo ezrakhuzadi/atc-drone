@@ -14,7 +14,7 @@ use serde_json::json;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::api::{commands, flights, geofences, daa, ws};
+use crate::api::{commands, daa, flights, geofences, request_id, ws};
 use crate::api::auth::{self, AdminToken, RateLimiter};
 use crate::altitude::altitude_to_amsl;
 use crate::compliance::{self, ComplianceReport, RoutePoint};
@@ -130,6 +130,7 @@ pub fn create_router(config: &Config) -> Router<Arc<AppState>> {
         .merge(admin_command_routes)
         .merge(admin_flight_routes)
         .merge(admin_routes)
+        .layer(middleware::from_fn(request_id::ensure_request_id))
 }
 
 // === Request/Response types ===

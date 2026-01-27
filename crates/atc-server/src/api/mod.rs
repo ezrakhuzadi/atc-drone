@@ -5,6 +5,7 @@ pub mod commands;
 pub mod daa;
 pub mod flights;
 pub mod geofences;
+pub mod request_id;
 mod routes;
 pub mod ws;
 

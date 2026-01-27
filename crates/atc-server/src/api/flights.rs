@@ -11,7 +11,7 @@ use atc_core::models::{
 use atc_core::routing::generate_random_route;
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -95,16 +95,18 @@ pub struct FlightPlansQuery {
 
 pub async fn create_flight_plan(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(payload): Json<FlightPlanRequest>,
 ) -> Result<(StatusCode, Json<FlightPlan>), (StatusCode, Json<serde_json::Value>)> {
     let mut payload = payload;
+    let request_id = request_id_from_headers(&headers);
     enforce_owner_for_drone(
         state.as_ref(),
         &payload.drone_id,
         payload.owner_id.as_deref(),
     )?;
     normalize_flight_plan_request(&mut payload, state.config());
-    let validation = validate_flight_plan(state.as_ref(), &payload).await;
+    let validation = validate_flight_plan(state.as_ref(), &payload, request_id.as_deref()).await;
     if !validation.violations.is_empty() {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -141,8 +143,10 @@ pub async fn create_flight_plan(
 
 pub(crate) async fn create_flight_plan_compat(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(payload): Json<FlightPlanSubmission>,
 ) -> Result<(StatusCode, Json<FlightPlan>), (StatusCode, Json<serde_json::Value>)> {
+    let request_id = request_id_from_headers(&headers);
     let (mut request, requested_flight_id, requires_trajectory) = match payload {
         FlightPlanSubmission::Atc(request) => (request, None, false),
         FlightPlanSubmission::Planner(request) => {
@@ -177,7 +181,7 @@ pub(crate) async fn create_flight_plan_compat(
         request.owner_id.as_deref(),
     )?;
     normalize_flight_plan_request(&mut request, state.config());
-    let validation = validate_flight_plan(state.as_ref(), &request).await;
+    let validation = validate_flight_plan(state.as_ref(), &request, request_id.as_deref()).await;
     if !validation.violations.is_empty() {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -388,7 +392,11 @@ struct ValidationOutcome {
     compliance: Option<ComplianceEvaluation>,
 }
 
-async fn validate_flight_plan(state: &AppState, request: &FlightPlanRequest) -> ValidationOutcome {
+async fn validate_flight_plan(
+    state: &AppState,
+    request: &FlightPlanRequest,
+    request_id: Option<&str>,
+) -> ValidationOutcome {
     let mut violations = Vec::new();
     let points = extract_route_points(request);
     if points.is_empty() {
@@ -547,6 +555,7 @@ async fn validate_flight_plan(state: &AppState, request: &FlightPlanRequest) -> 
                     &state.config().blender_session_id,
                     &state.config().blender_auth_token,
                 );
+                blender.set_request_id(request_id.map(str::to_string));
                 if let Err(err) = auth.apply(&mut blender).await {
                     violations.push(json!({
                         "type": "blender",
@@ -598,6 +607,15 @@ async fn validate_flight_plan(state: &AppState, request: &FlightPlanRequest) -> 
         violations,
         compliance: Some(compliance),
     }
+}
+
+fn request_id_from_headers(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn apply_compliance_metadata(
@@ -1233,16 +1251,18 @@ pub async fn get_flight_plans(
 
 pub async fn reserve_operational_intent(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(payload): Json<FlightPlanRequest>,
 ) -> Result<(StatusCode, Json<FlightPlan>), (StatusCode, Json<serde_json::Value>)> {
     let mut payload = payload;
+    let request_id = request_id_from_headers(&headers);
     enforce_owner_for_drone(
         state.as_ref(),
         &payload.drone_id,
         payload.owner_id.as_deref(),
     )?;
     normalize_flight_plan_request(&mut payload, state.config());
-    let validation = validate_flight_plan(state.as_ref(), &payload).await;
+    let validation = validate_flight_plan(state.as_ref(), &payload, request_id.as_deref()).await;
     if !validation.violations.is_empty() {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1491,9 +1511,11 @@ pub async fn cancel_operational_intent(
 
 pub async fn update_operational_intent(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(flight_id): Path<String>,
     Json(payload): Json<FlightPlanRequest>,
 ) -> Result<(StatusCode, Json<FlightPlan>), (StatusCode, Json<serde_json::Value>)> {
+    let request_id = request_id_from_headers(&headers);
     let _booking_guard = state.flight_plan_booking_lock().lock().await;
     let pool = state.database().map(|db| db.pool().clone());
 
@@ -1598,7 +1620,7 @@ pub async fn update_operational_intent(
         payload.owner_id.as_deref(),
     )?;
     normalize_flight_plan_request(&mut payload, state.config());
-    let validation = validate_flight_plan(state.as_ref(), &payload).await;
+    let validation = validate_flight_plan(state.as_ref(), &payload, request_id.as_deref()).await;
     if !validation.violations.is_empty() {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,

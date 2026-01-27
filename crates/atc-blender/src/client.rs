@@ -38,6 +38,7 @@ pub struct BlenderClient {
     pub(crate) base_url: String,
     pub(crate) session_id: String,
     pub(crate) auth_token: Option<String>,
+    pub(crate) request_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,6 +93,14 @@ impl BlenderClient {
             base_url: base_url.into(),
             session_id: session_id.into(),
             auth_token,
+            request_id: None,
+        }
+    }
+
+    fn apply_request_id(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self.request_id.as_deref() {
+            Some(value) if !value.is_empty() => request.header("X-Request-ID", value),
+            _ => request,
         }
     }
 
@@ -106,6 +115,12 @@ impl BlenderClient {
     /// Update auth token at runtime (OAuth refresh, rotation, etc.).
     pub fn set_auth_token(&mut self, token: Option<String>) {
         self.auth_token = token
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+    }
+
+    pub fn set_request_id(&mut self, request_id: Option<String>) {
+        self.request_id = request_id
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
     }
@@ -178,13 +193,15 @@ impl BlenderClient {
     async fn send_request(&self, url: &str, request: &ObservationRequest) -> Result<u16> {
         // Resolve auth token (configured or dummy)
         let auth_header = self.auth_header();
-        
+
         let response = self
-            .client
-            .post(url)
-            .header("Content-Type", "application/json")
-            .header("Authorization", auth_header)
-            .json(request)
+            .apply_request_id(
+                self.client
+                    .post(url)
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", auth_header)
+                    .json(request),
+            )
             .send()
             .await
             .context("Failed to send observation")?;
@@ -202,9 +219,7 @@ impl BlenderClient {
         let auth_header = self.auth_header();
 
         let response = self
-            .client
-            .get(&url)
-            .header("Authorization", auth_header)
+            .apply_request_id(self.client.get(&url).header("Authorization", auth_header))
             .send()
             .await
             .context("Failed to fetch conformance status")?;
@@ -237,10 +252,12 @@ impl BlenderClient {
         let auth_header = self.auth_header();
 
         let response = self
-            .client
-            .put(&url)
-            .header("Authorization", auth_header)
-            .query(&[("view", view)])
+            .apply_request_id(
+                self.client
+                    .put(&url)
+                    .header("Authorization", auth_header)
+                    .query(&[("view", view)]),
+            )
             .send()
             .await
             .context("Failed to create RID subscription")?;
@@ -279,9 +296,7 @@ impl BlenderClient {
         let auth_header = self.auth_header();
 
         let response = self
-            .client
-            .get(&url)
-            .header("Authorization", auth_header)
+            .apply_request_id(self.client.get(&url).header("Authorization", auth_header))
             .send()
             .await
             .context("Failed to fetch RID data")?;
@@ -314,11 +329,13 @@ impl BlenderClient {
         let auth_header = self.auth_header();
 
         let response = self
-            .client
-            .put(&url)
-            .header("Content-Type", "application/json")
-            .header("Authorization", auth_header)
-            .json(payload)
+            .apply_request_id(
+                self.client
+                    .put(&url)
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", auth_header)
+                    .json(payload),
+            )
             .send()
             .await
             .context("Failed to create geofence")?;
@@ -367,7 +384,8 @@ impl BlenderClient {
                 first = false;
             }
 
-            let response = request
+            let response = self
+                .apply_request_id(request)
                 .send()
                 .await
                 .context("Failed to fetch geofences")?;
@@ -419,9 +437,11 @@ impl BlenderClient {
 
         while let Some(url) = next_url {
             let response = self
-                .client
-                .get(&url)
-                .header("Authorization", auth_header.clone())
+                .apply_request_id(
+                    self.client
+                        .get(&url)
+                        .header("Authorization", auth_header.clone()),
+                )
                 .send()
                 .await
                 .context("Failed to fetch flight declarations")?;
@@ -471,9 +491,7 @@ impl BlenderClient {
         let auth_header = self.auth_header();
 
         let response = self
-            .client
-            .get(&url)
-            .header("Authorization", auth_header)
+            .apply_request_id(self.client.get(&url).header("Authorization", auth_header))
             .send()
             .await
             .context("Failed to fetch flight declaration")?;
@@ -504,9 +522,7 @@ impl BlenderClient {
         let auth_header = self.auth_header();
 
         let response = self
-            .client
-            .delete(&url)
-            .header("Authorization", auth_header)
+            .apply_request_id(self.client.delete(&url).header("Authorization", auth_header))
             .send()
             .await
             .context("Failed to delete geofence")?;
