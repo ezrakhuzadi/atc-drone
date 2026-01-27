@@ -25,7 +25,6 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tower_http::cors::{Any, CorsLayer};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::config::Config;
 use crate::state::AppState;
@@ -154,13 +153,17 @@ async fn ready_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse 
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer())
-        .with(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("atc_server=debug".parse()?),
-        )
-        .init();
+    let env_filter = tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive("atc_server=debug".parse()?);
+    let log_format = std::env::var("ATC_LOG_FORMAT").unwrap_or_default();
+    if log_format.trim().eq_ignore_ascii_case("json") {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(env_filter)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    }
 
     tracing::info!("Starting ATC Server...");
 
