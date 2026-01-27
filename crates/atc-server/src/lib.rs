@@ -2,6 +2,7 @@
 
 pub mod altitude;
 pub mod api;
+pub mod backoff;
 pub mod blender_auth;
 pub mod cache;
 pub mod compliance;

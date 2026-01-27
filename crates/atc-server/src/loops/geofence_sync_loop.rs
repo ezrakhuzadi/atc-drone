@@ -20,6 +20,7 @@ use anyhow::Result;
 use atc_blender::BlenderClient;
 use atc_core::models::{Geofence, GeofenceType};
 
+use crate::backoff::Backoff;
 use crate::blender_auth::BlenderAuthManager;
 use crate::config::Config;
 use crate::persistence::{geofence_sync as geofence_sync_db, Database};
@@ -51,6 +52,7 @@ pub async fn run_geofence_sync_loop(
     );
 
     let mut ticker = interval(Duration::from_secs(GEOFENCE_SYNC_SECS));
+    let mut backoff = Backoff::new(Duration::from_secs(GEOFENCE_SYNC_SECS), Duration::from_secs(300));
     let state_path = PathBuf::from(config.geofence_sync_state_path.clone());
     let db = state.database().cloned();
     let mut tracked = match db.as_ref() {
@@ -85,13 +87,34 @@ pub async fn run_geofence_sync_loop(
             }
             _ = ticker.tick() => {
                 state.mark_loop_heartbeat("geofence-sync");
-                if let Err(err) = auth.apply(&mut blender).await {
-                    tracing::warn!("Geofence sync Blender auth refresh failed: {}", err);
+                if !backoff.ready() {
                     continue;
                 }
+                if let Err(err) = auth.apply(&mut blender).await {
+                    let delay = backoff.fail();
+                    tracing::warn!(
+                        "Geofence sync Blender auth refresh failed: {} (backing off {:?})",
+                        err,
+                        delay
+                    );
+                    continue;
+                }
+                let mut blender_error_streak = 0usize;
+                let mut any_blender_success = false;
+                let mut any_blender_failure = false;
+
+                'tick: {
                 if config.pull_blender_geofences {
                     if let Err(err) = sync_external_geofences(&blender, state.as_ref(), &tracked, &config).await {
+                        any_blender_failure = true;
+                        blender_error_streak += 1;
                         tracing::warn!("Failed to pull Blender geofences: {}", err);
+                        if blender_error_streak >= 3 {
+                            break 'tick;
+                        }
+                    } else {
+                        any_blender_success = true;
+                        blender_error_streak = 0;
                     }
                 }
 
@@ -116,7 +139,15 @@ pub async fn run_geofence_sync_loop(
                     if let Some(existing) = tracked.remove(&local_id) {
                         dirty = true;
                         if let Err(err) = blender.delete_geofence(&existing.blender_id).await {
+                            any_blender_failure = true;
+                            blender_error_streak += 1;
                             tracing::warn!("Failed to delete Blender geofence {}: {}", local_id, err);
+                            if blender_error_streak >= 3 {
+                                break 'tick;
+                            }
+                        } else {
+                            any_blender_success = true;
+                            blender_error_streak = 0;
                         }
                     }
                 }
@@ -149,6 +180,8 @@ pub async fn run_geofence_sync_loop(
                     let payload = build_geofence_payload(&geofence, now);
                     match blender.create_geofence(&payload).await {
                         Ok(blender_id) => {
+                            any_blender_success = true;
+                            blender_error_streak = 0;
                             let expires_at = (now + ChronoDuration::hours(GEOFENCE_TTL_HOURS)).timestamp();
                             tracked.insert(
                                 geofence.id.clone(),
@@ -161,7 +194,12 @@ pub async fn run_geofence_sync_loop(
                             dirty = true;
                         }
                         Err(err) => {
+                            any_blender_failure = true;
+                            blender_error_streak += 1;
                             tracing::warn!("Failed to sync geofence {}: {}", geofence.id, err);
+                            if blender_error_streak >= 3 {
+                                break 'tick;
+                            }
                         }
                     }
                 }
@@ -175,6 +213,17 @@ pub async fn run_geofence_sync_loop(
                     if let Err(err) = persisted {
                         tracing::warn!("Failed to persist geofence sync state: {}", err);
                     }
+                }
+                }
+
+                if any_blender_failure && !any_blender_success {
+                    let delay = backoff.fail();
+                    tracing::warn!(
+                        "Geofence sync is seeing repeated Blender failures (backing off {:?})",
+                        delay
+                    );
+                } else if any_blender_success {
+                    backoff.reset();
                 }
             }
         }

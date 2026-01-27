@@ -12,6 +12,7 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 use tokio::time::interval;
 
+use crate::backoff::Backoff;
 use crate::blender_auth::BlenderAuthManager;
 use crate::config::Config;
 use crate::state::{AppState, ExternalTraffic};
@@ -40,8 +41,10 @@ pub async fn run_rid_loop(
     let mut last_subscription = Instant::now()
         .checked_sub(Duration::from_secs(RID_SUBSCRIPTION_TTL_SECS + 1))
         .unwrap_or_else(Instant::now);
-    let mut subscription_backoff_secs: u64 = RID_POLL_SECS;
-    let mut next_subscription_attempt = Instant::now();
+    let mut backoff = Backoff::new(
+        Duration::from_secs(RID_POLL_SECS),
+        Duration::from_secs(RID_SUBSCRIPTION_BACKOFF_MAX_SECS),
+    );
     let mut last_view = state.get_rid_view_bbox();
     state.mark_loop_heartbeat("rid");
 
@@ -53,16 +56,23 @@ pub async fn run_rid_loop(
             }
             _ = ticker.tick() => {
                 state.mark_loop_heartbeat("rid");
+                if !backoff.ready() {
+                    continue;
+                }
                 if let Err(err) = auth.apply(&mut blender).await {
-                    tracing::warn!("RID sync Blender auth refresh failed: {}", err);
+                    let delay = backoff.fail();
+                    tracing::warn!(
+                        "RID sync Blender auth refresh failed: {} (backing off {:?})",
+                        err,
+                        delay
+                    );
                     continue;
                 }
                 let current_view = state.get_rid_view_bbox();
                 if current_view != last_view {
                     last_view = current_view.clone();
                     subscription_id = None;
-                    subscription_backoff_secs = RID_POLL_SECS;
-                    next_subscription_attempt = Instant::now();
+                    backoff.reset();
                 }
 
                 if current_view.trim().is_empty() {
@@ -71,26 +81,22 @@ pub async fn run_rid_loop(
 
                 let needs_refresh = subscription_id.is_none()
                     || last_subscription.elapsed().as_secs() >= RID_SUBSCRIPTION_TTL_SECS;
-                if needs_refresh && Instant::now() >= next_subscription_attempt {
+                if needs_refresh {
                     match blender.create_rid_subscription(&current_view).await {
                         Ok(id) => {
                             subscription_id = Some(id);
                             last_subscription = Instant::now();
-                            subscription_backoff_secs = RID_POLL_SECS;
-                            next_subscription_attempt = Instant::now();
+                            backoff.reset();
                             tracing::info!("RID subscription refreshed");
                         }
                         Err(err) => {
-                            let delay_secs = subscription_backoff_secs.max(1);
-                            next_subscription_attempt = Instant::now()
-                                + Duration::from_secs(delay_secs);
-                            subscription_backoff_secs = (subscription_backoff_secs.saturating_mul(2))
-                                .min(RID_SUBSCRIPTION_BACKOFF_MAX_SECS);
+                            let delay = backoff.fail();
                             tracing::warn!(
-                                "RID subscription failed: {} (retrying in {}s)",
+                                "RID subscription failed: {} (backing off {:?})",
                                 err,
-                                delay_secs
+                                delay
                             );
+                            continue;
                         }
                     }
                 }
@@ -101,6 +107,7 @@ pub async fn run_rid_loop(
 
                 match blender.fetch_rid_data(active_id).await {
                     Ok(payload) => {
+                        backoff.reset();
                         let tracks = normalize_rid_payload(payload);
                         for track in tracks {
                             state.upsert_external_traffic(track).await;
@@ -108,7 +115,12 @@ pub async fn run_rid_loop(
                         state.purge_external_traffic(RID_TRACK_TTL_SECS).await;
                     }
                     Err(err) => {
-                        tracing::warn!("RID data fetch failed: {}", err);
+                        let delay = backoff.fail();
+                        tracing::warn!(
+                            "RID data fetch failed: {} (backing off {:?})",
+                            err,
+                            delay
+                        );
                     }
                 }
             }

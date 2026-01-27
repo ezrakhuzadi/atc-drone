@@ -13,6 +13,7 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 use tokio::time::interval;
 
+use crate::backoff::Backoff;
 use crate::blender_auth::BlenderAuthManager;
 use crate::config::Config;
 use crate::state::AppState;
@@ -56,6 +57,10 @@ pub async fn run_flight_declaration_sync_loop(
     );
 
     let mut ticker = interval(Duration::from_secs(LOOP_INTERVAL_SECS));
+    let mut backoff = Backoff::new(
+        Duration::from_secs(LOOP_INTERVAL_SECS),
+        Duration::from_secs(300),
+    );
     state.mark_loop_heartbeat("flight-declaration-sync");
 
     loop {
@@ -66,12 +71,27 @@ pub async fn run_flight_declaration_sync_loop(
             }
             _ = ticker.tick() => {
                 state.mark_loop_heartbeat("flight-declaration-sync");
+                if !backoff.ready() {
+                    continue;
+                }
                 if let Err(err) = auth.apply(&mut blender).await {
-                    tracing::warn!("Flight declaration sync Blender auth refresh failed: {}", err);
+                    let delay = backoff.fail();
+                    tracing::warn!(
+                        "Flight declaration sync Blender auth refresh failed: {} (backing off {:?})",
+                        err,
+                        delay
+                    );
                     continue;
                 }
                 if let Err(err) = sync_flight_declarations(state.as_ref(), &blender).await {
-                    tracing::warn!("Flight declaration sync failed: {}", err);
+                    let delay = backoff.fail();
+                    tracing::warn!(
+                        "Flight declaration sync failed: {} (backing off {:?})",
+                        err,
+                        delay
+                    );
+                } else {
+                    backoff.reset();
                 }
             }
         }

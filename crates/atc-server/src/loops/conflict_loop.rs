@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tokio::time::interval;
 
+use crate::backoff::Backoff;
 use crate::blender_auth::BlenderAuthManager;
 use crate::config::Config;
 use crate::route_planner::plan_airborne_route;
@@ -31,6 +32,7 @@ const FAILSAFE_HOLD_SECS: u32 = 120;
 const RESOLUTION_COOLDOWN_SECS: i64 = 120;
 const CONFLICT_SUMMARY_LOG_INTERVAL_SECS: u64 = 30;
 
+#[derive(Debug, Clone)]
 struct BlenderConflictState {
     blender_id: String,
     expires_at: i64,
@@ -56,6 +58,7 @@ pub async fn run_conflict_loop(
     let mut resolution_cooldowns: HashMap<String, i64> = HashMap::new();
     let mut last_conflict_count: usize = 0;
     let mut last_conflict_log_at: Instant = Instant::now();
+    let mut blender_backoff = Backoff::new(Duration::from_secs(1), Duration::from_secs(60));
 
     loop {
         tokio::select! {
@@ -65,8 +68,22 @@ pub async fn run_conflict_loop(
             }
             _ = ticker.tick() => {
                 state.mark_loop_heartbeat("conflict");
-                if let Err(err) = auth.apply(&mut blender).await {
-                    tracing::warn!("Conflict loop Blender auth refresh failed: {}", err);
+                let mut blender_available = false;
+                if blender_backoff.ready() {
+                    match auth.apply(&mut blender).await {
+                        Ok(()) => {
+                            blender_backoff.reset();
+                            blender_available = true;
+                        }
+                        Err(err) => {
+                            let delay = blender_backoff.fail();
+                            tracing::warn!(
+                                "Conflict loop Blender auth refresh failed: {} (backing off {:?})",
+                                err,
+                                delay
+                            );
+                        }
+                    }
                 }
                 // Check for timed-out drones first
                 let lost_drones = state.check_timeouts().await;
@@ -110,11 +127,34 @@ pub async fn run_conflict_loop(
                         last_conflict_count = 0;
                     }
                     if !tracked_conflicts.is_empty() {
-                        for (_, existing) in tracked_conflicts.drain() {
-                            if let Err(err) = blender.delete_geofence(&existing.blender_id).await {
-                                tracing::warn!("Failed to delete conflict geofence: {}", err);
+                        if blender_available {
+                            let conflict_ids: Vec<String> =
+                                tracked_conflicts.keys().cloned().collect();
+                            for conflict_id in conflict_ids {
+                                let Some(existing) = tracked_conflicts
+                                    .get(&conflict_id)
+                                    .map(|entry| entry.clone())
+                                else {
+                                    continue;
+                                };
+                                match blender.delete_geofence(&existing.blender_id).await {
+                                    Ok(()) => {
+                                        tracked_conflicts.remove(&conflict_id);
+                                        state.clear_conflict_geofence(&existing.blender_id);
+                                        blender_backoff.reset();
+                                    }
+                                    Err(err) => {
+                                        let delay = blender_backoff.fail();
+                                        tracing::warn!(
+                                            "Failed to delete conflict geofence {}: {} (backing off {:?})",
+                                            conflict_id,
+                                            err,
+                                            delay
+                                        );
+                                        break;
+                                    }
+                                }
                             }
-                            state.clear_conflict_geofence(&existing.blender_id);
                         }
                     }
                     resolve_inactive_conflict_advisories(state.as_ref(), &active_daa_ids);
@@ -543,59 +583,109 @@ pub async fn run_conflict_loop(
                     }
                 }
 
-                let stale_ids: Vec<String> = tracked_conflicts
-                    .keys()
-                    .filter(|id| !active_conflict_ids.contains(*id))
-                    .cloned()
-                    .collect();
-                for conflict_id in stale_ids {
-                    if let Some(existing) = tracked_conflicts.remove(&conflict_id) {
-                        if let Err(err) = blender.delete_geofence(&existing.blender_id).await {
-                            tracing::warn!("Failed to delete conflict geofence {}: {}", conflict_id, err);
+                if blender_available {
+                    let stale_ids: Vec<String> = tracked_conflicts
+                        .keys()
+                        .filter(|id| !active_conflict_ids.contains(*id))
+                        .cloned()
+                        .collect();
+                    for conflict_id in stale_ids {
+                        let Some(existing) = tracked_conflicts
+                            .get(&conflict_id)
+                            .map(|entry| entry.clone())
+                        else {
+                            continue;
+                        };
+                        match blender.delete_geofence(&existing.blender_id).await {
+                            Ok(()) => {
+                                tracked_conflicts.remove(&conflict_id);
+                                state.clear_conflict_geofence(&existing.blender_id);
+                                blender_backoff.reset();
+                            }
+                            Err(err) => {
+                                let delay = blender_backoff.fail();
+                                tracing::warn!(
+                                    "Failed to delete conflict geofence {}: {} (backing off {:?})",
+                                    conflict_id,
+                                    err,
+                                    delay
+                                );
+                                blender_available = false;
+                                break;
+                            }
                         }
-                        state.clear_conflict_geofence(&existing.blender_id);
-                    }
-                }
-
-                for geofence in &geofences {
-                    let needs_refresh = tracked_conflicts
-                        .get(&geofence.id)
-                        .map(|entry| entry.expires_at <= refresh_deadline)
-                        .unwrap_or(true);
-                    if !needs_refresh {
-                        continue;
                     }
 
-                    if let Some(existing) = tracked_conflicts.remove(&geofence.id) {
-                        if let Err(err) = blender.delete_geofence(&existing.blender_id).await {
-                            tracing::warn!("Failed to delete conflict geofence {}: {}", geofence.id, err);
+                    for geofence in &geofences {
+                        if !blender_available {
+                            break;
                         }
-                        state.clear_conflict_geofence(&existing.blender_id);
-                    }
-
-                    let payload = match conflict_payload(geofence) {
-                        Ok(payload) => payload,
-                        Err(err) => {
-                            tracing::warn!("Failed to build conflict payload {}: {}", geofence.id, err);
+                        let needs_refresh = tracked_conflicts
+                            .get(&geofence.id)
+                            .map(|entry| entry.expires_at <= refresh_deadline)
+                            .unwrap_or(true);
+                        if !needs_refresh {
                             continue;
                         }
-                    };
 
-                    match blender.create_geofence(&payload).await {
-                        Ok(blender_id) => {
-                            let expires_at = loop_now.timestamp() + CONFLICT_TTL_SECS;
-                            let blender_id_clone = blender_id.clone();
-                            tracked_conflicts.insert(
-                                geofence.id.clone(),
-                                BlenderConflictState {
-                                    blender_id,
-                                    expires_at,
-                                },
-                            );
-                            state.mark_conflict_geofence(blender_id_clone, expires_at);
+                        if let Some(existing) =
+                            tracked_conflicts.get(&geofence.id).map(|entry| entry.clone())
+                        {
+                            match blender.delete_geofence(&existing.blender_id).await {
+                                Ok(()) => {
+                                    tracked_conflicts.remove(&geofence.id);
+                                    state.clear_conflict_geofence(&existing.blender_id);
+                                    blender_backoff.reset();
+                                }
+                                Err(err) => {
+                                    let delay = blender_backoff.fail();
+                                    tracing::warn!(
+                                        "Failed to delete conflict geofence {}: {} (backing off {:?})",
+                                        geofence.id,
+                                        err,
+                                        delay
+                                    );
+                                    break;
+                                }
+                            }
                         }
-                        Err(err) => {
-                            tracing::warn!("Failed to sync conflict geofence {}: {}", geofence.id, err);
+
+                        let payload = match conflict_payload(geofence) {
+                            Ok(payload) => payload,
+                            Err(err) => {
+                                tracing::warn!(
+                                    "Failed to build conflict payload {}: {}",
+                                    geofence.id,
+                                    err
+                                );
+                                continue;
+                            }
+                        };
+
+                        match blender.create_geofence(&payload).await {
+                            Ok(blender_id) => {
+                                blender_backoff.reset();
+                                let expires_at = loop_now.timestamp() + CONFLICT_TTL_SECS;
+                                let blender_id_clone = blender_id.clone();
+                                tracked_conflicts.insert(
+                                    geofence.id.clone(),
+                                    BlenderConflictState {
+                                        blender_id,
+                                        expires_at,
+                                    },
+                                );
+                                state.mark_conflict_geofence(blender_id_clone, expires_at);
+                            }
+                            Err(err) => {
+                                let delay = blender_backoff.fail();
+                                tracing::warn!(
+                                    "Failed to sync conflict geofence {}: {} (backing off {:?})",
+                                    geofence.id,
+                                    err,
+                                    delay
+                                );
+                                break;
+                            }
                         }
                     }
                 }

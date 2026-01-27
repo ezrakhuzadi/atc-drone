@@ -20,6 +20,7 @@ use atc_core::models::{
 use crate::blender_auth::BlenderAuthManager;
 use crate::config::Config;
 use crate::state::AppState;
+use crate::backoff::Backoff;
 
 const CONFORMANCE_POLL_SECS: u64 = 10;
 const CONFORMANCE_COMMAND_COOLDOWN_SECS: u64 = 120;
@@ -41,6 +42,10 @@ pub async fn run_conformance_loop(
 
     let mut ticker = interval(Duration::from_secs(CONFORMANCE_POLL_SECS));
     let mut last_status: HashMap<String, String> = HashMap::new();
+    let mut backoff = Backoff::new(
+        Duration::from_secs(CONFORMANCE_POLL_SECS),
+        Duration::from_secs(120),
+    );
     state.mark_loop_heartbeat("conformance");
 
     loop {
@@ -51,8 +56,16 @@ pub async fn run_conformance_loop(
             }
             _ = ticker.tick() => {
                 state.mark_loop_heartbeat("conformance");
+                if !backoff.ready() {
+                    continue;
+                }
                 if let Err(err) = auth.apply(&mut blender).await {
-                    tracing::warn!("Conformance loop Blender auth refresh failed: {}", err);
+                    let delay = backoff.fail();
+                    tracing::warn!(
+                        "Conformance loop Blender auth refresh failed: {} (backing off {:?})",
+                        err,
+                        delay
+                    );
                     continue;
                 }
                 let drones = state.get_all_drones();
@@ -60,9 +73,12 @@ pub async fn run_conformance_loop(
                     continue;
                 }
 
+                let mut any_success = false;
+                let mut any_failure = false;
                 for drone in drones {
                     let response = blender.fetch_conformance_status(&drone.drone_id).await;
                     let Ok(payload) = response else {
+                        any_failure = true;
                         tracing::debug!(
                             "Conformance status fetch failed for {}",
                             drone.drone_id
@@ -70,6 +86,7 @@ pub async fn run_conformance_loop(
                         continue;
                     };
 
+                    any_success = true;
                     let status = ConformanceStatus {
                         drone_id: drone.drone_id.clone(),
                         owner_id: drone.owner_id.clone(),
@@ -199,6 +216,16 @@ pub async fn run_conformance_loop(
                             }
                         }
                     }
+                }
+
+                if any_failure && !any_success {
+                    let delay = backoff.fail();
+                    tracing::warn!(
+                        "Conformance loop is seeing repeated Blender failures (backing off {:?})",
+                        delay
+                    );
+                } else if any_success {
+                    backoff.reset();
                 }
             }
         }

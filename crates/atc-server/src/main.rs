@@ -2,6 +2,7 @@
 
 mod altitude;
 mod api;
+mod backoff;
 mod blender_auth;
 mod cache;
 mod compliance;

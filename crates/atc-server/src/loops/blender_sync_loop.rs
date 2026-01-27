@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use tokio::sync::broadcast;
 use tokio::time::interval;
 
+use crate::backoff::Backoff;
 use crate::blender_auth::BlenderAuthManager;
 use crate::config::Config;
 use crate::state::AppState;
@@ -34,6 +35,10 @@ pub async fn run_blender_loop(
     let mut last_full_sync = Instant::now()
         .checked_sub(Duration::from_secs(BLENDER_FULL_SYNC_SECS + 1))
         .unwrap_or_else(Instant::now);
+    let mut backoff = Backoff::new(
+        Duration::from_secs(BLENDER_SYNC_INTERVAL_SECS),
+        Duration::from_secs(60),
+    );
     state.mark_loop_heartbeat("blender-sync");
 
     loop {
@@ -44,8 +49,16 @@ pub async fn run_blender_loop(
             }
             _ = ticker.tick() => {
                 state.mark_loop_heartbeat("blender-sync");
+                if !backoff.ready() {
+                    continue;
+                }
                 if let Err(err) = auth.apply(&mut client).await {
-                    tracing::warn!("Blender sync auth refresh failed: {}", err);
+                    let delay = backoff.fail();
+                    tracing::warn!(
+                        "Blender sync auth refresh failed: {} (backing off {:?})",
+                        err,
+                        delay
+                    );
                     continue;
                 }
                 let full_sync = last_full_sync.elapsed().as_secs() >= BLENDER_FULL_SYNC_SECS;
@@ -61,7 +74,6 @@ pub async fn run_blender_loop(
                             .map(|prev| *prev != last_update)
                             .unwrap_or(true);
 
-                    last_sent.insert(id.clone(), last_update);
                     if changed {
                         to_send.push(drone);
                     }
@@ -73,20 +85,24 @@ pub async fn run_blender_loop(
                     }
                 }
 
-                if full_sync {
-                    last_full_sync = Instant::now();
-                    if let Some(ids) = current_ids {
-                        last_sent.retain(|id, _| ids.contains(id));
-                    }
-                }
-
                 if to_send.is_empty() {
                     continue;
                 }
 
-                if let Err(e) = client.send_snapshot(&to_send).await {
-                    tracing::error!("Blender Sync Error: {}", e);
+                if let Err(err) = client.send_snapshot(&to_send).await {
+                    let delay = backoff.fail();
+                    tracing::warn!("Blender sync failed: {} (backing off {:?})", err, delay);
                 } else {
+                    backoff.reset();
+                    for drone in &to_send {
+                        last_sent.insert(drone.drone_id.clone(), drone.last_update);
+                    }
+                    if full_sync {
+                        last_full_sync = Instant::now();
+                        if let Some(ids) = current_ids {
+                            last_sent.retain(|id, _| ids.contains(id));
+                        }
+                    }
                     tracing::debug!("Synced {} drones to Blender", to_send.len());
                 }
             }
