@@ -12,7 +12,6 @@ use atc_core::routing::generate_random_route;
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
     Json,
 };
 use chrono::Utc;
@@ -91,6 +90,10 @@ pub(crate) enum FlightPlanSubmission {
 #[derive(Debug, Deserialize)]
 pub struct FlightPlansQuery {
     pub owner_id: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub offset: Option<usize>,
 }
 
 pub async fn create_flight_plan(
@@ -1239,27 +1242,63 @@ fn enforce_owner_for_drone(
 pub async fn get_flight_plans(
     State(state): State<Arc<AppState>>,
     Query(query): Query<FlightPlansQuery>,
-) -> impl IntoResponse {
-    let plans = state.get_flight_plans();
-    if let Some(owner_id) = query.owner_id {
+) -> Result<Json<Vec<FlightPlan>>, (StatusCode, Json<serde_json::Value>)> {
+    let FlightPlansQuery {
+        owner_id,
+        limit,
+        offset,
+    } = query;
+
+    let config = state.config();
+    let max_limit = if config.flights_list_max_limit == 0 {
+        usize::MAX
+    } else {
+        config.flights_list_max_limit
+    };
+    let requested_limit = match limit {
+        Some(value) => value,
+        None => config.flights_list_default_limit.min(max_limit),
+    };
+    if limit.is_some() && requested_limit > max_limit {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "limit too large",
+                "max_limit": max_limit
+            })),
+        ));
+    }
+
+    let offset = offset.unwrap_or(0);
+    let mut plans = state.get_flight_plans();
+    if let Some(owner_id) = owner_id {
         let owner_drone_ids: HashSet<String> = state
             .get_all_drones()
             .into_iter()
             .filter(|drone| drone.owner_id.as_ref() == Some(&owner_id))
             .map(|drone| drone.drone_id)
             .collect();
-
-        let filtered: Vec<FlightPlan> = plans
+        plans = plans
             .into_iter()
             .filter(|plan| {
                 plan.owner_id.as_ref() == Some(&owner_id)
                     || owner_drone_ids.contains(&plan.drone_id)
             })
             .collect();
-        return Json(filtered);
     }
 
-    Json(plans)
+    plans.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| a.flight_id.cmp(&b.flight_id))
+    });
+
+    let page: Vec<FlightPlan> = plans
+        .into_iter()
+        .skip(offset)
+        .take(requested_limit)
+        .collect();
+    Ok(Json(page))
 }
 
 // =============================

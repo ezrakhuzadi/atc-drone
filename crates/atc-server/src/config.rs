@@ -47,6 +47,10 @@ pub struct Config {
     pub max_external_traffic_tracks: usize,
     /// Hard cap for overflow maps (telemetry/detector) keyed by drone ID (DoS protection).
     pub max_overflow_entries: usize,
+    /// Default number of flight plans returned by GET /v1/flights (pagination).
+    pub flights_list_default_limit: usize,
+    /// Hard cap on flight plans returned by GET /v1/flights (DoS protection). Set to 0 to disable.
+    pub flights_list_max_limit: usize,
     /// Trust X-Forwarded-For headers for rate limiting
     pub trust_proxy: bool,
     /// Path to SQLite database file
@@ -252,6 +256,14 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(5_000),
+            flights_list_default_limit: env::var("ATC_FLIGHTS_DEFAULT_LIMIT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(200),
+            flights_list_max_limit: env::var("ATC_FLIGHTS_MAX_LIMIT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1000),
             trust_proxy: env::var("ATC_TRUST_PROXY")
                 .map(|v| v == "1" || v.to_lowercase() == "true")
                 .unwrap_or(false),
