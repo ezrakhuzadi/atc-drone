@@ -52,7 +52,10 @@ pub async fn run_geofence_sync_loop(
     );
 
     let mut ticker = interval(Duration::from_secs(GEOFENCE_SYNC_SECS));
-    let mut backoff = Backoff::new(Duration::from_secs(GEOFENCE_SYNC_SECS), Duration::from_secs(300));
+    let mut backoff = Backoff::new(
+        Duration::from_secs(GEOFENCE_SYNC_SECS),
+        Duration::from_secs(300),
+    );
     let state_path = PathBuf::from(config.geofence_sync_state_path.clone());
     let db = state.database().cloned();
     let mut tracked = match db.as_ref() {

@@ -66,4 +66,3 @@ fn add_jitter(delay: Duration, ratio: f64) -> Duration {
     let jitter_ms = (now_nanos as u128) % (jitter_ms_max + 1);
     delay + Duration::from_millis(jitter_ms as u64)
 }
-
