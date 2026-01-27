@@ -134,6 +134,10 @@ pub fn create_router(config: &Config) -> Router<Arc<AppState>> {
         .layer(middleware::from_fn_with_state(
             expensive_limiter,
             auth::rate_limit,
+        ))
+        .layer(middleware::from_fn_with_state(
+            admin_token.clone(),
+            auth::require_admin,
         ));
 
     // Admin routes (preferred: /v1/admin/... prefix)
@@ -160,7 +164,7 @@ pub fn create_router(config: &Config) -> Router<Arc<AppState>> {
             post(flights::cancel_operational_intent),
         )
         .layer(middleware::from_fn_with_state(
-            admin_token,
+            admin_token.clone(),
             auth::require_admin,
         ));
 
