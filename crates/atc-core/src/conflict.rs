@@ -175,12 +175,8 @@ impl ConflictDetector {
         // Convert heading to radians (0 = North, clockwise)
         let heading_rad = drone.heading_deg.to_radians();
 
-        let (lat, lon) = crate::spatial::offset_by_bearing(
-            drone.lat,
-            drone.lon,
-            distance_m,
-            heading_rad,
-        );
+        let (lat, lon) =
+            crate::spatial::offset_by_bearing(drone.lat, drone.lon, distance_m, heading_rad);
 
         let altitude_m = drone.altitude_m + drone.velocity_z * time_offset_s;
 
@@ -189,10 +185,7 @@ impl ConflictDetector {
 
     /// Check separation between two positions.
     /// Returns (horizontal_distance_m, vertical_distance_m).
-    fn check_separation(
-        pos1: (f64, f64, f64),
-        pos2: (f64, f64, f64),
-    ) -> (f64, f64) {
+    fn check_separation(pos1: (f64, f64, f64), pos2: (f64, f64, f64)) -> (f64, f64) {
         let horizontal = crate::spatial::haversine_distance(pos1.0, pos1.1, pos2.0, pos2.1);
         let vertical = (pos1.2 - pos2.2).abs();
         (horizontal, vertical)
@@ -276,7 +269,10 @@ impl ConflictDetector {
         for (idx, drone) in drone_list.iter().enumerate() {
             let (x, y) = project_xy(drone.lat, drone.lon, ref_lat, ref_lon);
             projected.push((x, y));
-            let cell = ((x / cell_size_m).floor() as i32, (y / cell_size_m).floor() as i32);
+            let cell = (
+                (x / cell_size_m).floor() as i32,
+                (y / cell_size_m).floor() as i32,
+            );
             grid.entry(cell).or_default().push(idx);
         }
 
@@ -343,8 +339,14 @@ impl ConflictDetector {
                             continue;
                         }
 
-                        let Some((severity, time_to_closest, closest_distance, cpa_lat, cpa_lon, cpa_altitude_m)) =
-                            self.predict_conflict(drone1, drone2, warning_h, warning_v)
+                        let Some((
+                            severity,
+                            time_to_closest,
+                            closest_distance,
+                            cpa_lat,
+                            cpa_lon,
+                            cpa_altitude_m,
+                        )) = self.predict_conflict(drone1, drone2, warning_h, warning_v)
                         else {
                             continue;
                         };
@@ -442,12 +444,8 @@ mod tests {
     fn test_vertical_conflict_detection() {
         let mut detector = ConflictDetector::default();
 
-        let (lat2, lon2) = crate::spatial::offset_by_bearing(
-            0.0,
-            0.0,
-            49.0,
-            std::f64::consts::FRAC_PI_2,
-        );
+        let (lat2, lon2) =
+            crate::spatial::offset_by_bearing(0.0, 0.0, 49.0, std::f64::consts::FRAC_PI_2);
 
         detector.update_position(DronePosition::new("DRONE001", 0.0, 0.0, 0.0));
         detector.update_position(

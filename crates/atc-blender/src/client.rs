@@ -1,12 +1,12 @@
 //! Blender API HTTP client.
 
 use anyhow::{Context, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::Utc;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::Value;
+use std::time::Duration;
 
 /// Generate a dummy JWT token that Blender will accept.
 /// Blender with BYPASS_AUTH_TOKEN_VERIFICATION=1 still validates:
@@ -24,11 +24,11 @@ pub(crate) fn generate_dummy_jwt() -> String {
         "exp": now + 3600,
         "iat": now
     });
-    
+
     let header_b64 = URL_SAFE_NO_PAD.encode(header.to_string().as_bytes());
     let payload_b64 = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
     let signature_b64 = URL_SAFE_NO_PAD.encode(b"dummy");
-    
+
     format!("{}.{}.{}", header_b64, payload_b64, signature_b64)
 }
 
@@ -105,10 +105,7 @@ impl BlenderClient {
     }
 
     pub(crate) fn auth_header(&self) -> String {
-        let token = self
-            .auth_token
-            .clone()
-            .unwrap_or_else(generate_dummy_jwt);
+        let token = self.auth_token.clone().unwrap_or_else(generate_dummy_jwt);
         format!("Bearer {}", token)
     }
 
@@ -171,20 +168,23 @@ impl BlenderClient {
             self.base_url, self.session_id
         );
 
-        let observations = drones.iter().map(|d| Observation {
-            lat_dd: d.lat,
-            lon_dd: d.lon,
-            altitude_mm: (d.altitude_m * 1000.0) as i64,
-            icao_address: d.drone_id.clone(),
-            traffic_source: 1,
-            source_type: 1,
-            timestamp: Utc::now().timestamp(),
-            metadata: ObservationMetadata {
-                heading: d.heading_deg,
-                speed_mps: d.speed_mps,
-                aircraft_type: "UAV".to_string(),
-            },
-        }).collect();
+        let observations = drones
+            .iter()
+            .map(|d| Observation {
+                lat_dd: d.lat,
+                lon_dd: d.lon,
+                altitude_mm: (d.altitude_m * 1000.0) as i64,
+                icao_address: d.drone_id.clone(),
+                traffic_source: 1,
+                source_type: 1,
+                timestamp: Utc::now().timestamp(),
+                metadata: ObservationMetadata {
+                    heading: d.heading_deg,
+                    speed_mps: d.speed_mps,
+                    aircraft_type: "UAV".to_string(),
+                },
+            })
+            .collect();
 
         let request = ObservationRequest { observations };
         self.send_request(&url, &request).await
@@ -210,7 +210,10 @@ impl BlenderClient {
     }
 
     /// Fetch conformance status for a specific aircraft.
-    pub async fn fetch_conformance_status(&self, aircraft_id: &str) -> Result<BlenderConformanceStatusResponse> {
+    pub async fn fetch_conformance_status(
+        &self,
+        aircraft_id: &str,
+    ) -> Result<BlenderConformanceStatusResponse> {
         let url = format!(
             "{}/conformance_monitoring_operations/conformance_status/?aircraft_id={}",
             self.base_url, aircraft_id
@@ -244,10 +247,7 @@ impl BlenderClient {
 
     /// Create a DSS Remote ID subscription for a viewport.
     pub async fn create_rid_subscription(&self, view: &str) -> Result<String> {
-        let url = format!(
-            "{}/rid/create_dss_subscription",
-            self.base_url
-        );
+        let url = format!("{}/rid/create_dss_subscription", self.base_url);
 
         let auth_header = self.auth_header();
 
@@ -280,7 +280,11 @@ impl BlenderClient {
             .get("dss_subscription_response")
             .and_then(|value| value.get("dss_subscription_id"))
             .and_then(|value| value.as_str())
-            .or_else(|| payload.get("dss_subscription_id").and_then(|value| value.as_str()))
+            .or_else(|| {
+                payload
+                    .get("dss_subscription_id")
+                    .and_then(|value| value.as_str())
+            })
             .ok_or_else(|| anyhow::anyhow!("RID subscription missing ID"))?;
 
         Ok(subscription_id.to_string())
@@ -288,10 +292,7 @@ impl BlenderClient {
 
     /// Fetch RID data for a DSS subscription.
     pub async fn fetch_rid_data(&self, subscription_id: &str) -> Result<Value> {
-        let url = format!(
-            "{}/rid/get_rid_data/{}",
-            self.base_url, subscription_id
-        );
+        let url = format!("{}/rid/get_rid_data/{}", self.base_url, subscription_id);
 
         let auth_header = self.auth_header();
 
@@ -522,7 +523,11 @@ impl BlenderClient {
         let auth_header = self.auth_header();
 
         let response = self
-            .apply_request_id(self.client.delete(&url).header("Authorization", auth_header))
+            .apply_request_id(
+                self.client
+                    .delete(&url)
+                    .header("Authorization", auth_header),
+            )
             .send()
             .await
             .context("Failed to delete geofence")?;

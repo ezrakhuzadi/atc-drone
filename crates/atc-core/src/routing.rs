@@ -1,8 +1,8 @@
 //! Simple route suggestion logic.
 
 use crate::models::Waypoint;
-use serde::{Deserialize, Serialize};
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 
 const IRVINE_LAT: f64 = 33.6846;
 const IRVINE_LON: f64 = -117.8265;
@@ -30,11 +30,7 @@ pub enum ConflictRisk {
 }
 
 /// Generate route options from start to end.
-pub fn generate_route_options(
-    start: Waypoint,
-    end: Waypoint,
-    altitude_m: f64,
-) -> Vec<RouteOption> {
+pub fn generate_route_options(start: Waypoint, end: Waypoint, altitude_m: f64) -> Vec<RouteOption> {
     let direct_distance = haversine_distance(start.lat, start.lon, end.lat, end.lon);
     let duration_secs = (direct_distance / 10.0) as u32; // Assume 10 m/s
 
@@ -44,10 +40,7 @@ pub fn generate_route_options(
             option_id: "direct".to_string(),
             name: "Direct".to_string(),
             description: "Shortest path, straight line".to_string(),
-            waypoints: vec![
-                start.clone(),
-                end.clone(),
-            ],
+            waypoints: vec![start.clone(), end.clone()],
             estimated_duration_secs: duration_secs,
             conflict_risk: ConflictRisk::Medium,
         },
@@ -57,8 +50,14 @@ pub fn generate_route_options(
             name: "High Altitude".to_string(),
             description: format!("Fly at {}m for separation", altitude_m + 30.0),
             waypoints: vec![
-                Waypoint { altitude_m: altitude_m + 30.0, ..start.clone() },
-                Waypoint { altitude_m: altitude_m + 30.0, ..end.clone() },
+                Waypoint {
+                    altitude_m: altitude_m + 30.0,
+                    ..start.clone()
+                },
+                Waypoint {
+                    altitude_m: altitude_m + 30.0,
+                    ..end.clone()
+                },
             ],
             estimated_duration_secs: duration_secs + 10, // Climb time
             conflict_risk: ConflictRisk::Low,
@@ -88,7 +87,7 @@ pub fn generate_route_options(
 pub fn generate_random_route() -> Vec<Waypoint> {
     let start = random_point_near_irvine();
     let end = random_point_near_irvine();
-    
+
     // Simple 2-point route
     vec![start, end]
 }
@@ -97,7 +96,7 @@ fn random_point_near_irvine() -> Waypoint {
     let mut rng = rand::rng();
     let lat_offset = rng.random_range(-RADIUS_DEG..RADIUS_DEG);
     let lon_offset = rng.random_range(-RADIUS_DEG..RADIUS_DEG);
-    
+
     Waypoint {
         lat: IRVINE_LAT + lat_offset,
         lon: IRVINE_LON + lon_offset,
@@ -124,13 +123,13 @@ pub enum AvoidanceType {
 }
 
 /// Generate avoidance waypoints around a conflict point.
-/// 
+///
 /// # Arguments
 /// * `current_pos` - Drone's current position
 /// * `destination` - Original destination waypoint
 /// * `conflict_point` - Predicted point of conflict
 /// * `avoidance_type` - Type of maneuver to perform
-/// 
+///
 /// # Returns
 /// Vector of waypoints that route around the conflict
 pub fn generate_avoidance_route(
@@ -139,104 +138,152 @@ pub fn generate_avoidance_route(
     conflict_point: &Waypoint,
     avoidance_type: AvoidanceType,
 ) -> Vec<Waypoint> {
-    use crate::spatial::{offset_position, bearing};
+    use crate::spatial::{bearing, offset_position};
     use std::f64::consts::PI;
-    
+
     // Constants for avoidance (in METERS, not degrees)
-    const LATERAL_OFFSET_M: f64 = 100.0;   // 100m lateral offset
-    const VERTICAL_OFFSET_M: f64 = 30.0;   // 30m altitude change
-    const BUFFER_DISTANCE_M: f64 = 50.0;   // 50m before/after conflict point
-    
+    const LATERAL_OFFSET_M: f64 = 100.0; // 100m lateral offset
+    const VERTICAL_OFFSET_M: f64 = 30.0; // 30m altitude change
+    const BUFFER_DISTANCE_M: f64 = 50.0; // 50m before/after conflict point
+
     // Calculate bearing from current to destination (radians, 0 = north)
-    let path_bearing = bearing(current_pos.lat, current_pos.lon, destination.lat, destination.lon);
-    
+    let path_bearing = bearing(
+        current_pos.lat,
+        current_pos.lon,
+        destination.lat,
+        destination.lon,
+    );
+
     // Perpendicular bearing (90 degrees right)
     let perp_bearing = path_bearing + PI / 2.0;
-    
+
     match avoidance_type {
         AvoidanceType::Lateral => {
             // Pre-conflict: offset begins
             let (pre_lat, pre_lon) = {
                 // Move back along path, then offset laterally
                 let (base_lat, base_lon) = offset_position(
-                    conflict_point.lat, conflict_point.lon,
-                    -BUFFER_DISTANCE_M * path_bearing.cos(),  // back along path
+                    conflict_point.lat,
+                    conflict_point.lon,
+                    -BUFFER_DISTANCE_M * path_bearing.cos(), // back along path
                     -BUFFER_DISTANCE_M * path_bearing.sin(),
                 );
                 offset_position(
-                    base_lat, base_lon,
+                    base_lat,
+                    base_lon,
                     LATERAL_OFFSET_M * perp_bearing.cos(),
                     LATERAL_OFFSET_M * perp_bearing.sin(),
                 )
             };
-            
+
             // At conflict: maximum offset
             let (mid_lat, mid_lon) = offset_position(
-                conflict_point.lat, conflict_point.lon,
+                conflict_point.lat,
+                conflict_point.lon,
                 LATERAL_OFFSET_M * perp_bearing.cos(),
                 LATERAL_OFFSET_M * perp_bearing.sin(),
             );
-            
+
             // Post-conflict: rejoin path
             let (post_lat, post_lon) = {
                 let (base_lat, base_lon) = offset_position(
-                    conflict_point.lat, conflict_point.lon,
+                    conflict_point.lat,
+                    conflict_point.lon,
                     BUFFER_DISTANCE_M * path_bearing.cos(),
                     BUFFER_DISTANCE_M * path_bearing.sin(),
                 );
                 offset_position(
-                    base_lat, base_lon,
+                    base_lat,
+                    base_lon,
                     (LATERAL_OFFSET_M / 2.0) * perp_bearing.cos(),
                     (LATERAL_OFFSET_M / 2.0) * perp_bearing.sin(),
                 )
             };
-            
+
             vec![
                 current_pos.clone(),
-                Waypoint { lat: pre_lat, lon: pre_lon, altitude_m: current_pos.altitude_m, speed_mps: current_pos.speed_mps },
-                Waypoint { lat: mid_lat, lon: mid_lon, altitude_m: current_pos.altitude_m, speed_mps: current_pos.speed_mps },
-                Waypoint { lat: post_lat, lon: post_lon, altitude_m: current_pos.altitude_m, speed_mps: current_pos.speed_mps },
+                Waypoint {
+                    lat: pre_lat,
+                    lon: pre_lon,
+                    altitude_m: current_pos.altitude_m,
+                    speed_mps: current_pos.speed_mps,
+                },
+                Waypoint {
+                    lat: mid_lat,
+                    lon: mid_lon,
+                    altitude_m: current_pos.altitude_m,
+                    speed_mps: current_pos.speed_mps,
+                },
+                Waypoint {
+                    lat: post_lat,
+                    lon: post_lon,
+                    altitude_m: current_pos.altitude_m,
+                    speed_mps: current_pos.speed_mps,
+                },
                 destination.clone(),
             ]
         }
         AvoidanceType::Vertical => {
             let new_altitude = current_pos.altitude_m + VERTICAL_OFFSET_M;
-            
+
             // Pre-conflict: begin climb
             let (pre_lat, pre_lon) = offset_position(
-                conflict_point.lat, conflict_point.lon,
+                conflict_point.lat,
+                conflict_point.lon,
                 -BUFFER_DISTANCE_M * path_bearing.cos(),
                 -BUFFER_DISTANCE_M * path_bearing.sin(),
             );
-            
+
             // Post-conflict: maintain altitude
             let (post_lat, post_lon) = offset_position(
-                conflict_point.lat, conflict_point.lon,
+                conflict_point.lat,
+                conflict_point.lon,
                 BUFFER_DISTANCE_M * path_bearing.cos(),
                 BUFFER_DISTANCE_M * path_bearing.sin(),
             );
-            
+
             vec![
                 current_pos.clone(),
-                Waypoint { lat: pre_lat, lon: pre_lon, altitude_m: new_altitude, speed_mps: current_pos.speed_mps },
-                Waypoint { lat: post_lat, lon: post_lon, altitude_m: new_altitude, speed_mps: current_pos.speed_mps },
-                Waypoint { lat: destination.lat, lon: destination.lon, altitude_m: destination.altitude_m, speed_mps: destination.speed_mps },
+                Waypoint {
+                    lat: pre_lat,
+                    lon: pre_lon,
+                    altitude_m: new_altitude,
+                    speed_mps: current_pos.speed_mps,
+                },
+                Waypoint {
+                    lat: post_lat,
+                    lon: post_lon,
+                    altitude_m: new_altitude,
+                    speed_mps: current_pos.speed_mps,
+                },
+                Waypoint {
+                    lat: destination.lat,
+                    lon: destination.lon,
+                    altitude_m: destination.altitude_m,
+                    speed_mps: destination.speed_mps,
+                },
             ]
         }
         AvoidanceType::Combined => {
             let lateral_offset = LATERAL_OFFSET_M * 0.7;
             let vertical_offset = VERTICAL_OFFSET_M * 0.7;
             let new_altitude = current_pos.altitude_m + vertical_offset;
-            
+
             let (mid_lat, mid_lon) = offset_position(
-                conflict_point.lat, conflict_point.lon,
+                conflict_point.lat,
+                conflict_point.lon,
                 lateral_offset * perp_bearing.cos(),
                 lateral_offset * perp_bearing.sin(),
             );
-            
+
             vec![
                 current_pos.clone(),
-                Waypoint { lat: mid_lat, lon: mid_lon, altitude_m: new_altitude, speed_mps: current_pos.speed_mps },
+                Waypoint {
+                    lat: mid_lat,
+                    lon: mid_lon,
+                    altitude_m: new_altitude,
+                    speed_mps: current_pos.speed_mps,
+                },
                 destination.clone(),
             ]
         }
@@ -254,12 +301,12 @@ pub fn select_avoidance_type(
     if alt_diff > 20.0 {
         return AvoidanceType::Lateral;
     }
-    
+
     // If near altitude limits, use lateral
     if altitude_m > 100.0 || has_ceiling {
         return AvoidanceType::Lateral;
     }
-    
+
     // Default: vertical is often simpler
     AvoidanceType::Vertical
 }
@@ -270,12 +317,27 @@ mod tests {
 
     #[test]
     fn test_generate_lateral_avoidance() {
-        let current = Waypoint { lat: 33.68, lon: -117.82, altitude_m: 50.0, speed_mps: Some(10.0) };
-        let dest = Waypoint { lat: 33.69, lon: -117.82, altitude_m: 50.0, speed_mps: Some(10.0) };
-        let conflict = Waypoint { lat: 33.685, lon: -117.82, altitude_m: 50.0, speed_mps: None };
-        
+        let current = Waypoint {
+            lat: 33.68,
+            lon: -117.82,
+            altitude_m: 50.0,
+            speed_mps: Some(10.0),
+        };
+        let dest = Waypoint {
+            lat: 33.69,
+            lon: -117.82,
+            altitude_m: 50.0,
+            speed_mps: Some(10.0),
+        };
+        let conflict = Waypoint {
+            lat: 33.685,
+            lon: -117.82,
+            altitude_m: 50.0,
+            speed_mps: None,
+        };
+
         let route = generate_avoidance_route(&current, &dest, &conflict, AvoidanceType::Lateral);
-        
+
         assert!(route.len() >= 3, "Should generate multiple waypoints");
         // First waypoint should be current position
         assert!((route[0].lat - current.lat).abs() < 0.0001);
@@ -283,13 +345,31 @@ mod tests {
 
     #[test]
     fn test_generate_vertical_avoidance() {
-        let current = Waypoint { lat: 33.68, lon: -117.82, altitude_m: 50.0, speed_mps: Some(10.0) };
-        let dest = Waypoint { lat: 33.69, lon: -117.82, altitude_m: 50.0, speed_mps: Some(10.0) };
-        let conflict = Waypoint { lat: 33.685, lon: -117.82, altitude_m: 50.0, speed_mps: None };
-        
+        let current = Waypoint {
+            lat: 33.68,
+            lon: -117.82,
+            altitude_m: 50.0,
+            speed_mps: Some(10.0),
+        };
+        let dest = Waypoint {
+            lat: 33.69,
+            lon: -117.82,
+            altitude_m: 50.0,
+            speed_mps: Some(10.0),
+        };
+        let conflict = Waypoint {
+            lat: 33.685,
+            lon: -117.82,
+            altitude_m: 50.0,
+            speed_mps: None,
+        };
+
         let route = generate_avoidance_route(&current, &dest, &conflict, AvoidanceType::Vertical);
-        
+
         // Middle waypoints should have different altitude
-        assert!(route[1].altitude_m != current.altitude_m, "Should change altitude");
+        assert!(
+            route[1].altitude_m != current.altitude_m,
+            "Should change altitude"
+        );
     }
 }

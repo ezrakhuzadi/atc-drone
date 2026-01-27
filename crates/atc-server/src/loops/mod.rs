@@ -1,7 +1,7 @@
 //! Background loops for continuous processing.
 
-pub mod conflict_loop;
 pub mod blender_sync_loop;
+pub mod conflict_loop;
 pub mod conformance_loop;
 pub mod flight_declaration_sync_loop;
 pub mod geofence_sync_loop;

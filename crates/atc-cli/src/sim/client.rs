@@ -45,7 +45,11 @@ impl BlenderClient {
     /// * `base_url` - Base URL of Flight Blender (e.g., "http://localhost:8000")
     /// * `session_id` - Session UUID
     /// * `token` - JWT bearer token
-    pub fn new(base_url: impl Into<String>, session_id: impl Into<String>, token: impl Into<String>) -> Self {
+    pub fn new(
+        base_url: impl Into<String>,
+        session_id: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Self {
         Self {
             client: Client::new(),
             base_url: base_url.into(),

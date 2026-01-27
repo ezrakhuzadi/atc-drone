@@ -2,16 +2,16 @@
 
 use crate::cache;
 use crate::config::Config;
-use atc_core::spatial::{meters_per_deg_lat, meters_per_deg_lon};
 use atc_core::models::FlightPlanRequest;
+use atc_core::spatial::{meters_per_deg_lat, meters_per_deg_lon};
 use chrono::Utc;
+use dashmap::DashMap;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
-use dashmap::DashMap;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RoutePoint {
@@ -111,8 +111,6 @@ pub struct ObstacleHazard {
     pub source: String,
     pub distance_m: Option<f64>,
 }
-
-
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ObstacleConflict {
@@ -281,7 +279,14 @@ pub async fn evaluate_compliance(
 
     let (weather_result, obstacle_result) = tokio::join!(
         fetch_weather(&client, config, points),
-        fetch_obstacles(&client, config, points, clearance_m, None, ObstacleQueryMode::Full)
+        fetch_obstacles(
+            &client,
+            config,
+            points,
+            clearance_m,
+            None,
+            ObstacleQueryMode::Full
+        )
     );
 
     let weather_check = match weather_result {
@@ -334,7 +339,13 @@ pub async fn evaluate_compliance(
         .max(weather_check.gust_mps.unwrap_or(0.0));
     let route = build_route_metrics(points, cruise_speed_mps, wind_mps);
 
-    let battery_check = evaluate_battery(config, &route, cruise_speed_mps, battery_capacity_min, battery_reserve_min);
+    let battery_check = evaluate_battery(
+        config,
+        &route,
+        cruise_speed_mps,
+        battery_capacity_min,
+        battery_reserve_min,
+    );
 
     let checks = ComplianceChecks {
         weather: weather_check.clone(),
@@ -378,7 +389,11 @@ pub async fn evaluate_compliance(
     }
 }
 
-fn build_route_metrics(points: &[RoutePoint], cruise_speed_mps: Option<f64>, wind_mps: f64) -> RouteMetrics {
+fn build_route_metrics(
+    points: &[RoutePoint],
+    cruise_speed_mps: Option<f64>,
+    wind_mps: f64,
+) -> RouteMetrics {
     if points.len() < 2 {
         return RouteMetrics {
             distance_m: 0.0,
@@ -505,7 +520,11 @@ fn evaluate_battery(
     }
 }
 
-fn evaluate_population(config: &Config, operation_type: u8, analysis: &ObstacleAnalysis) -> PopulationCheck {
+fn evaluate_population(
+    config: &Config,
+    operation_type: u8,
+    analysis: &ObstacleAnalysis,
+) -> PopulationCheck {
     let density = analysis.density;
     let classification = classify_density(density);
     let is_bvlos = operation_type == 2;
@@ -521,10 +540,7 @@ fn evaluate_population(config: &Config, operation_type: u8, analysis: &ObstacleA
 
     PopulationCheck {
         status,
-        message: format!(
-            "Density {:.0} people/km^2 ({})",
-            density, classification
-        ),
+        message: format!("Density {:.0} people/km^2 ({})", density, classification),
         density: Some(density),
         classification: Some(classification),
         building_count: Some(analysis.building_count),
@@ -657,7 +673,11 @@ async fn fetch_weather(
         .query(&[
             ("latitude", lat.to_string()),
             ("longitude", lon.to_string()),
-            ("current", "temperature_2m,wind_speed_10m,wind_gusts_10m,precipitation,weather_code".to_string()),
+            (
+                "current",
+                "temperature_2m,wind_speed_10m,wind_gusts_10m,precipitation,weather_code"
+                    .to_string(),
+            ),
             ("windspeed_unit", "ms".to_string()),
             ("timezone", "UTC".to_string()),
         ])
@@ -721,7 +741,10 @@ pub(crate) async fn fetch_obstacles(
         }
     }
     let area_km2 = bounds_area_km2(&bounds);
-    let bbox = format!("{},{},{},{}", bounds.min_lat, bounds.min_lon, bounds.max_lat, bounds.max_lon);
+    let bbox = format!(
+        "{},{},{},{}",
+        bounds.min_lat, bounds.min_lon, bounds.max_lat, bounds.max_lon
+    );
     let overpass_timeout_s = config.compliance_overpass_timeout_s.max(5);
     let route_min_height_m = config.route_planner_building_min_height_m.max(0.0);
     let route_min_levels = config.route_planner_building_min_levels as f64;
@@ -837,7 +860,9 @@ pub(crate) async fn fetch_obstacles(
             continue;
         }
 
-        let Some((lat, lon)) = element_center(&element) else { continue };
+        let Some((lat, lon)) = element_center(&element) else {
+            continue;
+        };
         let distance_m = distance_to_route_meters(lat, lon, points);
         if distance_m.is_finite() && distance_m > max_distance {
             continue;
@@ -861,8 +886,8 @@ pub(crate) async fn fetch_obstacles(
             height_m = default_height;
         }
         if matches!(mode, ObstacleQueryMode::RoutePlanner) && is_building {
-            let tall_enough =
-                height_m + f64::EPSILON >= route_min_height_m || levels.unwrap_or(0.0) >= route_min_levels;
+            let tall_enough = height_m + f64::EPSILON >= route_min_height_m
+                || levels.unwrap_or(0.0) >= route_min_levels;
             if !tall_enough {
                 continue;
             }
@@ -904,7 +929,11 @@ pub(crate) async fn fetch_obstacles(
         });
     }
 
-    candidates.sort_by(|a, b| a.distance_m.partial_cmp(&b.distance_m).unwrap_or(std::cmp::Ordering::Equal));
+    candidates.sort_by(|a, b| {
+        a.distance_m
+            .partial_cmp(&b.distance_m)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let obstacle_count = candidates.len();
     let truncated = obstacle_count > config.compliance_max_overpass_elements;
     let route_candidates: Vec<ObstacleCandidate> = if truncated {
@@ -971,7 +1000,11 @@ pub(crate) async fn fetch_obstacles(
             analysis: analysis.clone(),
         },
     );
-    cache::prune_cache(cache, OBSTACLE_CACHE_MAX_ENTRIES, cache_ttl.saturating_mul(2));
+    cache::prune_cache(
+        cache,
+        OBSTACLE_CACHE_MAX_ENTRIES,
+        cache_ttl.saturating_mul(2),
+    );
 
     Ok(analysis)
 }
@@ -1179,8 +1212,7 @@ fn haversine_distance_latlon(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 
     let lat2 = lat2.to_radians();
     let dlat = lat2 - lat1;
     let dlon = (lon2 - lon1).to_radians();
-    let a = (dlat / 2.0).sin().powi(2)
-        + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
+    let a = (dlat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
     let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
     r * c
 }
@@ -1255,8 +1287,7 @@ fn haversine_distance_m(a: RoutePoint, b: RoutePoint) -> f64 {
     let lat2 = b.lat.to_radians();
     let dlat = lat2 - lat1;
     let dlon = (b.lon - a.lon).to_radians();
-    let h = (dlat / 2.0).sin().powi(2)
-        + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
+    let h = (dlat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
     let c = 2.0 * h.sqrt().asin();
     6_371_000.0 * c
 }

@@ -53,11 +53,11 @@ const LANDED_HOVER_DURATION: f64 = 10.0;
 /// Flight lifecycle phases
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum FlightPhase {
-    Preflight,  // On ground, preparing
-    Takeoff,    // Ascending to cruise altitude
-    Cruise,     // Flying to destination
-    Landing,    // Descending at destination
-    Landed,     // On ground at destination
+    Preflight, // On ground, preparing
+    Takeoff,   // Ascending to cruise altitude
+    Cruise,    // Flying to destination
+    Landing,   // Descending at destination
+    Landed,    // On ground at destination
 }
 
 impl std::fmt::Display for FlightPhase {
@@ -74,7 +74,11 @@ impl std::fmt::Display for FlightPhase {
 
 /// Golden Demo Scenario
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Golden Demo: Realistic drone lifecycle with collision")]
+#[command(
+    author,
+    version,
+    about = "Golden Demo: Realistic drone lifecycle with collision"
+)]
 struct Args {
     /// ATC Server URL
     #[arg(long, default_value = "http://localhost:3000")]
@@ -142,7 +146,9 @@ impl DemoState {
     ) -> Self {
         let heading_rad = bearing(start.0, start.1, end.0, end.1);
         let mut heading = heading_rad.to_degrees();
-        if heading < 0.0 { heading += 360.0; }
+        if heading < 0.0 {
+            heading += 360.0;
+        }
 
         Self {
             drone_id: drone_id.to_string(),
@@ -175,7 +181,7 @@ impl DemoState {
     /// Update phase based on elapsed time and current state
     fn update_phase(&mut self, elapsed: f64) {
         let phase_elapsed = elapsed - self.phase_start_time;
-        
+
         match self.phase {
             FlightPhase::Preflight => {
                 if phase_elapsed >= PREFLIGHT_DURATION {
@@ -187,7 +193,7 @@ impl DemoState {
                 // Altitude increases during takeoff
                 let takeoff_progress = (phase_elapsed / TAKEOFF_DURATION).clamp(0.0, 1.0);
                 self.current_alt = takeoff_progress * CRUISE_ALTITUDE_M;
-                
+
                 if phase_elapsed >= TAKEOFF_DURATION {
                     self.phase = FlightPhase::Cruise;
                     self.phase_start_time = elapsed;
@@ -201,7 +207,7 @@ impl DemoState {
                 // Altitude decreases during landing
                 let landing_progress = (phase_elapsed / LANDING_DURATION).clamp(0.0, 1.0);
                 self.current_alt = CRUISE_ALTITUDE_M * (1.0 - landing_progress);
-                
+
                 if phase_elapsed >= LANDING_DURATION {
                     self.phase = FlightPhase::Landed;
                     self.phase_start_time = elapsed;
@@ -214,7 +220,13 @@ impl DemoState {
         }
     }
 
-    fn update_motion(&mut self, target_lat: f64, target_lon: f64, dt_s: f64, target_speed_mps: f64) {
+    fn update_motion(
+        &mut self,
+        target_lat: f64,
+        target_lon: f64,
+        dt_s: f64,
+        target_speed_mps: f64,
+    ) {
         if dt_s <= 0.0 {
             return;
         }
@@ -230,7 +242,8 @@ impl DemoState {
             return;
         }
 
-        let desired_heading = bearing(self.current_lat, self.current_lon, target_lat, target_lon).to_degrees();
+        let desired_heading =
+            bearing(self.current_lat, self.current_lon, target_lat, target_lon).to_degrees();
         let desired_heading = if desired_heading < 0.0 {
             desired_heading + 360.0
         } else {
@@ -242,7 +255,8 @@ impl DemoState {
             self.heading_deg + heading_delta.clamp(-max_turn, max_turn),
         );
 
-        let remaining = haversine_distance(self.current_lat, self.current_lon, target_lat, target_lon);
+        let remaining =
+            haversine_distance(self.current_lat, self.current_lon, target_lat, target_lon);
         let travel = (self.current_speed_mps * dt_s).min(remaining);
         if travel <= 0.0 {
             return;
@@ -340,7 +354,8 @@ async fn handle_command(drone: &mut DemoState, cmd: Command) {
     match cmd.command_type {
         CommandType::Hold { duration_secs } => {
             drone.is_holding = true;
-            drone.hold_until = Some(time::Instant::now() + Duration::from_secs(duration_secs as u64));
+            drone.hold_until =
+                Some(time::Instant::now() + Duration::from_secs(duration_secs as u64));
             println!("  [CMD] {} HOLD for {}s\n", drone.drone_id, duration_secs);
         }
         CommandType::Resume => {
@@ -356,7 +371,11 @@ async fn handle_command(drone: &mut DemoState, cmd: Command) {
                 .map(|wp| (wp.lat, wp.lon, wp.altitude_m))
                 .collect();
             drone.reroute_index = 0;
-            println!("  [CMD] {} REROUTE ({} waypoints)", drone.drone_id, waypoints.len());
+            println!(
+                "  [CMD] {} REROUTE ({} waypoints)",
+                drone.drone_id,
+                waypoints.len()
+            );
             println!("        Reason: {}\n", reason.as_deref().unwrap_or("none"));
         }
         CommandType::AltitudeChange { target_altitude_m } => {
@@ -431,8 +450,12 @@ async fn main() -> anyhow::Result<()> {
     println!("[REGISTER] Registering drones...");
     alpha_client.set_registration_token(Some(registration_token.clone()));
     beta_client.set_registration_token(Some(registration_token.clone()));
-    alpha_client.register_with_owner(Some("demo-alpha"), Some(&args.owner)).await?;
-    beta_client.register_with_owner(Some("demo-beta"), Some(&args.owner)).await?;
+    alpha_client
+        .register_with_owner(Some("demo-alpha"), Some(&args.owner))
+        .await?;
+    beta_client
+        .register_with_owner(Some("demo-beta"), Some(&args.owner))
+        .await?;
     println!("[REGISTER] ✓ Both drones registered\n");
 
     let alpha_command_rx = spawn_command_listener("demo-alpha", &alpha_client).await;
@@ -464,18 +487,30 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Calculate cruise duration
-    let distance_m = haversine_distance(alpha.start_lat, alpha.start_lon, alpha.end_lat, alpha.end_lon);
+    let distance_m = haversine_distance(
+        alpha.start_lat,
+        alpha.start_lon,
+        alpha.end_lat,
+        alpha.end_lon,
+    );
     let cruise_duration = distance_m / DRONE_SPEED_MPS;
-    
-    let total_duration = PREFLIGHT_DURATION + TAKEOFF_DURATION + cruise_duration + LANDING_DURATION + LANDED_HOVER_DURATION;
+
+    let total_duration = PREFLIGHT_DURATION
+        + TAKEOFF_DURATION
+        + cruise_duration
+        + LANDING_DURATION
+        + LANDED_HOVER_DURATION;
 
     println!("╔═══════════════════════════════════════════════════════════════╗");
     println!("║  SIMULATION START                                             ║");
-    println!("║  Distance: {:.0}m | Cruise: {:.1}s | Total: {:.0}s              ║", distance_m, cruise_duration, total_duration);
+    println!(
+        "║  Distance: {:.0}m | Cruise: {:.1}s | Total: {:.0}s              ║",
+        distance_m, cruise_duration, total_duration
+    );
     println!("╚═══════════════════════════════════════════════════════════════╝\n");
 
     let start_time = time::Instant::now();
-    let owner_id = args.owner.clone();  // For telemetry owner tracking
+    let owner_id = args.owner.clone(); // For telemetry owner tracking
     let mut update_count = 0u32;
     let mut interval = time::interval(Duration::from_secs_f64(1.0 / UPDATE_RATE_HZ));
     let mut last_elapsed = 0.0;
@@ -488,7 +523,10 @@ async fn main() -> anyhow::Result<()> {
 
         if elapsed > total_duration {
             println!("\n╔═══════════════════════════════════════════════════════════════╗");
-            println!("║  DEMO COMPLETE - {} updates | Both drones landed             ║", update_count);
+            println!(
+                "║  DEMO COMPLETE - {} updates | Both drones landed             ║",
+                update_count
+            );
             println!("╚═══════════════════════════════════════════════════════════════╝");
             break;
         }
@@ -507,15 +545,21 @@ async fn main() -> anyhow::Result<()> {
             // Update phase
             drone.update_phase(elapsed);
 
-            let (target_lat, target_lon, target_alt) = if drone.is_rerouting && drone.reroute_index < drone.reroute_waypoints.len() {
-                drone.reroute_waypoints[drone.reroute_index]
-            } else {
-                (drone.end_lat, drone.end_lon, drone.current_alt)
-            };
+            let (target_lat, target_lon, target_alt) =
+                if drone.is_rerouting && drone.reroute_index < drone.reroute_waypoints.len() {
+                    drone.reroute_waypoints[drone.reroute_index]
+                } else {
+                    (drone.end_lat, drone.end_lon, drone.current_alt)
+                };
 
             let target_speed = if drone.is_holding
-                || matches!(drone.phase, FlightPhase::Preflight | FlightPhase::Takeoff | FlightPhase::Landing | FlightPhase::Landed)
-            {
+                || matches!(
+                    drone.phase,
+                    FlightPhase::Preflight
+                        | FlightPhase::Takeoff
+                        | FlightPhase::Landing
+                        | FlightPhase::Landed
+                ) {
                 0.0
             } else {
                 DRONE_SPEED_MPS
@@ -538,7 +582,10 @@ async fn main() -> anyhow::Result<()> {
                         drone.is_rerouting = false;
                         drone.reroute_waypoints.clear();
                         drone.reroute_index = 0;
-                        println!("[{:3}] {} reroute complete, continuing from new position", update_count, drone.drone_id);
+                        println!(
+                            "[{:3}] {} reroute complete, continuing from new position",
+                            update_count, drone.drone_id
+                        );
                     }
                 }
             }
@@ -546,13 +593,17 @@ async fn main() -> anyhow::Result<()> {
             // Check if we reached destination (distance-based transition)
             if drone.phase == FlightPhase::Cruise && !drone.is_rerouting && !drone.is_holding {
                 let dist_to_end = haversine_distance(lat, lon, drone.end_lat, drone.end_lon);
-                if dist_to_end < 10.0 { // Within 10 meters
+                if dist_to_end < 10.0 {
+                    // Within 10 meters
                     drone.phase = FlightPhase::Landing;
                     drone.phase_start_time = elapsed;
-                    println!("[{:3}] {} arrived at destination, starting landing", update_count, drone.drone_id);
+                    println!(
+                        "[{:3}] {} arrived at destination, starting landing",
+                        update_count, drone.drone_id
+                    );
                 }
             }
-            
+
             // Calculate altitude with offset applied during cruise
             let alt = if drone.is_rerouting && drone.reroute_index < drone.reroute_waypoints.len() {
                 // During reroute: use waypoint altitude + any additional offset
@@ -575,12 +626,13 @@ async fn main() -> anyhow::Result<()> {
                     drone.battery_warned = true;
                     println!(
                         "[{:3}] {} battery reserve reached ({:.1} min left), forcing landing",
-                        update_count,
-                        drone.drone_id,
-                        drone.battery_remaining_min
+                        update_count, drone.drone_id, drone.battery_remaining_min
                     );
                 }
-                if matches!(drone.phase, FlightPhase::Cruise | FlightPhase::Takeoff | FlightPhase::Preflight) {
+                if matches!(
+                    drone.phase,
+                    FlightPhase::Cruise | FlightPhase::Takeoff | FlightPhase::Preflight
+                ) {
                     drone.is_holding = false;
                     drone.is_rerouting = false;
                     drone.phase = FlightPhase::Landing;
@@ -589,25 +641,31 @@ async fn main() -> anyhow::Result<()> {
             }
 
             // Send telemetry with owner ID
-            match drone.client.send_position_with_owner(
-                lat,
-                lon,
-                alt,
-                drone.heading_deg,
-                speed,
-                Some(owner_id.clone()),
-            )
-            .await
+            match drone
+                .client
+                .send_position_with_owner(
+                    lat,
+                    lon,
+                    alt,
+                    drone.heading_deg,
+                    speed,
+                    Some(owner_id.clone()),
+                )
+                .await
             {
                 Ok(_) => {
                     let status = if drone.is_rerouting {
-                        format!("REROUTE[{}/{}]", drone.reroute_index + 1, drone.reroute_waypoints.len())
+                        format!(
+                            "REROUTE[{}/{}]",
+                            drone.reroute_index + 1,
+                            drone.reroute_waypoints.len()
+                        )
                     } else if drone.is_holding {
                         "HOLD".to_string()
                     } else {
                         format!("{}", drone.phase)
                     };
-                    
+
                     println!(
                         "[{:3}] {}: ({:.6}, {:.6}) @ {:.0}m | {}",
                         update_count, drone.drone_id, lat, lon, alt, status
@@ -651,7 +709,6 @@ async fn main() -> anyhow::Result<()> {
                     handle_command(drone, cmd).await;
                 }
             }
-
         }
     }
 

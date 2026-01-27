@@ -13,8 +13,8 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 use tokio::time::interval;
 
-use crate::config::Config;
 use crate::blender_auth::BlenderAuthManager;
+use crate::config::Config;
 use crate::state::AppState;
 
 const LOOP_INTERVAL_SECS: u64 = 30;
@@ -146,7 +146,12 @@ fn declaration_to_plan(declaration: &Value, declaration_id: &str) -> Option<Flig
         .and_then(|value| value.get("atc_plan"))
         .and_then(|value| serde_json::from_value::<AtcPlanEmbed>(value.clone()).ok());
 
-    if coordinates.is_empty() && atc_plan.as_ref().map(|plan| plan.waypoints.is_empty()).unwrap_or(true) {
+    if coordinates.is_empty()
+        && atc_plan
+            .as_ref()
+            .map(|plan| plan.waypoints.is_empty())
+            .unwrap_or(true)
+    {
         return None;
     }
 
@@ -168,50 +173,51 @@ fn declaration_to_plan(declaration: &Value, declaration_id: &str) -> Option<Flig
         .and_then(|plan| plan.metadata.as_ref())
         .and_then(|meta| meta.drone_speed_mps);
 
-    let waypoints: Vec<Waypoint> = if let Some(plan) = atc_plan.as_ref().filter(|plan| !plan.waypoints.is_empty()) {
-        plan.waypoints
-            .iter()
-            .map(|wp| Waypoint {
-                lat: wp.lat,
-                lon: wp.lon,
-                altitude_m: wp.alt,
-                speed_mps: wp.speed_mps.or(speed_mps),
-            })
-            .collect()
-    } else {
-        coordinates
-            .into_iter()
-            .map(|(lon, lat)| Waypoint {
-                lat,
-                lon,
-                altitude_m: altitude,
-                speed_mps,
-            })
-            .collect()
-    };
+    let waypoints: Vec<Waypoint> =
+        if let Some(plan) = atc_plan.as_ref().filter(|plan| !plan.waypoints.is_empty()) {
+            plan.waypoints
+                .iter()
+                .map(|wp| Waypoint {
+                    lat: wp.lat,
+                    lon: wp.lon,
+                    altitude_m: wp.alt,
+                    speed_mps: wp.speed_mps.or(speed_mps),
+                })
+                .collect()
+        } else {
+            coordinates
+                .into_iter()
+                .map(|(lon, lat)| Waypoint {
+                    lat,
+                    lon,
+                    altitude_m: altitude,
+                    speed_mps,
+                })
+                .collect()
+        };
 
     let departure_time = parse_datetime(
-        declaration.get("start_datetime")
-            .or_else(|| properties.get("start_time"))
+        declaration
+            .get("start_datetime")
+            .or_else(|| properties.get("start_time")),
     )
     .unwrap_or_else(Utc::now);
     let arrival_time = parse_datetime(
-        declaration.get("end_datetime")
-            .or_else(|| properties.get("end_time"))
+        declaration
+            .get("end_datetime")
+            .or_else(|| properties.get("end_time")),
     );
     let created_at = parse_datetime(
-        declaration.get("created_at")
+        declaration
+            .get("created_at")
             .or_else(|| declaration.get("submitted_at"))
-            .or_else(|| declaration.get("updated_at"))
+            .or_else(|| declaration.get("updated_at")),
     )
     .unwrap_or_else(Utc::now);
 
     let status = map_declaration_status(declaration);
-    let drone_id = first_string(&[
-        declaration.get("aircraft_id"),
-        declaration.get("aircraft"),
-    ])
-    .unwrap_or_else(|| format!("BLENDER-{}", declaration_id));
+    let drone_id = first_string(&[declaration.get("aircraft_id"), declaration.get("aircraft")])
+        .unwrap_or_else(|| format!("BLENDER-{}", declaration_id));
 
     let mut metadata = atc_plan
         .as_ref()
@@ -236,9 +242,13 @@ fn declaration_to_plan(declaration: &Value, declaration_id: &str) -> Option<Flig
         drone_id,
         owner_id: None,
         waypoints,
-        trajectory_log: atc_plan
-            .as_ref()
-            .and_then(|plan| if plan.trajectory_log.is_empty() { None } else { Some(plan.trajectory_log.clone()) }),
+        trajectory_log: atc_plan.as_ref().and_then(|plan| {
+            if plan.trajectory_log.is_empty() {
+                None
+            } else {
+                Some(plan.trajectory_log.clone())
+            }
+        }),
         metadata: Some(metadata),
         status,
         departure_time,
@@ -261,24 +271,14 @@ fn extract_geojson(declaration: &Value) -> Option<Value> {
 }
 
 fn extract_coordinates(geometry: &Value) -> Vec<(f64, f64)> {
-    let geom_type = geometry
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let geom_type = geometry.get("type").and_then(|v| v.as_str()).unwrap_or("");
     let coords = geometry.get("coordinates");
 
     match geom_type {
-        "Point" => coords
-            .and_then(parse_coord_pair)
-            .into_iter()
-            .collect(),
+        "Point" => coords.and_then(parse_coord_pair).into_iter().collect(),
         "LineString" => coords
             .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(parse_coord_pair)
-                    .collect()
-            })
+            .map(|arr| arr.iter().filter_map(parse_coord_pair).collect())
             .unwrap_or_default(),
         "MultiPoint" => coords
             .and_then(|v| v.as_array())

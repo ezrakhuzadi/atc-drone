@@ -15,7 +15,9 @@ struct PlanErrorWrapper {
     plan: atc_core::models::FlightPlan,
 }
 
-async fn parse_json_or_error<T: serde::de::DeserializeOwned>(response: reqwest::Response) -> Result<T> {
+async fn parse_json_or_error<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T> {
     let status = response.status();
     let body = response.text().await?;
     if !status.is_success() {
@@ -24,7 +26,9 @@ async fn parse_json_or_error<T: serde::de::DeserializeOwned>(response: reqwest::
     Ok(serde_json::from_str(&body)?)
 }
 
-async fn parse_flight_plan_response(response: reqwest::Response) -> Result<atc_core::models::FlightPlan> {
+async fn parse_flight_plan_response(
+    response: reqwest::Response,
+) -> Result<atc_core::models::FlightPlan> {
     let status = response.status();
     let body = response.text().await?;
     if status.is_success() {
@@ -158,7 +162,7 @@ impl AtcClient {
             .session_token
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("Drone not registered"))?;
-        
+
         let response = self
             .client
             .post(&url)
@@ -166,7 +170,7 @@ impl AtcClient {
             .json(telemetry)
             .send()
             .await?;
-            
+
         if !response.status().is_success() {
             anyhow::bail!("Failed to send telemetry: {}", response.status());
         }
@@ -175,9 +179,12 @@ impl AtcClient {
     }
 
     /// Create a flight plan for the drone.
-    pub async fn create_flight_plan(&self, request: &atc_core::models::FlightPlanRequest) -> Result<atc_core::models::FlightPlan> {
+    pub async fn create_flight_plan(
+        &self,
+        request: &atc_core::models::FlightPlanRequest,
+    ) -> Result<atc_core::models::FlightPlan> {
         let url = format!("{}/v1/flights/plan", self.base_url);
-        
+
         // Ensure the request has the correct drone_id
         let mut req = request.clone();
         if let Some(drone_id) = &self.drone_id {
@@ -298,15 +305,17 @@ impl AtcClient {
     /// Poll for the next pending command for this drone.
     /// Returns None if no command is pending.
     pub async fn get_next_command(&self) -> Result<Option<atc_core::models::Command>> {
-        let drone_id = self.drone_id.as_ref()
+        let drone_id = self
+            .drone_id
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Drone not registered"))?;
         let auth = self
             .session_token
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("Drone not registered"))?;
-        
+
         let url = format!("{}/v1/commands/next?drone_id={}", self.base_url, drone_id);
-        
+
         let response: Option<atc_core::models::Command> = self
             .client
             .get(&url)
@@ -326,15 +335,17 @@ impl AtcClient {
             .session_token
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("Drone not registered"))?;
-        
+
         let response = self
             .client
             .post(&url)
             .header("Authorization", format!("Bearer {}", auth))
-            .json(&AckRequest { command_id: command_id.to_string() })
+            .json(&AckRequest {
+                command_id: command_id.to_string(),
+            })
             .send()
             .await?;
-            
+
         if !response.status().is_success() {
             anyhow::bail!("Failed to ack command: {}", response.status());
         }
@@ -396,8 +407,9 @@ fn build_ws_url(base: &str, path: &str, drone_id: &str) -> Result<Url> {
         "http" => "ws",
         "https" => "wss",
         other => other,
-    }.to_string();
-    
+    }
+    .to_string();
+
     url.set_scheme(&scheme)
         .map_err(|_| anyhow::anyhow!("Invalid base URL scheme"))?;
     url.set_path(path);

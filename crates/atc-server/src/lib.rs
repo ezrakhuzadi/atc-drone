@@ -1,7 +1,7 @@
 //! Shared library surface for ATC server utilities and tests.
 
-pub mod api;
 pub mod altitude;
+pub mod api;
 pub mod blender_auth;
 pub mod cache;
 pub mod compliance;

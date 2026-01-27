@@ -13,8 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
     atomic::{AtomicU32, AtomicU64, Ordering},
-    Arc,
-    RwLock,
+    Arc, RwLock,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -756,7 +755,8 @@ impl AppState {
 
         for id in &stale_ids {
             self.external_traffic.remove(id);
-            self.queue_detector_update(DetectorUpdate::Remove(id.clone())).await;
+            self.queue_detector_update(DetectorUpdate::Remove(id.clone()))
+                .await;
         }
 
         stale_ids
@@ -799,7 +799,9 @@ impl AppState {
             let mut detector = match state.detector.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => {
-                    tracing::error!("Conflict detector mutex poisoned; continuing with inner state");
+                    tracing::error!(
+                        "Conflict detector mutex poisoned; continuing with inner state"
+                    );
                     poisoned.into_inner()
                 }
             };

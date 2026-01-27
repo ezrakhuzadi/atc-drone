@@ -198,16 +198,16 @@ pub(crate) async fn create_flight_plan_compat(
         requested_flight_id,
         FlightStatus::Approved,
     )
-        .await
-        .map_err(|err| {
-            tracing::error!("Failed to persist flight plan: {}", err);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "error": "Failed to persist flight plan"
-                })),
-            )
-        })?;
+    .await
+    .map_err(|err| {
+        tracing::error!("Failed to persist flight plan: {}", err);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": "Failed to persist flight plan"
+            })),
+        )
+    })?;
     if plan.status == FlightStatus::Rejected {
         return Err((
             StatusCode::CONFLICT,
@@ -745,7 +745,9 @@ pub(crate) async fn build_plan(
                     }
                     tx.commit().await?;
                     for plan in &updates {
-                        state.flight_plans.insert(plan.flight_id.clone(), plan.clone());
+                        state
+                            .flight_plans
+                            .insert(plan.flight_id.clone(), plan.clone());
                     }
                     return Ok(new_plan);
                 }
@@ -875,7 +877,9 @@ pub(crate) async fn build_plan(
         if let Some(mut tx) = scheduling_tx {
             crate::persistence::flight_plans::upsert_flight_plan_tx(&mut tx, &plan).await?;
             tx.commit().await?;
-            state.flight_plans.insert(plan.flight_id.clone(), plan.clone());
+            state
+                .flight_plans
+                .insert(plan.flight_id.clone(), plan.clone());
         } else {
             state.add_flight_plan(plan.clone()).await?;
         }
@@ -888,8 +892,13 @@ pub(crate) async fn build_plan(
 
 #[derive(Debug)]
 enum ReservedBatchOutcome {
-    Accepted { new_plan: FlightPlan, updates: Vec<FlightPlan> },
-    Rejected { rejected_plan: FlightPlan },
+    Accepted {
+        new_plan: FlightPlan,
+        updates: Vec<FlightPlan>,
+    },
+    Rejected {
+        rejected_plan: FlightPlan,
+    },
 }
 
 fn schedule_reserved_batch(
@@ -945,7 +954,9 @@ fn schedule_reserved_batch(
         let pa = scheduling_priority(a.metadata.as_ref());
         let pb = scheduling_priority(b.metadata.as_ref());
         pa.cmp(&pb)
-            .then_with(|| earliest_departure_for_reserved(a).cmp(&earliest_departure_for_reserved(b)))
+            .then_with(|| {
+                earliest_departure_for_reserved(a).cmp(&earliest_departure_for_reserved(b))
+            })
             .then_with(|| a.created_at.cmp(&b.created_at))
             .then_with(|| a.flight_id.cmp(&b.flight_id))
     });
@@ -1012,7 +1023,9 @@ fn schedule_reserved_batch(
                     allow_payload_log,
                     requested_departure,
                 );
-                return ReservedBatchOutcome::Rejected { rejected_plan: rejected };
+                return ReservedBatchOutcome::Rejected {
+                    rejected_plan: rejected,
+                };
             }
 
             plan.status = FlightStatus::Rejected;
@@ -1095,7 +1108,11 @@ fn try_schedule_plan(
             };
 
             let has_conflict = obstacles.iter().any(|existing| {
-                atc_core::spatial::check_plan_conflict_with_rules(&test_plan, existing, state.rules())
+                atc_core::spatial::check_plan_conflict_with_rules(
+                    &test_plan,
+                    existing,
+                    state.rules(),
+                )
             });
             if has_conflict {
                 continue;
@@ -1372,10 +1389,9 @@ pub async fn confirm_operational_intent(
     updated.status = FlightStatus::Approved;
 
     // Re-check conflicts before confirming.
-    let existing_plans =
-        crate::persistence::flight_plans::load_all_flight_plans_tx(&mut tx)
-            .await
-            .unwrap_or_default();
+    let existing_plans = crate::persistence::flight_plans::load_all_flight_plans_tx(&mut tx)
+        .await
+        .unwrap_or_default();
     let has_conflict = existing_plans.iter().any(|plan| {
         plan.flight_id != updated.flight_id
             && matches!(
@@ -1719,7 +1735,9 @@ pub async fn update_operational_intent(
             })?;
 
             for plan in &updates {
-                state.flight_plans.insert(plan.flight_id.clone(), plan.clone());
+                state
+                    .flight_plans
+                    .insert(plan.flight_id.clone(), plan.clone());
             }
 
             Ok((StatusCode::OK, Json(new_plan)))

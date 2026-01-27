@@ -30,8 +30,8 @@ pub fn create_crossing_scenario(center_lat: f64, center_lon: f64) -> Scenario {
         start_lon_1,
         end_lat_1,
         end_lon_1,
-        50.0,  // altitude
-        10.0,  // speed
+        50.0, // altitude
+        10.0, // speed
     ));
 
     // Drone 2: South to North
@@ -116,12 +116,7 @@ pub fn create_converging_scenario(center_lat: f64, center_lon: f64) -> Scenario 
                 offset_by_bearing(center_lat, center_lon, offset_m, angle_rad);
 
             let path = Arc::new(LinearPath::new(
-                start_lat,
-                start_lon,
-                center_lat,
-                center_lon,
-                50.0,
-                8.0,
+                start_lat, start_lon, center_lat, center_lon, 50.0, 8.0,
             )) as Arc<dyn FlightPath>;
 
             (format!("DRONE{:03}", i + 1), path)

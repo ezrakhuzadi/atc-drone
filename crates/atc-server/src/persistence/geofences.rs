@@ -1,15 +1,15 @@
 //! Geofence persistence operations.
 
 use anyhow::Result;
-use sqlx::SqlitePool;
 use atc_core::models::{Geofence, GeofenceType};
 use chrono::{DateTime, Utc};
+use sqlx::SqlitePool;
 
 /// Upsert a geofence into the database.
 pub async fn upsert_geofence(pool: &SqlitePool, geofence: &Geofence) -> Result<()> {
     let polygon_json = serde_json::to_string(&geofence.polygon)?;
     let geofence_type = format!("{:?}", geofence.geofence_type);
-    
+
     sqlx::query(
         r#"
         INSERT INTO geofences (id, name, geofence_type, vertices, lower_altitude_m, upper_altitude_m, active, updated_at)
@@ -29,7 +29,7 @@ pub async fn upsert_geofence(pool: &SqlitePool, geofence: &Geofence) -> Result<(
     .bind(geofence.active)
     .execute(pool)
     .await?;
-    
+
     Ok(())
 }
 
@@ -40,11 +40,9 @@ pub async fn load_all_geofences(pool: &SqlitePool) -> Result<Vec<Geofence>> {
     )
     .fetch_all(pool)
     .await?;
-    
+
     rows.into_iter().map(|r| r.try_into()).collect()
 }
-
-
 
 /// Delete a geofence by ID.
 pub async fn delete_geofence(pool: &SqlitePool, id: &str) -> Result<bool> {
@@ -52,7 +50,7 @@ pub async fn delete_geofence(pool: &SqlitePool, id: &str) -> Result<bool> {
         .bind(id)
         .execute(pool)
         .await?;
-    
+
     Ok(result.rows_affected() > 0)
 }
 
@@ -71,7 +69,7 @@ struct GeofenceRow {
 
 impl TryFrom<GeofenceRow> for Geofence {
     type Error = anyhow::Error;
-    
+
     fn try_from(row: GeofenceRow) -> Result<Self> {
         let geofence_type = match row.geofence_type.as_str() {
             "NoFlyZone" => GeofenceType::NoFlyZone,
@@ -80,13 +78,13 @@ impl TryFrom<GeofenceRow> for Geofence {
             "Advisory" => GeofenceType::Advisory,
             _ => GeofenceType::NoFlyZone,
         };
-        
+
         let polygon: Vec<[f64; 2]> = serde_json::from_str(&row.vertices)?;
-        
+
         let created_at = DateTime::parse_from_rfc3339(&row.created_at)
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now());
-        
+
         Ok(Geofence {
             id: row.id,
             name: row.name,
@@ -99,4 +97,3 @@ impl TryFrom<GeofenceRow> for Geofence {
         })
     }
 }
-

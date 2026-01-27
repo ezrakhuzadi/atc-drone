@@ -1,5 +1,5 @@
 //! Geofence API endpoints.
-//! 
+//!
 //! Provides CRUD operations for no-fly zones and restricted areas.
 
 use axum::{
@@ -7,13 +7,13 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use std::sync::Arc;
 use chrono::Utc;
+use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::state::AppState;
 use crate::altitude::altitude_to_amsl;
-use atc_core::{Geofence, GeofenceType, CreateGeofenceRequest, UpdateGeofenceRequest};
+use crate::state::AppState;
+use atc_core::{CreateGeofenceRequest, Geofence, GeofenceType, UpdateGeofenceRequest};
 
 /// Create a new geofence.
 pub async fn create_geofence(
@@ -41,7 +41,7 @@ pub async fn create_geofence(
         active: true,
         created_at: Utc::now(),
     };
-    
+
     // Validate geofence before saving
     let errors = geofence.validate();
     if !errors.is_empty() {
@@ -50,10 +50,10 @@ pub async fn create_geofence(
             Json(serde_json::json!({
                 "error": "Invalid geofence",
                 "validation_errors": errors
-            }))
+            })),
         ));
     }
-    
+
     if let Err(err) = state.add_geofence(geofence.clone()).await {
         tracing::error!("Failed to persist geofence {}: {}", geofence.id, err);
         return Err((
@@ -61,18 +61,16 @@ pub async fn create_geofence(
             Json(serde_json::json!({
                 "error": "Failed to create geofence",
                 "id": geofence.id
-            }))
+            })),
         ));
     }
     tracing::info!("Created geofence '{}' ({})", geofence.name, geofence.id);
-    
+
     Ok((StatusCode::CREATED, Json(geofence)))
 }
 
 /// List all geofences.
-pub async fn list_geofences(
-    State(state): State<Arc<AppState>>,
-) -> Json<Vec<Geofence>> {
+pub async fn list_geofences(State(state): State<Arc<AppState>>) -> Json<Vec<Geofence>> {
     Json(state.get_geofences())
 }
 
@@ -81,7 +79,8 @@ pub async fn get_geofence(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Geofence>, StatusCode> {
-    state.get_geofence(&id)
+    state
+        .get_geofence(&id)
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
 }
@@ -98,7 +97,7 @@ pub async fn update_geofence(
             Json(serde_json::json!({
                 "error": "External geofences are read-only",
                 "id": id
-            }))
+            })),
         ));
     }
 
@@ -110,7 +109,7 @@ pub async fn update_geofence(
                 Json(serde_json::json!({
                     "error": "Geofence not found",
                     "id": id
-                }))
+                })),
             ));
         }
     };
@@ -150,7 +149,7 @@ pub async fn update_geofence(
             Json(serde_json::json!({
                 "error": "Invalid geofence",
                 "validation_errors": errors
-            }))
+            })),
         ));
     }
 
@@ -161,7 +160,7 @@ pub async fn update_geofence(
             Json(serde_json::json!({
                 "error": "Failed to update geofence",
                 "id": geofence.id
-            }))
+            })),
         ));
     }
     tracing::info!("Updated geofence '{}' ({})", geofence.name, geofence.id);
@@ -262,19 +261,23 @@ pub async fn check_route(
         .collect();
     let geofences = state.get_geofences();
     let mut conflicts = Vec::new();
-    
+
     // Check each segment of the route against all active geofences
     for i in 0..waypoints.len().saturating_sub(1) {
         let wp1 = &waypoints[i];
         let wp2 = &waypoints[i + 1];
-        
+
         for geofence in geofences
             .iter()
             .filter(|g| g.active && g.geofence_type != GeofenceType::Advisory)
         {
             if geofence.intersects_segment(
-                wp1.lat, wp1.lon, wp1.altitude_m,
-                wp2.lat, wp2.lon, wp2.altitude_m,
+                wp1.lat,
+                wp1.lon,
+                wp1.altitude_m,
+                wp2.lat,
+                wp2.lon,
+                wp2.altitude_m,
             ) {
                 conflicts.push(GeofenceConflict {
                     geofence_id: geofence.id.clone(),
@@ -284,7 +287,7 @@ pub async fn check_route(
             }
         }
     }
-    
+
     Json(RouteCheckResponse {
         conflicts: !conflicts.is_empty(),
         conflicting_geofences: conflicts,

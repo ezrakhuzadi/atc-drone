@@ -9,10 +9,8 @@ pub mod request_id;
 mod routes;
 pub mod ws;
 
-use axum::Router;
 use crate::config::Config;
-
-
+use axum::Router;
 
 pub fn routes(config: &Config) -> Router<std::sync::Arc<crate::state::AppState>> {
     routes::create_router(config)

@@ -1,9 +1,9 @@
 //! Terrain sampling utilities for server-side routing.
 
 use crate::cache;
+use crate::compliance::RoutePoint;
 use crate::config::Config;
 use atc_core::spatial::{meters_per_deg_lat, meters_per_deg_lon};
-use crate::compliance::RoutePoint;
 use dashmap::DashMap;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -249,12 +249,7 @@ pub async fn fetch_terrain_grid(
 
         for attempt in 0..max_attempts {
             let response = if let Some(body) = request_body.as_ref() {
-                client
-                    .post(&url)
-                    .timeout(timeout)
-                    .json(body)
-                    .send()
-                    .await
+                client.post(&url).timeout(timeout).json(body).send().await
             } else {
                 client.get(&url).timeout(timeout).send().await
             };
@@ -370,7 +365,11 @@ pub async fn fetch_terrain_grid(
             grid: grid.clone(),
         },
     );
-    cache::prune_cache(cache, TERRAIN_CACHE_MAX_ENTRIES, cache_ttl.saturating_mul(2));
+    cache::prune_cache(
+        cache,
+        TERRAIN_CACHE_MAX_ENTRIES,
+        cache_ttl.saturating_mul(2),
+    );
 
     tracing::info!(
         rows = rows,
@@ -436,8 +435,14 @@ fn resolve_grid_dims(
         let spacing_used = spacing;
         let lat_step_deg = spacing / meters_per_deg_lat;
         let lon_step_deg = spacing / meters_per_deg_lon;
-        let rows = ((bounds.max_lat - bounds.min_lat) / lat_step_deg).ceil().max(1.0) as usize + 1;
-        let cols = ((bounds.max_lon - bounds.min_lon) / lon_step_deg).ceil().max(1.0) as usize + 1;
+        let rows = ((bounds.max_lat - bounds.min_lat) / lat_step_deg)
+            .ceil()
+            .max(1.0) as usize
+            + 1;
+        let cols = ((bounds.max_lon - bounds.min_lon) / lon_step_deg)
+            .ceil()
+            .max(1.0) as usize
+            + 1;
         let total = rows.saturating_mul(cols);
         if total <= max_points {
             return (rows, cols, lat_step_deg, lon_step_deg, spacing_used);
@@ -473,10 +478,6 @@ fn build_provider_url(base: &str, latitudes: &str, longitudes: &str) -> String {
 fn terrain_cache_key(bounds: &TerrainBounds, spacing_m: f64) -> String {
     format!(
         "terrain:{:.4}:{:.4}:{:.4}:{:.4}:{:.1}",
-        bounds.min_lat,
-        bounds.min_lon,
-        bounds.max_lat,
-        bounds.max_lon,
-        spacing_m
+        bounds.min_lat, bounds.min_lon, bounds.max_lat, bounds.max_lon, spacing_m
     )
 }

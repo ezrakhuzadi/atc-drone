@@ -3,7 +3,9 @@
 //! This module keeps routing logic server-side so ATC is the source of truth.
 
 use crate::models::{Geofence, GeofenceType, Waypoint};
-use crate::spatial::{bearing, haversine_distance, meters_per_deg_lat, meters_per_deg_lon, offset_by_bearing};
+use crate::spatial::{
+    bearing, haversine_distance, meters_per_deg_lat, meters_per_deg_lon, offset_by_bearing,
+};
 use serde::{Deserialize, Serialize};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -269,11 +271,12 @@ pub fn generate_grid_samples(
                 let (lat, lon) = if offset.abs() < f64::EPSILON {
                     (center_lat, center_lon)
                 } else {
-                    let lateral_bearing = heading + if *offset >= 0.0 {
-                        std::f64::consts::FRAC_PI_2
-                    } else {
-                        -std::f64::consts::FRAC_PI_2
-                    };
+                    let lateral_bearing = heading
+                        + if *offset >= 0.0 {
+                            std::f64::consts::FRAC_PI_2
+                        } else {
+                            -std::f64::consts::FRAC_PI_2
+                        };
                     offset_by_bearing(center_lat, center_lon, offset.abs(), lateral_bearing)
                 };
                 lanes[lane_idx].push(RouteGridPoint {
@@ -298,14 +301,14 @@ pub fn generate_grid_samples(
         }
     }
 
-    Some(RouteGrid { lanes, waypoint_indices })
+    Some(RouteGrid {
+        lanes,
+        waypoint_indices,
+    })
 }
 
-pub fn apply_obstacles<F>(
-    grid: &mut RouteGrid,
-    obstacles: &[RouteObstacle],
-    terrain_height: F,
-) where
+pub fn apply_obstacles<F>(grid: &mut RouteGrid, obstacles: &[RouteObstacle], terrain_height: F)
+where
     F: Fn(f64, f64) -> f64,
 {
     if obstacles.is_empty() {
@@ -364,7 +367,10 @@ pub fn apply_obstacles<F>(
         };
         for dx in -cell_radius..=cell_radius {
             for dy in -cell_radius..=cell_radius {
-                obstacle_index.entry((cell_x + dx, cell_y + dy)).or_default().push(entry);
+                obstacle_index
+                    .entry((cell_x + dx, cell_y + dy))
+                    .or_default()
+                    .push(entry);
             }
         }
     }
@@ -434,14 +440,16 @@ pub fn optimize_flight_path(
             lat: point.lat,
             lon: point.lon,
             altitude_m: point.terrain_height_m,
-            phase: Some(if is_first {
-                "GROUND_START"
-            } else if is_last {
-                "GROUND_END"
-            } else {
-                "GROUND_WAYPOINT"
-            }
-            .to_string()),
+            phase: Some(
+                if is_first {
+                    "GROUND_START"
+                } else if is_last {
+                    "GROUND_END"
+                } else {
+                    "GROUND_WAYPOINT"
+                }
+                .to_string(),
+            ),
         });
 
         if !is_last {
@@ -458,11 +466,15 @@ pub fn optimize_flight_path(
             for step in *step_idx..=next_step_idx {
                 let pt = &grid.lanes[center_lane_idx][step];
                 segment_planned_alt = segment_planned_alt.max(pt.altitude_m);
-                max_obstacle = max_obstacle.max(pt.obstacle_height_m).max(pt.terrain_height_m);
+                max_obstacle = max_obstacle
+                    .max(pt.obstacle_height_m)
+                    .max(pt.terrain_height_m);
             }
 
             let min_safe_alt = max_obstacle + config.safety_buffer_m;
-            segment_cruise_alt = segment_cruise_alt.max(min_safe_alt).max(segment_planned_alt);
+            segment_cruise_alt = segment_cruise_alt
+                .max(min_safe_alt)
+                .max(segment_planned_alt);
 
             final_waypoints.push(RouteEngineWaypoint {
                 lat: point.lat,
@@ -502,7 +514,12 @@ pub fn optimize_flight_path(
                     last_output_node = Some(node.clone());
                 } else if let Some(last_node) = &last_output_node {
                     let last_point = &grid.lanes[last_node.lane][last_node.step];
-                    let dist = haversine_distance(last_point.lat, last_point.lon, node_point.lat, node_point.lon);
+                    let dist = haversine_distance(
+                        last_point.lat,
+                        last_point.lon,
+                        node_point.lat,
+                        node_point.lon,
+                    );
                     if dist > MAX_SEGMENT_DISTANCE_M {
                         final_waypoints.push(RouteEngineWaypoint {
                             lat: node_point.lat,
@@ -616,7 +633,8 @@ fn compute_path_nodes(
     let center_lane_idx = num_lanes / 2;
 
     let start_point = &grid.lanes[center_lane_idx][0];
-    let start_alt = start_altitude_override.unwrap_or(start_point.altitude_m.max(start_point.terrain_height_m));
+    let start_alt =
+        start_altitude_override.unwrap_or(start_point.altitude_m.max(start_point.terrain_height_m));
     let start_node = Node {
         step: 0,
         lane: center_lane_idx,
@@ -627,9 +645,12 @@ fn compute_path_nodes(
 
     let effective_speed = (config.cruise_speed_mps - config.wind_mps).max(1.0);
     let end_point = &grid.lanes[center_lane_idx][num_steps - 1];
-    let start_h =
-        haversine_distance(start_point.lat, start_point.lon, end_point.lat, end_point.lon)
-            / effective_speed;
+    let start_h = haversine_distance(
+        start_point.lat,
+        start_point.lon,
+        end_point.lat,
+        end_point.lon,
+    ) / effective_speed;
 
     let mut open_set: BinaryHeap<Reverse<OpenNode>> = BinaryHeap::new();
     open_set.push(Reverse(OpenNode {
@@ -692,14 +713,21 @@ fn compute_path_nodes(
             }
 
             let next_point = &grid.lanes[next_lane][next_step];
-            let feature_height = next_point.obstacle_height_m.max(next_point.terrain_height_m);
+            let feature_height = next_point
+                .obstacle_height_m
+                .max(next_point.terrain_height_m);
             let min_safe_alt = (feature_height + config.safety_buffer_m).max(next_point.altitude_m);
             let faa_ceiling = next_point.terrain_height_m + config.faa_limit_agl;
             if min_safe_alt > faa_ceiling {
                 continue;
             }
 
-            let dist = haversine_distance(curr_point.lat, curr_point.lon, next_point.lat, next_point.lon);
+            let dist = haversine_distance(
+                curr_point.lat,
+                curr_point.lon,
+                next_point.lat,
+                next_point.lon,
+            );
             let time_to_travel = dist / effective_speed;
 
             let target_alt = min_safe_alt;
@@ -724,19 +752,22 @@ fn compute_path_nodes(
                 continue;
             }
 
-            let lane_change_cost = (next_lane as i32 - current.lane as i32).abs() as f64 * config.cost_lane_change;
+            let lane_change_cost =
+                (next_lane as i32 - current.lane as i32).abs() as f64 * config.cost_lane_change;
 
             let mut proximity_cost = 0.0;
             if next_lane > 0 {
                 let left = &grid.lanes[next_lane - 1][next_step];
-                let left_min_safe = left.obstacle_height_m.max(left.terrain_height_m) + config.safety_buffer_m;
+                let left_min_safe =
+                    left.obstacle_height_m.max(left.terrain_height_m) + config.safety_buffer_m;
                 if left_min_safe > cruise_alt {
                     proximity_cost += config.cost_proximity_penalty;
                 }
             }
             if next_lane + 1 < num_lanes {
                 let right = &grid.lanes[next_lane + 1][next_step];
-                let right_min_safe = right.obstacle_height_m.max(right.terrain_height_m) + config.safety_buffer_m;
+                let right_min_safe =
+                    right.obstacle_height_m.max(right.terrain_height_m) + config.safety_buffer_m;
                 if right_min_safe > cruise_alt {
                     proximity_cost += config.cost_proximity_penalty;
                 }
@@ -757,8 +788,12 @@ fn compute_path_nodes(
                 );
                 g_score.insert(next_key, tentative_g);
 
-                let dist_to_end =
-                    haversine_distance(next_point.lat, next_point.lon, end_point.lat, end_point.lon);
+                let dist_to_end = haversine_distance(
+                    next_point.lat,
+                    next_point.lon,
+                    end_point.lat,
+                    end_point.lon,
+                );
                 let h_score = dist_to_end / effective_speed;
 
                 let new_alt = current.alt.max(target_alt);
@@ -872,7 +907,9 @@ fn is_line_of_sight_clear(
             return false;
         }
         let grid_point = &grid.lanes[mid_lane as usize][mid_step as usize];
-        let obstacle_height = grid_point.obstacle_height_m.max(grid_point.terrain_height_m);
+        let obstacle_height = grid_point
+            .obstacle_height_m
+            .max(grid_point.terrain_height_m);
         let min_safe_alt = obstacle_height + config.safety_buffer_m;
         if !geofences.is_empty() {
             let sample_alt = start.alt + t * (end.alt - start.alt);

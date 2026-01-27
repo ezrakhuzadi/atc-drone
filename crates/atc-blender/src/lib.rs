@@ -6,4 +6,4 @@ pub mod client;
 pub mod sync_geofences;
 
 pub use client::BlenderClient;
-pub use sync_geofences::{ConflictGeofence, conflict_payload, conflict_to_geofence};
+pub use sync_geofences::{conflict_payload, conflict_to_geofence, ConflictGeofence};

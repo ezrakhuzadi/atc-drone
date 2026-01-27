@@ -4,22 +4,22 @@
 //! and broadcasting updates as geofences to Blender.
 //! Issues REROUTE commands when critical conflicts are detected.
 
+use chrono::{Duration as ChronoDuration, Utc};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tokio::time::interval;
-use chrono::{Duration as ChronoDuration, Utc};
 
-use crate::config::Config;
 use crate::blender_auth::BlenderAuthManager;
+use crate::config::Config;
 use crate::route_planner::plan_airborne_route;
 use crate::state::AppState;
-use atc_blender::{BlenderClient, conflict_payload, conflict_to_geofence};
+use atc_blender::{conflict_payload, conflict_to_geofence, BlenderClient};
 use atc_core::{
-    Conflict, ConflictSeverity, 
+    generate_avoidance_route,
     models::{Command, CommandType, DaaAdvisory, DaaSeverity, Geofence, GeofenceType, Waypoint},
-    generate_avoidance_route, select_avoidance_type,
+    select_avoidance_type, Conflict, ConflictSeverity,
 };
 
 /// Cooldown in seconds before issuing another command to the same drone.
@@ -90,7 +90,7 @@ pub async fn run_conflict_loop(
                         }
                     }
                 }
-                
+
                 // Purge expired commands to prevent them from hiding drones
                 if let Err(err) = state.purge_expired_commands().await {
                     tracing::warn!("Failed to purge expired commands: {}", err);
@@ -181,7 +181,7 @@ pub async fn run_conflict_loop(
                     let drone2 = drones.iter().find(|d| d.drone_id == conflict.drone2_id);
                     let external1 = external_by_id.get(&conflict.drone1_id);
                     let external2 = external_by_id.get(&conflict.drone2_id);
-                    
+
                     let drone1_pos = drone1
                         .map(|d| (d.lat, d.lon, d.altitude_m))
                         .or_else(|| external1.map(|t| (t.lat, t.lon, t.altitude_m)));
@@ -191,7 +191,7 @@ pub async fn run_conflict_loop(
 
                     let gf = conflict_to_geofence(conflict, drone1_pos, drone2_pos);
                     active_conflict_ids.insert(gf.id.clone());
-                    
+
                     tracing::warn!(
                         "  [{:?}] {} <-> {} @ {}m -> Geofence {}",
                         conflict.severity,
@@ -252,7 +252,7 @@ pub async fn run_conflict_loop(
                             resolved: false,
                         });
                     }
-                    
+
                     geofences.push(gf);
 
                     // === AUTO-REROUTE COMMAND DISPATCH ===
@@ -364,51 +364,51 @@ pub async fn run_conflict_loop(
                             }
                             continue;
                         }
-                        
+
                         // Determine which drone should give way
                         let (give_way_id, priority_drone) = if conflict.drone1_id < conflict.drone2_id {
                             (&conflict.drone2_id, drone1)
                         } else {
                             (&conflict.drone1_id, drone2)
                         };
-                        
+
                         let give_way_drone = if give_way_id == &conflict.drone1_id { drone1 } else { drone2 };
-                        
+
                         // Only issue if we can find both drones and cooldown has passed
                         if resolution_ready && state.can_issue_command(give_way_id, COMMAND_COOLDOWN_SECS) {
                             if let (Some(gw), Some(pri)) = (give_way_drone, priority_drone) {
                                 // === HOLD-AWARE LOGIC ===
                                 // If the priority drone is holding/rerouting, check if it's actually blocking
-                                let priority_id = if give_way_id == &conflict.drone1_id { 
-                                    &conflict.drone2_id 
-                                } else { 
-                                    &conflict.drone1_id 
+                                let priority_id = if give_way_id == &conflict.drone1_id {
+                                    &conflict.drone2_id
+                                } else {
+                                    &conflict.drone1_id
                                 };
-                                
+
                                 if state.has_active_command(priority_id) {
                                     // Priority drone is on HOLD/REROUTE - check if it's blocking our path
                                     // Use proper distance-to-segment calculation instead of bounding box
                                     use atc_core::spatial::{offset_by_bearing, distance_to_segment_m};
                                     let heading_rad = gw.heading_deg.to_radians();
-                                    
+
                                     // Project give_way drone's position ~30 seconds ahead
                                     let projection_distance = gw.speed_mps * 30.0;
                                     let (future_lat, future_lon) = offset_by_bearing(
-                                        gw.lat, gw.lon, 
+                                        gw.lat, gw.lon,
                                         projection_distance,
                                         heading_rad
                                     );
-                                    
+
                                     // Calculate distance from priority drone to our projected path
                                     let distance_to_path = distance_to_segment_m(
                                         pri.lat, pri.lon,
                                         gw.lat, gw.lon,
                                         future_lat, future_lon,
                                     );
-                                    
+
                                     // Use horizontal separation threshold (with buffer)
                                     let blocking_threshold = state.rules().min_horizontal_separation_m * 2.0;
-                                    
+
                                     if distance_to_path > blocking_threshold {
                                         // Priority drone is NOT in our path - skip reroute
                                         tracing::info!(
@@ -425,7 +425,7 @@ pub async fn run_conflict_loop(
                                     altitude_m: conflict.cpa_altitude_m,
                                     speed_mps: Some(gw.speed_mps),
                                 };
-                                
+
                                 // Create current position waypoint
                                 let current_pos = Waypoint {
                                     lat: gw.lat,
@@ -433,13 +433,13 @@ pub async fn run_conflict_loop(
                                     altitude_m: gw.altitude_m,
                                     speed_mps: Some(gw.speed_mps),
                                 };
-                                
+
                                 // Destination: continue in current heading direction (~500m ahead)
                                 // Using proper ENU conversion instead of degree offsets
                                 use atc_core::spatial::offset_by_bearing;
                                 let heading_rad = gw.heading_deg.to_radians();
                                 let (dest_lat, dest_lon) = offset_by_bearing(
-                                    gw.lat, gw.lon, 
+                                    gw.lat, gw.lon,
                                     500.0,  // 500 meters ahead
                                     heading_rad
                                 );
@@ -449,14 +449,14 @@ pub async fn run_conflict_loop(
                                     altitude_m: gw.altitude_m,
                                     speed_mps: Some(gw.speed_mps),
                                 };
-                                
+
                                 // Select avoidance type based on altitude context
                                 let avoidance_type = select_avoidance_type(
                                     gw.altitude_m,
                                     pri.altitude_m,
                                     gw.altitude_m > 100.0, // Basic ceiling check
                                 );
-                                
+
                                 // Generate avoidance route
                                 let conflict_geofence = build_conflict_geofence(conflict);
                                 let planned = plan_airborne_route(
@@ -475,19 +475,19 @@ pub async fn run_conflict_loop(
                                         avoidance_type,
                                     )
                                 });
-                                
+
                                 let cmd = Command {
                                     command_id: format!("REROUTE-{}-{}", give_way_id, now.timestamp()),
                                     drone_id: give_way_id.clone(),
-                                    command_type: CommandType::Reroute { 
+                                    command_type: CommandType::Reroute {
                                         waypoints: avoidance_waypoints,
                                         reason: Some(format!(
                                             "Conflict avoidance ({:?}) with {}",
                                             avoidance_type,
-                                            if give_way_id == &conflict.drone1_id { 
-                                                &conflict.drone2_id 
-                                            } else { 
-                                                &conflict.drone1_id 
+                                            if give_way_id == &conflict.drone1_id {
+                                                &conflict.drone2_id
+                                            } else {
+                                                &conflict.drone1_id
                                             }
                                         )),
                                     },

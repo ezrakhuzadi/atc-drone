@@ -45,8 +45,8 @@ impl AtcClient {
         // Calculate velocity components from heading and speed
         // heading_deg: 0 = North, 90 = East (clockwise from North)
         let heading_rad = heading_deg.to_radians();
-        let velocity_x = speed_mps * heading_rad.sin();  // East component
-        let velocity_y = speed_mps * heading_rad.cos();  // North component
+        let velocity_x = speed_mps * heading_rad.sin(); // East component
+        let velocity_y = speed_mps * heading_rad.cos(); // North component
         let velocity_z = 0.0; // Assuming level flight (could add climb rate later)
 
         let telemetry = Telemetry {

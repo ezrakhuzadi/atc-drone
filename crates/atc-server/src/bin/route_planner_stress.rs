@@ -126,7 +126,13 @@ fn find_hazard_violations(
         }
         let mut hit = false;
         for segment in waypoints.windows(2) {
-            if segment_hits_hazard(segment[0].clone(), segment[1].clone(), hazard, radius, height) {
+            if segment_hits_hazard(
+                segment[0].clone(),
+                segment[1].clone(),
+                hazard,
+                radius,
+                height,
+            ) {
                 hit = true;
                 break;
             }

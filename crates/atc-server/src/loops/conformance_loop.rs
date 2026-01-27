@@ -13,19 +13,12 @@ use tokio::time::interval;
 
 use atc_blender::BlenderClient;
 use atc_core::models::{
-    Command,
-    CommandType,
-    ConformanceRecord,
-    ConformanceStatus,
-    DaaAdvisory,
-    DaaSeverity,
-    DroneState,
-    Geofence,
-    Waypoint,
+    Command, CommandType, ConformanceRecord, ConformanceStatus, DaaAdvisory, DaaSeverity,
+    DroneState, Geofence, Waypoint,
 };
 
-use crate::config::Config;
 use crate::blender_auth::BlenderAuthManager;
+use crate::config::Config;
 use crate::state::AppState;
 
 const CONFORMANCE_POLL_SECS: u64 = 10;
@@ -298,14 +291,7 @@ fn unproject_xy(x: f64, y: f64, ref_lat: f64, ref_lon: f64) -> (f64, f64) {
     (lat, lon)
 }
 
-fn closest_point_on_segment(
-    px: f64,
-    py: f64,
-    x1: f64,
-    y1: f64,
-    x2: f64,
-    y2: f64,
-) -> (f64, f64) {
+fn closest_point_on_segment(px: f64, py: f64, x1: f64, y1: f64, x2: f64, y2: f64) -> (f64, f64) {
     let dx = x2 - x1;
     let dy = y2 - y1;
     let len_sq = dx * dx + dy * dy;

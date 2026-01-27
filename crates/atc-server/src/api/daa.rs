@@ -1,6 +1,9 @@
 //! DAA (Detect and Avoid) advisory endpoints.
 
-use axum::{extract::{Query, State}, Json};
+use axum::{
+    extract::{Query, State},
+    Json,
+};
 use serde::Deserialize;
 use std::sync::Arc;
 

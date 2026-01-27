@@ -1,5 +1,6 @@
 //! Authentication middleware for protected endpoints.
 
+use axum::http::HeaderMap;
 use axum::{
     extract::{ConnectInfo, Request, State},
     http::{header, StatusCode},
@@ -7,7 +8,6 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use axum::http::HeaderMap;
 use std::net::SocketAddr;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -33,7 +33,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// Middleware that requires a valid admin token in the Authorization header.
-/// 
+///
 /// Expected header format: `Authorization: Bearer <admin_token>`
 pub async fn require_admin(
     State(admin_token): State<AdminToken>,
@@ -174,7 +174,12 @@ impl RateLimiter {
 
         if self
             .last_cleanup_epoch_s
-            .compare_exchange(last_cleanup, now_epoch_s, Ordering::Relaxed, Ordering::Relaxed)
+            .compare_exchange(
+                last_cleanup,
+                now_epoch_s,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
             .is_err()
         {
             return;
@@ -335,5 +340,7 @@ pub fn authorize_drone_from_headers(
     headers: &HeaderMap,
 ) -> Result<String, StatusCode> {
     let token = extract_drone_token(headers).ok_or(StatusCode::UNAUTHORIZED)?;
-    state.drone_id_for_token(&token).ok_or(StatusCode::FORBIDDEN)
+    state
+        .drone_id_for_token(&token)
+        .ok_or(StatusCode::FORBIDDEN)
 }

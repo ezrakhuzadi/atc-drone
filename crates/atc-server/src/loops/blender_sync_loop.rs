@@ -5,9 +5,9 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::time::interval;
 
-use crate::state::AppState;
-use crate::config::Config;
 use crate::blender_auth::BlenderAuthManager;
+use crate::config::Config;
+use crate::state::AppState;
 use atc_blender::BlenderClient;
 
 /// Start the Blender sync loop.

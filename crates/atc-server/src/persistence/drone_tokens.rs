@@ -30,11 +30,10 @@ pub async fn upsert_drone_token(pool: &SqlitePool, drone_id: &str, token: &str) 
 
 /// Load all persisted drone tokens.
 pub async fn load_all_drone_tokens(pool: &SqlitePool) -> Result<Vec<DroneTokenRow>> {
-    let rows = sqlx::query_as::<_, DroneTokenRow>(
-        "SELECT drone_id, session_token FROM drone_tokens",
-    )
-    .fetch_all(pool)
-    .await?;
+    let rows =
+        sqlx::query_as::<_, DroneTokenRow>("SELECT drone_id, session_token FROM drone_tokens")
+            .fetch_all(pool)
+            .await?;
 
     Ok(rows)
 }

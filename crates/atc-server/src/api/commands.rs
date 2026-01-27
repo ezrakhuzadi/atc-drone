@@ -15,9 +15,9 @@ use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use atc_core::models::{Command, CommandType};
 use crate::api::auth;
 use crate::state::AppState;
+use atc_core::models::{Command, CommandType};
 
 /// Request to issue a new command.
 #[derive(Debug, Deserialize)]
@@ -64,7 +64,9 @@ pub async fn issue_command(
     State(state): State<Arc<AppState>>,
     Json(request): Json<IssueCommandRequest>,
 ) -> Result<Json<IssueCommandResponse>, StatusCode> {
-    let drone = state.get_drone(&request.drone_id).ok_or(StatusCode::NOT_FOUND)?;
+    let drone = state
+        .get_drone(&request.drone_id)
+        .ok_or(StatusCode::NOT_FOUND)?;
     if let Some(expected_owner) = drone.owner_id {
         if request.owner_id.as_deref() != Some(expected_owner.as_str()) {
             return Err(StatusCode::FORBIDDEN);
@@ -73,9 +75,12 @@ pub async fn issue_command(
 
     let now = Utc::now();
     let expires_in = request.expires_in_secs.unwrap_or(60);
-    
+
     let command = Command {
-        command_id: format!("CMD-{}", uuid::Uuid::new_v4().to_string()[..8].to_uppercase()),
+        command_id: format!(
+            "CMD-{}",
+            uuid::Uuid::new_v4().to_string()[..8].to_uppercase()
+        ),
         drone_id: request.drone_id.clone(),
         command_type: request.command_type,
         issued_at: now,
@@ -85,12 +90,20 @@ pub async fn issue_command(
 
     let command_id = command.command_id.clone();
     if let Err(err) = state.enqueue_command(command).await {
-        tracing::error!("Failed to persist command for drone {}: {}", request.drone_id, err);
+        tracing::error!(
+            "Failed to persist command for drone {}: {}",
+            request.drone_id,
+            err
+        );
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
     state.mark_command_issued(&request.drone_id);
 
-    tracing::info!("Issued command {} to drone {}", command_id, request.drone_id);
+    tracing::info!(
+        "Issued command {} to drone {}",
+        command_id,
+        request.drone_id
+    );
 
     Ok(Json(IssueCommandResponse {
         command_id,
@@ -127,11 +140,15 @@ pub async fn ack_command(
     let found = match state.ack_command(&request.command_id).await {
         Ok(found) => found,
         Err(err) => {
-            tracing::error!("Failed to acknowledge command {}: {}", request.command_id, err);
+            tracing::error!(
+                "Failed to acknowledge command {}: {}",
+                request.command_id,
+                err
+            );
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
-    
+
     if found {
         tracing::info!("Command {} acknowledged", request.command_id);
         Ok(Json(serde_json::json!({
@@ -148,9 +165,7 @@ pub async fn ack_command(
 
 /// Get all pending commands (for debugging/UI).
 /// GET /v1/commands
-pub async fn get_all_commands(
-    State(state): State<Arc<AppState>>,
-) -> Json<Vec<Command>> {
+pub async fn get_all_commands(State(state): State<Arc<AppState>>) -> Json<Vec<Command>> {
     Json(state.get_all_pending_commands())
 }
 
@@ -178,11 +193,7 @@ pub async fn command_stream_ws(
     ws.on_upgrade(move |socket| handle_command_socket(socket, state, drone_id))
 }
 
-async fn handle_command_socket(
-    mut socket: WebSocket,
-    state: Arc<AppState>,
-    drone_id: String,
-) {
+async fn handle_command_socket(mut socket: WebSocket, state: Arc<AppState>, drone_id: String) {
     let pending = state.get_pending_commands(&drone_id);
     for command in pending {
         if let Ok(payload) = serde_json::to_string(&command) {

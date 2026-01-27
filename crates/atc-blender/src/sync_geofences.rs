@@ -4,8 +4,8 @@
 //! geofences so they appear as red zones in Spotlight.
 
 use anyhow::{Context, Result};
-use atc_core::{Conflict, ConflictSeverity};
 use atc_core::spatial::offset_by_bearing;
+use atc_core::{Conflict, ConflictSeverity};
 use chrono::{Duration as ChronoDuration, Utc};
 use serde::Serialize;
 use serde_json::Value;
@@ -83,16 +83,16 @@ struct BlenderGeofenceGeometry {
 fn generate_circle_polygon(center_lat: f64, center_lon: f64, radius_m: f64) -> Vec<[f64; 2]> {
     const NUM_POINTS: usize = 32;
     let mut coords = Vec::with_capacity(NUM_POINTS + 1);
-    
+
     for i in 0..=NUM_POINTS {
         let angle = 2.0 * PI * (i as f64) / (NUM_POINTS as f64);
-        
+
         let (lat, lon) = offset_by_bearing(center_lat, center_lon, radius_m, angle);
 
         // GeoJSON uses [lon, lat] order!
         coords.push([lon, lat]);
     }
-    
+
     coords
 }
 
@@ -110,9 +110,11 @@ pub fn conflict_to_geofence(
 
     // Calculate midpoint between the two drones (if positions known)
     let (center_lat, center_lon, center_alt) = match (drone1_pos, drone2_pos) {
-        (Some((lat1, lon1, alt1)), Some((lat2, lon2, alt2))) => {
-            ((lat1 + lat2) / 2.0, (lon1 + lon2) / 2.0, (alt1 + alt2) / 2.0)
-        }
+        (Some((lat1, lon1, alt1)), Some((lat2, lon2, alt2))) => (
+            (lat1 + lat2) / 2.0,
+            (lon1 + lon2) / 2.0,
+            (alt1 + alt2) / 2.0,
+        ),
         (Some(pos), None) | (None, Some(pos)) => pos,
         (None, None) => (33.6846, -117.8265, 50.0), // Default to Irvine if unknown
     };
@@ -203,16 +205,20 @@ impl BlenderClient {
         }
 
         let url = format!("{}/geo_fence_ops/set_geo_fence", self.base_url);
-        
+
         // Note: Blender expects each geofence separately or as a batch
         // We'll send them one by one for now (can optimize later)
         for gf in geofences {
             let response = self.send_geofence_request(&url, gf).await?;
             if response >= 400 {
-                tracing::warn!("Failed to send conflict geofence {}: HTTP {}", gf.id, response);
+                tracing::warn!(
+                    "Failed to send conflict geofence {}: HTTP {}",
+                    gf.id,
+                    response
+                );
             }
         }
-        
+
         Ok(200)
     }
 

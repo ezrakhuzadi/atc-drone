@@ -12,17 +12,17 @@ use std::time::Duration;
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::broadcast;
 use tokio::fs;
+use tokio::sync::broadcast;
 use tokio::time::interval;
 
 use anyhow::Result;
 use atc_blender::BlenderClient;
 use atc_core::models::{Geofence, GeofenceType};
 
-use crate::config::Config;
 use crate::blender_auth::BlenderAuthManager;
-use crate::persistence::{Database, geofence_sync as geofence_sync_db};
+use crate::config::Config;
+use crate::persistence::{geofence_sync as geofence_sync_db, Database};
 use crate::state::AppState;
 
 const GEOFENCE_SYNC_SECS: u64 = 15;
@@ -198,7 +198,11 @@ async fn sync_external_geofences(
     } else {
         view
     };
-    let view_param = if view.trim().is_empty() { None } else { Some(view.as_str()) };
+    let view_param = if view.trim().is_empty() {
+        None
+    } else {
+        Some(view.as_str())
+    };
 
     let raw_geofences = blender.fetch_geofences(view_param).await?;
     let ignored_ids: HashSet<String> = tracked
@@ -230,7 +234,10 @@ async fn sync_external_geofences(
     Ok(())
 }
 
-fn parse_blender_geofence(entry: &serde_json::Value, now: DateTime<Utc>) -> Option<ParsedBlenderGeofence> {
+fn parse_blender_geofence(
+    entry: &serde_json::Value,
+    now: DateTime<Utc>,
+) -> Option<ParsedBlenderGeofence> {
     let blender_id = entry.get("id")?.as_str()?.to_string();
 
     let raw_geo = extract_json(entry.get("raw_geo_fence"));
@@ -265,10 +272,16 @@ fn parse_blender_geofence(entry: &serde_json::Value, now: DateTime<Utc>) -> Opti
     let lower = extract_f64(entry.get("lower_limit")).unwrap_or(0.0);
 
     let status = entry.get("status").and_then(|v| v.as_i64());
-    let start_time = parse_datetime(entry.get("start_datetime"))
-        .or_else(|| raw_geo.as_ref().and_then(|geo| extract_geojson_time(geo, "start_time")));
-    let end_time = parse_datetime(entry.get("end_datetime"))
-        .or_else(|| raw_geo.as_ref().and_then(|geo| extract_geojson_time(geo, "end_time")));
+    let start_time = parse_datetime(entry.get("start_datetime")).or_else(|| {
+        raw_geo
+            .as_ref()
+            .and_then(|geo| extract_geojson_time(geo, "start_time"))
+    });
+    let end_time = parse_datetime(entry.get("end_datetime")).or_else(|| {
+        raw_geo
+            .as_ref()
+            .and_then(|geo| extract_geojson_time(geo, "end_time"))
+    });
 
     let mut active = !matches!(status, Some(4 | 5 | 6));
     if let (Some(start), Some(end)) = (start_time, end_time) {
@@ -348,7 +361,11 @@ fn extract_geojson_polygon(geojson: &serde_json::Value) -> Option<Vec<[f64; 2]>>
         geojson
     } else if let Some(geometry) = geojson.get("geometry") {
         geometry
-    } else if let Some(feature) = geojson.get("features").and_then(|f| f.as_array()).and_then(|arr| arr.first()) {
+    } else if let Some(feature) = geojson
+        .get("features")
+        .and_then(|f| f.as_array())
+        .and_then(|arr| arr.first())
+    {
         feature.get("geometry")?
     } else {
         return None;
@@ -414,7 +431,10 @@ fn is_conflict_geofence(geofence: &Geofence) -> bool {
         || geofence.id.contains("CONFLICT_")
 }
 
-fn build_geofence_payload(geofence: &Geofence, start_time: chrono::DateTime<Utc>) -> serde_json::Value {
+fn build_geofence_payload(
+    geofence: &Geofence,
+    start_time: chrono::DateTime<Utc>,
+) -> serde_json::Value {
     let mut coordinates: Vec<[f64; 2]> = geofence
         .polygon
         .iter()
@@ -466,9 +486,7 @@ fn fingerprint_geofence(geofence: &Geofence) -> u64 {
 
 type SyncResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-async fn load_tracking_state(
-    path: &Path,
-) -> SyncResult<HashMap<String, BlenderGeofenceState>> {
+async fn load_tracking_state(path: &Path) -> SyncResult<HashMap<String, BlenderGeofenceState>> {
     if !path.exists() {
         return Ok(HashMap::new());
     }
@@ -491,7 +509,9 @@ async fn persist_tracking_state(
     Ok(())
 }
 
-async fn load_tracking_state_db(db: &Database) -> SyncResult<HashMap<String, BlenderGeofenceState>> {
+async fn load_tracking_state_db(
+    db: &Database,
+) -> SyncResult<HashMap<String, BlenderGeofenceState>> {
     let rows = geofence_sync_db::load_geofence_sync_state(db.pool()).await?;
     let mut tracked = HashMap::new();
     for row in rows {

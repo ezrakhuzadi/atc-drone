@@ -1,16 +1,15 @@
 //! WebSocket streaming for real-time updates.
+use crate::state::AppState;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Query,
-        State,
+        Query, State,
     },
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     response::IntoResponse,
 };
-use std::sync::Arc;
 use serde::Deserialize;
-use crate::state::AppState;
+use std::sync::Arc;
 
 /// Handler for WebSocket connections.
 pub async fn ws_handler(
@@ -20,10 +19,7 @@ pub async fn ws_handler(
     Query(params): Query<WsQuery>,
 ) -> axum::response::Response {
     let config = state.config();
-    let provided = params
-        .token
-        .clone()
-        .or_else(|| extract_bearer(&headers));
+    let provided = params.token.clone().or_else(|| extract_bearer(&headers));
 
     if config.require_ws_token {
         let expected = config.ws_token.as_deref().unwrap_or_default();
@@ -40,7 +36,8 @@ pub async fn ws_handler(
 
     let owner_filter = params.owner_id.clone();
     let drone_filter = params.drone_id.clone();
-    ws.on_upgrade(move |socket| handle_socket(socket, state, owner_filter, drone_filter)).into_response()
+    ws.on_upgrade(move |socket| handle_socket(socket, state, owner_filter, drone_filter))
+        .into_response()
 }
 
 #[derive(Debug, Deserialize, Default)]

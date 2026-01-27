@@ -12,10 +12,10 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 use tokio::time::interval;
 
-use atc_blender::BlenderClient;
 use crate::blender_auth::BlenderAuthManager;
 use crate::config::Config;
 use crate::state::{AppState, ExternalTraffic};
+use atc_blender::BlenderClient;
 
 const RID_POLL_SECS: u64 = 2;
 const RID_SUBSCRIPTION_TTL_SECS: u64 = 20;
@@ -167,24 +167,29 @@ fn normalize_observation(observation: &Value) -> Option<ExternalTraffic> {
         position.get("longitude"),
     ])?;
 
-    let altitude_raw = first_number(&[
-        observation.get("altitude_mm"),
-        position.get("alt"),
-    ]);
+    let altitude_raw = first_number(&[observation.get("altitude_mm"), position.get("alt")]);
     let altitude_m = altitude_raw
-        .map(|value| if value > 5000.0 { value / 1000.0 } else { value })
+        .map(|value| {
+            if value > 5000.0 {
+                value / 1000.0
+            } else {
+                value
+            }
+        })
         .unwrap_or(0.0);
 
     let speed_mps = first_number(&[
         current_state.get("speed"),
         metadata.get("speed_mps"),
         metadata.get("speed"),
-    ]).unwrap_or(0.0);
+    ])
+    .unwrap_or(0.0);
     let heading_deg = first_number(&[
         current_state.get("track"),
         metadata.get("heading_deg"),
         metadata.get("heading"),
-    ]).unwrap_or(0.0);
+    ])
+    .unwrap_or(0.0);
 
     let raw_id = first_string(&[
         observation.get("icao_address"),
@@ -276,6 +281,8 @@ fn from_epoch(value: i64) -> DateTime<Utc> {
             .single()
             .unwrap_or_else(Utc::now)
     } else {
-        Utc.timestamp_opt(value, 0).single().unwrap_or_else(Utc::now)
+        Utc.timestamp_opt(value, 0)
+            .single()
+            .unwrap_or_else(Utc::now)
     }
 }

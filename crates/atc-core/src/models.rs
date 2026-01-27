@@ -130,7 +130,6 @@ pub struct FlightPlanRequest {
     pub departure_time: Option<DateTime<Utc>>,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Waypoint {
     pub lat: f64,
@@ -264,7 +263,7 @@ pub enum CommandType {
     /// Change altitude
     AltitudeChange { target_altitude_m: f64 },
     /// Reroute to new waypoints (conflict avoidance)
-    Reroute { 
+    Reroute {
         waypoints: Vec<Waypoint>,
         reason: Option<String>,
     },
@@ -334,7 +333,7 @@ pub struct ConformanceStatus {
     pub record: Option<ConformanceRecord>,
 }
 
-// ========== DAA (DETECT AND AVOID) ========== 
+// ========== DAA (DETECT AND AVOID) ==========
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -392,49 +391,47 @@ impl Geofence {
         if altitude_m < self.lower_altitude_m || altitude_m > self.upper_altitude_m {
             return false;
         }
-        
+
         // Ray casting: count intersections with polygon edges
         let mut inside = false;
         let n = self.polygon.len();
         if n < 3 {
             return false;
         }
-        
+
         let mut j = n - 1;
         for i in 0..n {
             let yi = self.polygon[i][0];
             let xi = self.polygon[i][1];
             let yj = self.polygon[j][0];
             let xj = self.polygon[j][1];
-            
-            if ((yi > lat) != (yj > lat)) 
-                && (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi) 
-            {
+
+            if ((yi > lat) != (yj > lat)) && (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi) {
                 inside = !inside;
             }
             j = i;
         }
-        
+
         inside
     }
-    
+
     /// Validate geofence configuration.
     /// Returns list of validation errors (empty = valid).
     pub fn validate(&self) -> Vec<String> {
         let mut errors = Vec::new();
-        
+
         // Check polygon has at least 3 points
         if self.polygon.len() < 3 {
             errors.push("Polygon must have at least 3 vertices".to_string());
         }
-        
+
         // Check polygon is closed (first == last)
         if let (Some(first), Some(last)) = (self.polygon.first(), self.polygon.last()) {
             if (first[0] - last[0]).abs() > 0.0001 || (first[1] - last[1]).abs() > 0.0001 {
                 errors.push("Polygon must be closed (first vertex must equal last)".to_string());
             }
         }
-        
+
         // Check altitude bounds
         if self.lower_altitude_m >= self.upper_altitude_m {
             errors.push(format!(
@@ -442,7 +439,7 @@ impl Geofence {
                 self.lower_altitude_m, self.upper_altitude_m
             ));
         }
-        
+
         // Check altitude is reasonable (0-10000m)
         if self.lower_altitude_m < 0.0 {
             errors.push("Lower altitude cannot be negative".to_string());
@@ -450,18 +447,26 @@ impl Geofence {
         if self.upper_altitude_m > 10000.0 {
             errors.push("Upper altitude exceeds maximum (10000m)".to_string());
         }
-        
+
         errors
     }
-    
+
     /// Check if geofence is valid.
     pub fn is_valid(&self) -> bool {
         self.validate().is_empty()
     }
-    
+
     /// Check if a route segment intersects this geofence.
     /// Returns true if any point along the segment is inside the geofence.
-    pub fn intersects_segment(&self, lat1: f64, lon1: f64, alt1: f64, lat2: f64, lon2: f64, alt2: f64) -> bool {
+    pub fn intersects_segment(
+        &self,
+        lat1: f64,
+        lon1: f64,
+        alt1: f64,
+        lat2: f64,
+        lon2: f64,
+        alt2: f64,
+    ) -> bool {
         let distance_m = crate::spatial::haversine_distance(lat1, lon1, lat2, lon2);
         let step_m = 25.0_f64;
         let steps = ((distance_m / step_m).ceil() as usize).max(1).min(200);
@@ -472,7 +477,7 @@ impl Geofence {
             let lat = lat1 + t * (lat2 - lat1);
             let lon = lon1 + t * (lon2 - lon1);
             let alt = alt1 + t * (alt2 - alt1);
-            
+
             if self.contains_point(lat, lon, alt) {
                 return true;
             }

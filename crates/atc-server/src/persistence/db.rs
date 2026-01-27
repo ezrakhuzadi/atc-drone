@@ -21,18 +21,28 @@ impl Database {
 /// Clear all persisted state (drones, geofences, flight plans, commands).
 pub async fn clear_all(pool: &SqlitePool) -> Result<()> {
     let mut tx = pool.begin().await?;
-    sqlx::query("DELETE FROM commands").execute(&mut *tx).await?;
-    sqlx::query("DELETE FROM flight_plans").execute(&mut *tx).await?;
-    sqlx::query("DELETE FROM geofences").execute(&mut *tx).await?;
-    sqlx::query("DELETE FROM geofence_sync_state").execute(&mut *tx).await?;
-    sqlx::query("DELETE FROM drone_tokens").execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM commands")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM flight_plans")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM geofences")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM geofence_sync_state")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM drone_tokens")
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("DELETE FROM drones").execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())
 }
 
 /// Initialize the SQLite database.
-/// 
+///
 /// Creates the database file if it doesn't exist, runs migrations,
 /// and returns a connection pool.
 pub async fn init_database(db_path: &str, max_connections: u32) -> Result<Database> {
@@ -40,21 +50,21 @@ pub async fn init_database(db_path: &str, max_connections: u32) -> Result<Databa
     if let Some(parent) = Path::new(db_path).parent() {
         std::fs::create_dir_all(parent)?;
     }
-    
+
     // Create database URL
     let db_url = format!("sqlite:{}?mode=rwc", db_path);
-    
+
     info!("Connecting to database: {}", db_path);
-    
+
     // Create connection pool
     let pool = SqlitePoolOptions::new()
         .max_connections(max_connections)
         .connect(&db_url)
         .await?;
-    
+
     // Run migrations
     run_migrations(&pool).await?;
-    
+
     Ok(Database { pool })
 }
 
@@ -66,7 +76,7 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
     MIGRATOR.run(pool).await?;
 
     ensure_flight_plan_columns(pool).await?;
-    
+
     info!("Database migrations complete");
     Ok(())
 }
@@ -107,21 +117,22 @@ async fn ensure_flight_plan_columns(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[tokio::test]
     async fn test_init_database() {
         let db = init_database(":memory:", 1).await.unwrap();
-        
+
         // Verify tables exist
-        let result: (i32,) = sqlx::query_as("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='drones'")
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
-        
+        let result: (i32,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='drones'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+
         assert_eq!(result.0, 1);
     }
 }

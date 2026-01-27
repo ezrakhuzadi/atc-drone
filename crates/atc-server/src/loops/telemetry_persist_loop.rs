@@ -11,8 +11,8 @@ use tokio::time::interval;
 
 use atc_core::models::DroneState;
 
+use crate::persistence::{drones as drones_db, Database};
 use crate::state::AppState;
-use crate::persistence::{Database, drones as drones_db};
 
 const TELEMETRY_FLUSH_SECS: u64 = 1;
 
@@ -62,10 +62,7 @@ pub async fn run_telemetry_persist_loop(
     }
 }
 
-fn drain_queue(
-    pending: &mut HashMap<String, DroneState>,
-    rx: &mut mpsc::Receiver<DroneState>,
-) {
+fn drain_queue(pending: &mut HashMap<String, DroneState>, rx: &mut mpsc::Receiver<DroneState>) {
     while let Ok(state) = rx.try_recv() {
         pending.insert(state.drone_id.clone(), state);
     }

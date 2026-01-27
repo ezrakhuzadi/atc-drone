@@ -2,11 +2,11 @@
 //!
 //! Activates approved flight plans and marks them complete based on telemetry.
 
+use chrono::Utc;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::time::interval;
-use chrono::Utc;
 use uuid::Uuid;
 
 use crate::state::AppState;

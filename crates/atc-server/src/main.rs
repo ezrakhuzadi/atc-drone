@@ -1,154 +1,164 @@
 //! ATC Server - Always-on backend for drone traffic management
 
-mod api;
 mod altitude;
+mod api;
+mod blender_auth;
 mod cache;
 mod compliance;
-mod state;
-mod loops;
 mod config;
-mod blender_auth;
+mod loops;
 mod persistence;
 mod route_planner;
-	mod terrain;
-	
-	use anyhow::{Result, bail};
-	use axum::{Json, extract::State, routing::get};
-	use axum::http::StatusCode;
-	use axum::response::IntoResponse;
-	use serde::Serialize;
-	use std::net::SocketAddr;
-	use std::future::Future;
-	use std::time::Duration;
-	use tower_http::cors::{CorsLayer, Any};
+mod state;
+mod terrain;
+
+use anyhow::{bail, Result};
+use axum::http::StatusCode;
 use axum::http::{HeaderValue, Method};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use axum::response::IntoResponse;
+use axum::{extract::State, routing::get, Json};
 use axum_server::tls_rustls::RustlsConfig;
+use serde::Serialize;
+use std::future::Future;
+use std::net::SocketAddr;
+use std::time::Duration;
 use tokio::sync::broadcast;
+use tower_http::cors::{Any, CorsLayer};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+use crate::config::Config;
 use crate::state::AppState;
-	use crate::config::Config;
-	use std::sync::Arc;
-	use std::time::{Instant, SystemTime, UNIX_EPOCH};
-	
-	#[derive(Debug, Serialize)]
-	struct LoopStatus {
-	    name: &'static str,
-	    ok: bool,
-	    age_secs: u64,
-	    max_age_secs: u64,
-	    last_tick_secs: Option<u64>,
-	}
-	
-	#[derive(Debug, Serialize)]
-	struct ReadyResponse {
-	    ok: bool,
-	    db_ok: bool,
-	    loops_ok: bool,
-	    db_latency_ms: Option<u128>,
-	    loops: Vec<LoopStatus>,
-	    error: Option<String>,
-	}
-	
-	async fn ready_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-	    let now_secs = SystemTime::now()
-	        .duration_since(UNIX_EPOCH)
-	        .map(|d| d.as_secs())
-	        .unwrap_or(0);
-	
-	    let loop_limits: [(&'static str, u64); 9] = [
-	        ("conflict", 5),
-	        ("blender-sync", 5),
-	        ("telemetry-persist", 10),
-	        ("rid", 10),
-	        ("mission", 10),
-	        ("oi-expiry", 20),
-	        ("conformance", 45),
-	        ("geofence-sync", 60),
-	        ("flight-declaration-sync", 120),
-	    ];
-	
-	    let mut loops = Vec::with_capacity(loop_limits.len());
-	    let mut loops_ok = true;
-	    for (name, max_age_secs) in loop_limits {
-	        let last_tick_secs = state.loop_last_tick_secs(name);
-	        let (ok, age_secs) = match last_tick_secs {
-	            Some(last) => {
-	                let age = now_secs.saturating_sub(last);
-	                (age <= max_age_secs, age)
-	            }
-	            None => (false, u64::MAX),
-	        };
-	        if !ok {
-	            loops_ok = false;
-	        }
-	        loops.push(LoopStatus {
-	            name,
-	            ok,
-	            age_secs,
-	            max_age_secs,
-	            last_tick_secs,
-	        });
-	    }
-	
-	    let (db_ok, db_latency_ms, db_error) = match state.database() {
-	        Some(db) => {
-	            let started_at = Instant::now();
-	            let result = tokio::time::timeout(
-	                Duration::from_millis(750),
-	                sqlx::query("SELECT 1").execute(db.pool()),
-	            )
-	            .await;
-	            match result {
-	                Ok(Ok(_)) => (true, Some(started_at.elapsed().as_millis()), None),
-	                Ok(Err(err)) => (false, Some(started_at.elapsed().as_millis()), Some(err.to_string())),
-	                Err(_) => (false, Some(started_at.elapsed().as_millis()), Some("database ping timed out".to_string())),
-	            }
-	        }
-	        None => (true, None, None),
-	    };
+use std::sync::Arc;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-	    let ok = db_ok && loops_ok;
-	    let status = if ok {
-	        StatusCode::OK
-	    } else {
-	        StatusCode::SERVICE_UNAVAILABLE
-	    };
-	
-	    let error = if let Some(err) = db_error {
-	        Some(err)
-	    } else if !loops_ok {
-	        let stale = loops
-	            .iter()
-	            .filter(|entry| !entry.ok)
-	            .map(|entry| entry.name)
-	            .collect::<Vec<_>>()
-	            .join(",");
-	        Some(format!("stale loops: {}", stale))
-	    } else {
-	        None
-	    };
-	
-	    (
-	        status,
-	        Json(ReadyResponse {
-	            ok,
-	            db_ok,
-	            loops_ok,
-	            db_latency_ms,
-	            loops,
-	            error,
-	        }),
-	    )
-	}
-	
-	#[tokio::main]
-	async fn main() -> Result<()> {
+#[derive(Debug, Serialize)]
+struct LoopStatus {
+    name: &'static str,
+    ok: bool,
+    age_secs: u64,
+    max_age_secs: u64,
+    last_tick_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReadyResponse {
+    ok: bool,
+    db_ok: bool,
+    loops_ok: bool,
+    db_latency_ms: Option<u128>,
+    loops: Vec<LoopStatus>,
+    error: Option<String>,
+}
+
+async fn ready_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let loop_limits: [(&'static str, u64); 9] = [
+        ("conflict", 5),
+        ("blender-sync", 5),
+        ("telemetry-persist", 10),
+        ("rid", 10),
+        ("mission", 10),
+        ("oi-expiry", 20),
+        ("conformance", 45),
+        ("geofence-sync", 60),
+        ("flight-declaration-sync", 120),
+    ];
+
+    let mut loops = Vec::with_capacity(loop_limits.len());
+    let mut loops_ok = true;
+    for (name, max_age_secs) in loop_limits {
+        let last_tick_secs = state.loop_last_tick_secs(name);
+        let (ok, age_secs) = match last_tick_secs {
+            Some(last) => {
+                let age = now_secs.saturating_sub(last);
+                (age <= max_age_secs, age)
+            }
+            None => (false, u64::MAX),
+        };
+        if !ok {
+            loops_ok = false;
+        }
+        loops.push(LoopStatus {
+            name,
+            ok,
+            age_secs,
+            max_age_secs,
+            last_tick_secs,
+        });
+    }
+
+    let (db_ok, db_latency_ms, db_error) = match state.database() {
+        Some(db) => {
+            let started_at = Instant::now();
+            let result = tokio::time::timeout(
+                Duration::from_millis(750),
+                sqlx::query("SELECT 1").execute(db.pool()),
+            )
+            .await;
+            match result {
+                Ok(Ok(_)) => (true, Some(started_at.elapsed().as_millis()), None),
+                Ok(Err(err)) => (
+                    false,
+                    Some(started_at.elapsed().as_millis()),
+                    Some(err.to_string()),
+                ),
+                Err(_) => (
+                    false,
+                    Some(started_at.elapsed().as_millis()),
+                    Some("database ping timed out".to_string()),
+                ),
+            }
+        }
+        None => (true, None, None),
+    };
+
+    let ok = db_ok && loops_ok;
+    let status = if ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    let error = if let Some(err) = db_error {
+        Some(err)
+    } else if !loops_ok {
+        let stale = loops
+            .iter()
+            .filter(|entry| !entry.ok)
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>()
+            .join(",");
+        Some(format!("stale loops: {}", stale))
+    } else {
+        None
+    };
+
+    (
+        status,
+        Json(ReadyResponse {
+            ok,
+            db_ok,
+            loops_ok,
+            db_latency_ms,
+            loops,
+            error,
+        }),
+    )
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
     // Initialize tracing
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
-        .with(tracing_subscriber::EnvFilter::from_default_env()
-            .add_directive("atc_server=debug".parse()?))
+        .with(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("atc_server=debug".parse()?),
+        )
         .init();
 
     tracing::info!("Starting ATC Server...");
@@ -171,29 +181,36 @@ use crate::state::AppState;
     if !config.allow_dummy_blender_auth && config.admin_token == "change-me-admin" {
         bail!("ATC_ADMIN_TOKEN is still set to the insecure default 'change-me-admin'");
     }
-    
+
     // Initialize database
     tracing::info!("Initializing database: {}", config.database_path);
-    let db = persistence::init_database(
-        &config.database_path,
-        config.database_max_connections,
-    ).await?;
+    let db =
+        persistence::init_database(&config.database_path, config.database_max_connections).await?;
     tracing::info!("Database initialized successfully");
-    
+
     // Create application state with database
     let state = Arc::new(AppState::with_database(db, config.clone()));
     state.set_rid_view_bbox(config.rid_view_bbox.clone());
     state.load_from_database().await?;
-    
+
     // Log security config
     tracing::info!("Admin token loaded");
-    tracing::info!("Registration token required: {}", config.require_registration_token);
-    tracing::info!("Rate limiting: {} ({} rps)", config.rate_limit_enabled, config.rate_limit_rps);
+    tracing::info!(
+        "Registration token required: {}",
+        config.require_registration_token
+    );
+    tracing::info!(
+        "Rate limiting: {} ({} rps)",
+        config.rate_limit_enabled,
+        config.rate_limit_rps
+    );
     tracing::info!("CORS origins: {:?}", config.allowed_origins);
-    
+
     let (shutdown_tx, _) = broadcast::channel(1);
 
-    if let (Some(db), Some(telemetry_rx)) = (state.database().cloned(), state.take_telemetry_receiver()) {
+    if let (Some(db), Some(telemetry_rx)) =
+        (state.database().cloned(), state.take_telemetry_receiver())
+    {
         let telemetry_state = state.clone();
         let telemetry_shutdown = shutdown_tx.subscribe();
         tokio::spawn(async move {
@@ -248,14 +265,7 @@ use crate::state::AppState;
         let state = state.clone();
         let config = config.clone();
         spawn_supervised_loop("geofence-sync", shutdown_tx.clone(), move |shutdown| {
-            loops::geofence_sync_loop::run_geofence_sync_loop(state.clone(), config.clone(), shutdown)
-        });
-    }
-    {
-        let state = state.clone();
-        let config = config.clone();
-        spawn_supervised_loop("flight-declaration-sync", shutdown_tx.clone(), move |shutdown| {
-            loops::flight_declaration_sync_loop::run_flight_declaration_sync_loop(
+            loops::geofence_sync_loop::run_geofence_sync_loop(
                 state.clone(),
                 config.clone(),
                 shutdown,
@@ -265,23 +275,40 @@ use crate::state::AppState;
     {
         let state = state.clone();
         let config = config.clone();
+        spawn_supervised_loop(
+            "flight-declaration-sync",
+            shutdown_tx.clone(),
+            move |shutdown| {
+                loops::flight_declaration_sync_loop::run_flight_declaration_sync_loop(
+                    state.clone(),
+                    config.clone(),
+                    shutdown,
+                )
+            },
+        );
+    }
+    {
+        let state = state.clone();
+        let config = config.clone();
         spawn_supervised_loop("blender-sync", shutdown_tx.clone(), move |shutdown| {
             loops::blender_sync_loop::run_blender_loop(state.clone(), config.clone(), shutdown)
         });
     }
 
-	    // Build CORS layer
-	    // Build the app
-	    let app = api::routes(&config)
-	        .route("/health", get(|| async { "OK" }))
-	        .route("/ready", get(ready_handler))
-	        .with_state(state);
+    // Build CORS layer
+    // Build the app
+    let app = api::routes(&config)
+        .route("/health", get(|| async { "OK" }))
+        .route("/ready", get(ready_handler))
+        .with_state(state);
 
     let app = if config.allowed_origins.is_empty() {
         tracing::warn!("No CORS origins configured - CORS disabled (same-origin only)");
         app
     } else {
-        let origins: Vec<HeaderValue> = config.allowed_origins.iter()
+        let origins: Vec<HeaderValue> = config
+            .allowed_origins
+            .iter()
             .filter_map(|o| o.parse().ok())
             .collect();
         app.layer(
@@ -314,9 +341,12 @@ use crate::state::AppState;
         bail!("TLS required but ATC_TLS_CERT_PATH/ATC_TLS_KEY_PATH not set");
     } else {
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-            .with_graceful_shutdown(shutdown_signal(shutdown_tx.clone()))
-            .await?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal(shutdown_tx.clone()))
+        .await?;
     }
 
     Ok(())
@@ -338,8 +368,7 @@ fn spawn_supervised_loop<F, Fut>(
     name: &'static str,
     shutdown_tx: broadcast::Sender<()>,
     make_future: F,
-)
-where
+) where
     F: Fn(broadcast::Receiver<()>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {

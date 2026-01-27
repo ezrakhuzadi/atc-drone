@@ -23,16 +23,22 @@ pub async fn ensure_request_id(mut request: Request, next: Next) -> Response {
 
     if request.headers().get(&REQUEST_ID_HEADER).is_none() {
         if let Ok(value) = HeaderValue::from_str(&request_id) {
-            request.headers_mut().insert(REQUEST_ID_HEADER.clone(), value);
+            request
+                .headers_mut()
+                .insert(REQUEST_ID_HEADER.clone(), value);
         }
     }
 
-    request.extensions_mut().insert(RequestId(request_id.clone()));
+    request
+        .extensions_mut()
+        .insert(RequestId(request_id.clone()));
 
     let span = tracing::info_span!("http", request_id = %request_id);
     let mut response = next.run(request).instrument(span).await;
     if let Ok(value) = HeaderValue::from_str(&request_id) {
-        response.headers_mut().insert(REQUEST_ID_HEADER.clone(), value);
+        response
+            .headers_mut()
+            .insert(REQUEST_ID_HEADER.clone(), value);
     }
     response
 }

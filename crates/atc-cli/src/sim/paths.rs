@@ -92,7 +92,8 @@ impl FlightPath for CircularPath {
             angle_rad = -angle_rad;
         }
 
-        let (lat, lon) = offset_by_bearing(self.center_lat, self.center_lon, self.radius_m, angle_rad);
+        let (lat, lon) =
+            offset_by_bearing(self.center_lat, self.center_lon, self.radius_m, angle_rad);
 
         (lat, lon, self.altitude_m)
     }
@@ -165,7 +166,8 @@ impl FlightPath for LinearPath {
         };
 
         let distance = self.distance_m * progress;
-        let (lat, lon) = offset_by_bearing(self.start_lat, self.start_lon, distance, self.heading_rad);
+        let (lat, lon) =
+            offset_by_bearing(self.start_lat, self.start_lon, distance, self.heading_rad);
 
         (lat, lon, self.altitude_m)
     }

@@ -1,9 +1,9 @@
 //! Drone persistence operations.
 
 use anyhow::Result;
-use sqlx::{Sqlite, SqlitePool};
 use atc_core::models::{DroneState, DroneStatus};
 use chrono::{DateTime, Utc};
+use sqlx::{Sqlite, SqlitePool};
 
 /// Upsert a drone state into the database.
 pub async fn upsert_drone(pool: &SqlitePool, drone: &DroneState) -> Result<()> {
@@ -33,7 +33,7 @@ pub async fn upsert_drone(pool: &SqlitePool, drone: &DroneState) -> Result<()> {
     .bind(drone.last_update.to_rfc3339())
     .execute(pool)
     .await?;
-    
+
     Ok(())
 }
 
@@ -79,11 +79,9 @@ pub async fn load_all_drones(pool: &SqlitePool) -> Result<Vec<DroneState>> {
     )
     .fetch_all(pool)
     .await?;
-    
+
     Ok(rows.into_iter().map(|r| r.into()).collect())
 }
-
-
 
 // Internal row type for SQLx
 #[derive(sqlx::FromRow)]
@@ -110,11 +108,11 @@ impl From<DroneRow> for DroneState {
             "Lost" => DroneStatus::Lost,
             _ => DroneStatus::Inactive,
         };
-        
+
         let last_update = DateTime::parse_from_rfc3339(&row.last_update)
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now());
-        
+
         DroneState {
             drone_id: row.drone_id,
             owner_id: row.owner_id,

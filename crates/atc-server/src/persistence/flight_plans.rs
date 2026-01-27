@@ -1,9 +1,9 @@
 //! Flight plan persistence operations.
 
 use anyhow::Result;
-use sqlx::{Sqlite, SqlitePool};
-use atc_core::models::{FlightPlan, FlightStatus, Waypoint, FlightPlanMetadata, TrajectoryPoint};
+use atc_core::models::{FlightPlan, FlightPlanMetadata, FlightStatus, TrajectoryPoint, Waypoint};
 use chrono::{DateTime, Utc};
+use sqlx::{Sqlite, SqlitePool};
 
 /// Serialize strategic scheduling across processes by taking a write lock early.
 pub async fn lock_scheduler(tx: &mut sqlx::Transaction<'_, Sqlite>) -> Result<()> {
@@ -38,15 +38,19 @@ pub async fn upsert_flight_plan(pool: &SqlitePool, plan: &FlightPlan) -> Result<
         None => None,
     };
     let status = format!("{:?}", plan.status);
-    
-    let (origin_lat, origin_lon) = plan.waypoints.first()
+
+    let (origin_lat, origin_lon) = plan
+        .waypoints
+        .first()
         .map(|w| (Some(w.lat), Some(w.lon)))
         .unwrap_or((None, None));
-    
-    let (dest_lat, dest_lon) = plan.waypoints.last()
+
+    let (dest_lat, dest_lon) = plan
+        .waypoints
+        .last()
         .map(|w| (Some(w.lat), Some(w.lon)))
         .unwrap_or((None, None));
-    
+
     sqlx::query(
         r#"
         INSERT INTO flight_plans (
@@ -80,7 +84,7 @@ pub async fn upsert_flight_plan(pool: &SqlitePool, plan: &FlightPlan) -> Result<
     .bind(plan.created_at.to_rfc3339())
     .execute(pool)
     .await?;
-    
+
     Ok(())
 }
 
@@ -214,8 +218,6 @@ where
     row.map(|r| r.try_into()).transpose()
 }
 
-
-
 // Internal row type for SQLx
 #[derive(sqlx::FromRow)]
 struct FlightPlanRow {
@@ -233,7 +235,7 @@ struct FlightPlanRow {
 
 impl TryFrom<FlightPlanRow> for FlightPlan {
     type Error = anyhow::Error;
-    
+
     fn try_from(row: FlightPlanRow) -> Result<Self> {
         let status = match row.status.as_str() {
             "Reserved" => FlightStatus::Reserved,
@@ -245,7 +247,7 @@ impl TryFrom<FlightPlanRow> for FlightPlan {
             "Cancelled" => FlightStatus::Cancelled,
             _ => FlightStatus::Pending,
         };
-        
+
         let waypoints: Vec<Waypoint> = serde_json::from_str(&row.waypoints)?;
         let trajectory_log: Option<Vec<TrajectoryPoint>> = match row.trajectory_log {
             Some(raw) => Some(serde_json::from_str(&raw)?),
@@ -255,19 +257,21 @@ impl TryFrom<FlightPlanRow> for FlightPlan {
             Some(raw) => Some(serde_json::from_str(&raw)?),
             None => None,
         };
-        
+
         let departure_time = DateTime::parse_from_rfc3339(&row.start_time)
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now());
-        
-        let arrival_time = row.end_time.as_ref()
+
+        let arrival_time = row
+            .end_time
+            .as_ref()
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc));
-        
+
         let created_at = DateTime::parse_from_rfc3339(&row.created_at)
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now());
-        
+
         Ok(FlightPlan {
             flight_id: row.flight_id,
             drone_id: row.drone_id,
