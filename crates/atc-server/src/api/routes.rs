@@ -118,9 +118,29 @@ pub fn create_router(config: &Config) -> Router<Arc<AppState>> {
         .route("/v1/routes/plan", post(plan_route_handler))
         .layer(middleware::from_fn_with_state(expensive_limiter, auth::rate_limit));
     
-    // Admin routes (require admin token)
-    let admin_routes = Router::new()
-        .route("/v1/admin/reset", post(admin_reset))
+    // Admin routes (preferred: /v1/admin/... prefix)
+    let admin_prefixed_routes = Router::new()
+        .route("/reset", post(admin_reset))
+        .route("/commands", post(commands::issue_command))
+        .route("/commands", get(commands::get_all_commands))
+        .route("/flights/plan", post(flights::create_flight_plan))
+        .route("/flights", post(flights::create_flight_plan_compat))
+        .route(
+            "/operational_intents/reserve",
+            post(flights::reserve_operational_intent),
+        )
+        .route(
+            "/operational_intents/:flight_id/confirm",
+            post(flights::confirm_operational_intent),
+        )
+        .route(
+            "/operational_intents/:flight_id",
+            put(flights::update_operational_intent),
+        )
+        .route(
+            "/operational_intents/:flight_id/cancel",
+            post(flights::cancel_operational_intent),
+        )
         .layer(middleware::from_fn_with_state(admin_token, auth::require_admin));
     
     public_routes
@@ -129,7 +149,7 @@ pub fn create_router(config: &Config) -> Router<Arc<AppState>> {
         .merge(expensive_routes)
         .merge(admin_command_routes)
         .merge(admin_flight_routes)
-        .merge(admin_routes)
+        .nest("/v1/admin", admin_prefixed_routes)
         .layer(middleware::from_fn(request_id::ensure_request_id))
 }
 
