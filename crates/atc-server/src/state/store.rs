@@ -31,6 +31,13 @@ const DETECTOR_QUEUE_DEPTH: usize = 4096;
 const DETECTOR_QUEUE_WARN_INTERVAL_SECS: u64 = 5;
 const STATE_CAP_WARN_INTERVAL_SECS: u64 = 10;
 
+#[derive(Debug, Clone)]
+pub struct WsDroneEvent {
+    pub drone_id: String,
+    pub owner_id: Option<String>,
+    pub payload: Arc<str>,
+}
+
 /// Application state - thread-safe store for drones and conflicts.
 pub struct AppState {
     drones: DashMap<String, DroneState>,
@@ -54,7 +61,7 @@ pub struct AppState {
     /// Track active HOLD commands after acknowledgment
     active_holds: DashMap<String, DateTime<Utc>>,
     drone_counter: AtomicU32,
-    pub tx: broadcast::Sender<DroneState>, // For WS broadcasting
+    pub tx: broadcast::Sender<WsDroneEvent>, // For WS broadcasting (pre-serialized payload)
     command_tx: broadcast::Sender<Command>,
     /// Telemetry persistence queue (coalesced in background).
     telemetry_tx: mpsc::Sender<DroneState>,
@@ -674,7 +681,14 @@ impl AppState {
 
         // Broadcast update via WebSocket
         if let Some(state) = updated_state {
-            let _ = self.tx.send(state.clone());
+            if let Ok(payload) = serde_json::to_string(&state) {
+                let event = WsDroneEvent {
+                    drone_id: state.drone_id.clone(),
+                    owner_id: state.owner_id.clone(),
+                    payload: Arc::from(payload),
+                };
+                let _ = self.tx.send(event);
+            }
             self.queue_telemetry_persist(state);
         }
 

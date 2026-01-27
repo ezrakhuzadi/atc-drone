@@ -93,10 +93,8 @@ async fn handle_socket(
                                 continue;
                             }
                         }
-                        if let Ok(json) = serde_json::to_string(&msg) {
-                            if socket.send(Message::Text(json)).await.is_err() {
-                                break;
-                            }
+                        if socket.send(Message::Text(msg.payload.as_ref().to_owned())).await.is_err() {
+                            break;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
