@@ -10,6 +10,7 @@ pub struct DroneTokenRow {
 }
 
 /// Upsert a drone session token.
+#[allow(dead_code)]
 pub async fn upsert_drone_token(pool: &SqlitePool, drone_id: &str, token: &str) -> Result<()> {
     sqlx::query(
         r#"

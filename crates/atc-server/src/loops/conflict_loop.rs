@@ -126,33 +126,27 @@ pub async fn run_conflict_loop(
                         tracing::info!("No conflicts detected");
                         last_conflict_count = 0;
                     }
-                    if !tracked_conflicts.is_empty() {
-                        if blender_available {
-                            let conflict_ids: Vec<String> =
-                                tracked_conflicts.keys().cloned().collect();
-                            for conflict_id in conflict_ids {
-                                let Some(existing) = tracked_conflicts
-                                    .get(&conflict_id)
-                                    .map(|entry| entry.clone())
-                                else {
-                                    continue;
-                                };
-                                match blender.delete_geofence(&existing.blender_id).await {
-                                    Ok(()) => {
-                                        tracked_conflicts.remove(&conflict_id);
-                                        state.clear_conflict_geofence(&existing.blender_id);
-                                        blender_backoff.reset();
-                                    }
-                                    Err(err) => {
-                                        let delay = blender_backoff.fail();
-                                        tracing::warn!(
-                                            "Failed to delete conflict geofence {}: {} (backing off {:?})",
-                                            conflict_id,
-                                            err,
-                                            delay
-                                        );
-                                        break;
-                                    }
+                    if blender_available && !tracked_conflicts.is_empty() {
+                        let conflict_ids: Vec<String> = tracked_conflicts.keys().cloned().collect();
+                        for conflict_id in conflict_ids {
+                            let Some(existing) = tracked_conflicts.get(&conflict_id).cloned() else {
+                                continue;
+                            };
+                            match blender.delete_geofence(&existing.blender_id).await {
+                                Ok(()) => {
+                                    tracked_conflicts.remove(&conflict_id);
+                                    state.clear_conflict_geofence(&existing.blender_id);
+                                    blender_backoff.reset();
+                                }
+                                Err(err) => {
+                                    let delay = blender_backoff.fail();
+                                    tracing::warn!(
+                                        "Failed to delete conflict geofence {}: {} (backing off {:?})",
+                                        conflict_id,
+                                        err,
+                                        delay
+                                    );
+                                    break;
                                 }
                             }
                         }
@@ -590,10 +584,7 @@ pub async fn run_conflict_loop(
                         .cloned()
                         .collect();
                     for conflict_id in stale_ids {
-                        let Some(existing) = tracked_conflicts
-                            .get(&conflict_id)
-                            .map(|entry| entry.clone())
-                        else {
+                        let Some(existing) = tracked_conflicts.get(&conflict_id).cloned() else {
                             continue;
                         };
                         match blender.delete_geofence(&existing.blender_id).await {
@@ -628,9 +619,7 @@ pub async fn run_conflict_loop(
                             continue;
                         }
 
-                        if let Some(existing) =
-                            tracked_conflicts.get(&geofence.id).map(|entry| entry.clone())
-                        {
+                        if let Some(existing) = tracked_conflicts.get(&geofence.id).cloned() {
                             match blender.delete_geofence(&existing.blender_id).await {
                                 Ok(()) => {
                                     tracked_conflicts.remove(&geofence.id);

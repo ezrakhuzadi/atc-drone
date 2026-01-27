@@ -358,11 +358,17 @@ async fn main() -> Result<()> {
 
 #[cfg(unix)]
 async fn shutdown_signal(shutdown_tx: broadcast::Sender<()>) {
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("failed to install SIGTERM handler");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {},
-        _ = sigterm.recv() => {},
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(mut sigterm) => {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = sigterm.recv() => {},
+            }
+        }
+        Err(err) => {
+            tracing::warn!("Failed to install SIGTERM handler (CTRL-C only): {}", err);
+            let _ = tokio::signal::ctrl_c().await;
+        }
     }
     tracing::info!("Shutdown signal received");
     let _ = shutdown_tx.send(());

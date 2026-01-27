@@ -150,7 +150,7 @@ pub struct TrajectoryPoint {
 }
 
 /// Metadata captured with a flight plan submission.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FlightPlanMetadata {
     #[serde(default)]
     pub drone_speed_mps: Option<f64>,
@@ -196,33 +196,6 @@ pub struct FlightPlanMetadata {
     /// If the plan is reserved, the time (RFC3339) when the reservation expires.
     #[serde(default)]
     pub reservation_expires_at: Option<String>,
-}
-
-impl Default for FlightPlanMetadata {
-    fn default() -> Self {
-        Self {
-            drone_speed_mps: None,
-            total_distance_m: None,
-            total_flight_time_s: None,
-            trajectory_points: None,
-            planned_altitude_m: None,
-            max_obstacle_height_m: None,
-            faa_compliant: None,
-            submitted_at: None,
-            blender_declaration_id: None,
-            operation_type: None,
-            battery_capacity_min: None,
-            battery_reserve_min: None,
-            clearance_m: None,
-            compliance_override_enabled: None,
-            compliance_override_notes: None,
-            compliance_report: None,
-            scheduling_priority: None,
-            requested_departure_time: None,
-            scheduled_delay_s: None,
-            reservation_expires_at: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -469,7 +442,7 @@ impl Geofence {
     ) -> bool {
         let distance_m = crate::spatial::haversine_distance(lat1, lon1, lat2, lon2);
         let step_m = 25.0_f64;
-        let steps = ((distance_m / step_m).ceil() as usize).max(1).min(200);
+        let steps = ((distance_m / step_m).ceil() as usize).clamp(1, 200);
 
         // Sample points along the segment based on distance
         for i in 0..=steps {

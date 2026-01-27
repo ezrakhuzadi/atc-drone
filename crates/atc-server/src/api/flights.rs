@@ -715,14 +715,14 @@ pub(crate) async fn build_plan(
 
     let active_plans: Vec<FlightPlan> = existing_plans
         .iter()
-        .cloned()
-        .filter(|p| {
+        .filter(|plan| {
             matches!(
-                p.status,
+                plan.status,
                 FlightStatus::Reserved | FlightStatus::Approved | FlightStatus::Active
             )
         })
-        .filter(|p| p.flight_id != flight_id)
+        .filter(|plan| plan.flight_id != flight_id)
+        .cloned()
         .collect();
 
     // For reserved operational intents, run a prioritized batch rescheduler so this reservation
@@ -904,6 +904,7 @@ enum ReservedBatchOutcome {
     },
 }
 
+#[allow(clippy::too_many_arguments)]
 fn schedule_reserved_batch(
     state: &AppState,
     existing_plans: &[FlightPlan],
@@ -1075,6 +1076,7 @@ fn earliest_departure_for_reserved(plan: &FlightPlan) -> chrono::DateTime<chrono
     requested.max(plan.departure_time)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn try_schedule_plan(
     state: &AppState,
     plan_template: &FlightPlan,
@@ -1278,13 +1280,9 @@ pub async fn get_flight_plans(
             .filter(|drone| drone.owner_id.as_ref() == Some(&owner_id))
             .map(|drone| drone.drone_id)
             .collect();
-        plans = plans
-            .into_iter()
-            .filter(|plan| {
-                plan.owner_id.as_ref() == Some(&owner_id)
-                    || owner_drone_ids.contains(&plan.drone_id)
-            })
-            .collect();
+        plans.retain(|plan| {
+            plan.owner_id.as_ref() == Some(&owner_id) || owner_drone_ids.contains(&plan.drone_id)
+        });
     }
 
     plans.sort_by(|a, b| {

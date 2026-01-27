@@ -97,7 +97,6 @@ struct Node {
     step: usize,
     lane: usize,
     g_score: f64,
-    f_score: f64,
     alt: f64,
 }
 
@@ -639,7 +638,6 @@ fn compute_path_nodes(
         step: 0,
         lane: center_lane_idx,
         g_score: 0.0,
-        f_score: 0.0,
         alt: start_alt,
     };
 
@@ -685,7 +683,6 @@ fn compute_path_nodes(
                 step: current.step,
                 lane: current.lane,
                 g_score: best_g,
-                f_score: current.f_score.0,
                 alt: current.alt,
             });
             break;
@@ -782,7 +779,6 @@ fn compute_path_nodes(
                         step: current.step,
                         lane: current.lane,
                         g_score: best_g,
-                        f_score: current.f_score.0,
                         alt: current.alt,
                     },
                 );
@@ -873,6 +869,7 @@ fn smooth_path(
     smoothed
 }
 
+#[allow(clippy::too_many_arguments)]
 fn is_line_of_sight_clear(
     start: &Node,
     end: &Node,
@@ -884,8 +881,8 @@ fn is_line_of_sight_clear(
     config: &RouteEngineConfig,
 ) -> bool {
     let mut max_alt = start.alt.max(end.alt);
-    for idx in start_idx..=end_idx {
-        max_alt = max_alt.max(all_nodes[idx].alt);
+    for node in &all_nodes[start_idx..=end_idx] {
+        max_alt = max_alt.max(node.alt);
     }
 
     let num_lanes = grid.lanes.len();
@@ -961,7 +958,7 @@ fn geofence_blocks_segment(
     }
     let distance_m = haversine_distance(start.lat, start.lon, end.lat, end.lon);
     let step = step_m.max(1.0);
-    let steps = ((distance_m / step).ceil() as usize).max(1).min(1000);
+    let steps = ((distance_m / step).ceil() as usize).clamp(1, 1000);
     for i in 0..=steps {
         let t = i as f64 / steps as f64;
         let lat = start.lat + t * (end.lat - start.lat);

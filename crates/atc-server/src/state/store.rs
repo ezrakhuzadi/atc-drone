@@ -132,8 +132,6 @@ impl AppState {
         state
     }
 
-    /// Create new AppState with custom safety rules.
-
     /// Create new AppState with custom rules and config.
     pub fn with_rules_and_config(rules: SafetyRules, config: Config) -> Self {
         let (tx, _) = broadcast::channel(100);
@@ -451,7 +449,7 @@ impl AppState {
     fn parse_drone_numeric_suffix(drone_id: &str) -> Option<u32> {
         let upper = drone_id.trim().to_ascii_uppercase();
         let rest = upper.strip_prefix("DRONE")?;
-        let rest = rest.trim_start_matches(|c: char| c == '-' || c == '_');
+        let rest = rest.trim_start_matches(['-', '_']);
         if rest.is_empty() || !rest.chars().all(|c| c.is_ascii_digit()) {
             return None;
         }
@@ -468,6 +466,7 @@ impl AppState {
     }
 
     /// Register a new drone, persisting before updating in-memory state.
+    #[allow(dead_code)]
     pub async fn register_drone(&self, drone_id: &str, owner_id: Option<String>) -> Result<()> {
         self.register_drone_internal(drone_id, owner_id, None)
             .await
@@ -603,6 +602,7 @@ impl AppState {
     }
 
     /// Store or update the session token for a drone.
+    #[allow(dead_code)]
     pub async fn set_drone_token(&self, drone_id: &str, token: String) -> Result<()> {
         if let Some(db) = self.database.clone() {
             drone_tokens_db::upsert_drone_token(db.pool(), drone_id, &token).await?;
@@ -1018,10 +1018,7 @@ impl AppState {
     /// Check if drone has an acknowledged HOLD command still in effect.
     pub fn has_active_hold_command(&self, drone_id: &str) -> bool {
         let now = Utc::now();
-        let expires_at = self
-            .active_holds
-            .get(drone_id)
-            .map(|entry| entry.value().clone());
+        let expires_at = self.active_holds.get(drone_id).map(|entry| *entry.value());
         let Some(expires_at) = expires_at else {
             return false;
         };

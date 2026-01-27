@@ -192,6 +192,7 @@ where
 }
 
 /// Load a single flight plan by ID.
+#[allow(dead_code)]
 pub async fn load_flight_plan(pool: &SqlitePool, flight_id: &str) -> Result<Option<FlightPlan>> {
     load_flight_plan_impl(pool, flight_id).await
 }

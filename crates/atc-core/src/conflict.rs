@@ -21,6 +21,14 @@ pub enum ConflictSeverity {
     Critical,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ClosestApproach {
+    distance_m: f64,
+    time_s: f64,
+    pos1: (f64, f64, f64),
+    pos2: (f64, f64, f64),
+}
+
 /// Current position and velocity of a drone.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DronePosition {
@@ -200,8 +208,8 @@ impl ConflictDetector {
         warning_horizontal_m: f64,
         warning_vertical_m: f64,
     ) -> Option<(ConflictSeverity, f64, f64, f64, f64, f64)> {
-        let mut best_critical: Option<(f64, f64, (f64, f64, f64), (f64, f64, f64))> = None;
-        let mut best_warning: Option<(f64, f64, (f64, f64, f64), (f64, f64, f64))> = None;
+        let mut best_critical: Option<ClosestApproach> = None;
+        let mut best_warning: Option<ClosestApproach> = None;
 
         for t in 0..=(self.lookahead_seconds as i32) {
             let t = t as f64;
@@ -213,35 +221,52 @@ impl ConflictDetector {
             if h_dist < self.separation_horizontal_m && v_dist < self.separation_vertical_m {
                 let replace = best_critical
                     .as_ref()
-                    .map(|(best_distance, ..)| distance < *best_distance)
+                    .map(|best| distance < best.distance_m)
                     .unwrap_or(true);
                 if replace {
-                    best_critical = Some((distance, t, pos1, pos2));
+                    best_critical = Some(ClosestApproach {
+                        distance_m: distance,
+                        time_s: t,
+                        pos1,
+                        pos2,
+                    });
                 }
             } else if h_dist < warning_horizontal_m && v_dist < warning_vertical_m {
                 let replace = best_warning
                     .as_ref()
-                    .map(|(best_distance, ..)| distance < *best_distance)
+                    .map(|best| distance < best.distance_m)
                     .unwrap_or(true);
                 if replace {
-                    best_warning = Some((distance, t, pos1, pos2));
+                    best_warning = Some(ClosestApproach {
+                        distance_m: distance,
+                        time_s: t,
+                        pos1,
+                        pos2,
+                    });
                 }
             }
         }
 
-        let (severity, distance, time, pos1, pos2) = if let Some(best) = best_critical {
-            (ConflictSeverity::Critical, best.0, best.1, best.2, best.3)
+        let (severity, best) = if let Some(best) = best_critical {
+            (ConflictSeverity::Critical, best)
         } else if let Some(best) = best_warning {
-            (ConflictSeverity::Warning, best.0, best.1, best.2, best.3)
+            (ConflictSeverity::Warning, best)
         } else {
             return None;
         };
 
-        let cpa_lat = (pos1.0 + pos2.0) / 2.0;
-        let cpa_lon = (pos1.1 + pos2.1) / 2.0;
-        let cpa_altitude_m = (pos1.2 + pos2.2) / 2.0;
+        let cpa_lat = (best.pos1.0 + best.pos2.0) / 2.0;
+        let cpa_lon = (best.pos1.1 + best.pos2.1) / 2.0;
+        let cpa_altitude_m = (best.pos1.2 + best.pos2.2) / 2.0;
 
-        Some((severity, time, distance, cpa_lat, cpa_lon, cpa_altitude_m))
+        Some((
+            severity,
+            best.time_s,
+            best.distance_m,
+            cpa_lat,
+            cpa_lon,
+            cpa_altitude_m,
+        ))
     }
 
     /// Check all tracked drones for conflicts.

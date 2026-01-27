@@ -11,6 +11,12 @@ const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
 #[derive(Clone, Debug)]
 pub struct RequestId(pub String);
 
+impl std::fmt::Display for RequestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 pub async fn ensure_request_id(mut request: Request, next: Next) -> Response {
     let request_id = request
         .headers()

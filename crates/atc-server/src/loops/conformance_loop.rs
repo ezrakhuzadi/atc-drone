@@ -280,9 +280,7 @@ fn compute_geofence_exit(drone: &DroneState, geofence: &Geofence) -> Option<Wayp
         }
     }
 
-    let Some((cx, cy, dist_sq)) = best else {
-        return None;
-    };
+    let (cx, cy, dist_sq) = best?;
 
     let distance = dist_sq.sqrt();
     let (dir_x, dir_y) = if distance > f64::EPSILON {

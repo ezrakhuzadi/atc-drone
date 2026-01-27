@@ -532,14 +532,16 @@ impl Config {
     }
 
     pub fn safety_rules(&self) -> SafetyRules {
-        let mut rules = SafetyRules::default();
-        rules.min_horizontal_separation_m = self.rules_min_horizontal_separation_m;
-        rules.min_vertical_separation_m = self.rules_min_vertical_separation_m;
-        rules.lookahead_seconds = self.rules_lookahead_seconds;
-        rules.warning_multiplier = self.rules_warning_multiplier;
-        rules.drone_timeout_secs = self.rules_drone_timeout_secs;
-        rules.max_altitude_m = self.rules_max_altitude_m;
-        rules.min_altitude_m = self.rules_min_altitude_m;
+        let mut rules = SafetyRules {
+            min_horizontal_separation_m: self.rules_min_horizontal_separation_m,
+            min_vertical_separation_m: self.rules_min_vertical_separation_m,
+            lookahead_seconds: self.rules_lookahead_seconds,
+            warning_multiplier: self.rules_warning_multiplier,
+            drone_timeout_secs: self.rules_drone_timeout_secs,
+            max_altitude_m: self.rules_max_altitude_m,
+            min_altitude_m: self.rules_min_altitude_m,
+            ..Default::default()
+        };
         if rules.max_altitude_m > rules.min_altitude_m {
             let band_size = (rules.max_altitude_m - rules.min_altitude_m) / 3.0;
             rules.altitude_bands = vec![

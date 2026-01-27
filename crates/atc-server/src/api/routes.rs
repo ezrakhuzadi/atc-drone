@@ -549,10 +549,10 @@ fn validate_telemetry(
             Some("lon"),
         ));
     }
-    if lat < -90.0 || lat > 90.0 {
+    if !(-90.0..=90.0).contains(&lat) {
         return Err(bad_request("Latitude out of range", Some("lat")));
     }
-    if lon < -180.0 || lon > 180.0 {
+    if !(-180.0..=180.0).contains(&lon) {
         return Err(bad_request("Longitude out of range", Some("lon")));
     }
 
@@ -590,7 +590,7 @@ fn validate_telemetry(
             Some("heading_deg"),
         ));
     }
-    if heading < 0.0 || heading >= 360.0 {
+    if !(0.0..360.0).contains(&heading) {
         return Err(bad_request("Heading out of range", Some("heading_deg")));
     }
 

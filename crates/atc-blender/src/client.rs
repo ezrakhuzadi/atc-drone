@@ -89,7 +89,7 @@ impl BlenderClient {
             client: Client::builder()
                 .timeout(Duration::from_secs(10))
                 .build()
-                .expect("Failed to create HTTP client"),
+                .unwrap_or_else(|_| Client::new()),
             base_url: base_url.into(),
             session_id: session_id.into(),
             auth_token,

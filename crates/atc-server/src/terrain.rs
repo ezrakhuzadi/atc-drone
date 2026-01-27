@@ -90,8 +90,7 @@ impl TerrainGrid {
         let v11 = self.value_at(y1, x1);
 
         // Conservative sampling avoids undercutting peaks between grid points.
-        let max_corner = v00.max(v10).max(v01).max(v11);
-        max_corner
+        v00.max(v10).max(v01).max(v11)
     }
 
     fn value_at(&self, row: usize, col: usize) -> f64 {
@@ -206,7 +205,7 @@ pub async fn fetch_terrain_grid(
     let min_interval = Duration::from_millis(config.terrain_request_min_interval_ms);
     let max_attempts = config.terrain_request_retries.saturating_add(1);
     let backoff_base_ms = config.terrain_request_backoff_ms.max(1);
-    let total_requests = (total + max_points - 1) / max_points;
+    let total_requests = total.div_ceil(max_points);
     if config.terrain_max_requests > 0 && total_requests > config.terrain_max_requests {
         return Err(format!(
             "terrain request count {} exceeds terrain_max_requests {}",
@@ -233,7 +232,7 @@ pub async fn fetch_terrain_grid(
     let mut last_request_at: Option<Instant> = None;
     while start < total {
         let request_idx = start / max_points;
-        if total_requests >= 25 && request_idx > 0 && request_idx % 25 == 0 {
+        if total_requests >= 25 && request_idx > 0 && request_idx.is_multiple_of(25) {
             tracing::info!(
                 request = request_idx,
                 total_requests = total_requests,

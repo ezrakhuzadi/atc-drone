@@ -204,6 +204,7 @@ pub(crate) struct ObstacleCandidate {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(crate) struct ObstacleFootprint {
     pub id: String,
     pub name: String,
@@ -536,9 +537,9 @@ fn evaluate_population(
     let is_bvlos = operation_type == 2;
     let mut status = ComplianceStatus::Pass;
 
-    if density >= config.compliance_population_absolute_max {
-        status = ComplianceStatus::Fail;
-    } else if is_bvlos && density > config.compliance_population_bvlos_max {
+    if density >= config.compliance_population_absolute_max
+        || (is_bvlos && density > config.compliance_population_bvlos_max)
+    {
         status = ComplianceStatus::Fail;
     } else if density >= config.compliance_population_warn {
         status = ComplianceStatus::Warn;
@@ -565,7 +566,7 @@ fn evaluate_obstacles(
         default_hazards()
     } else {
         let mut hazards = default_hazards();
-        hazards.extend(analysis.hazards.drain(..));
+        hazards.append(&mut analysis.hazards);
         hazards
     };
 
@@ -1291,11 +1292,7 @@ fn distance_to_route_meters(hazard_lat: f64, hazard_lon: f64, points: &[RoutePoi
             continue;
         }
         let mut t = -(ax * dx + ay * dy) / len_sq;
-        if t < 0.0 {
-            t = 0.0;
-        } else if t > 1.0 {
-            t = 1.0;
-        }
+        t = t.clamp(0.0, 1.0);
         let cx = ax + t * dx;
         let cy = ay + t * dy;
         let dist = (cx * cx + cy * cy).sqrt();

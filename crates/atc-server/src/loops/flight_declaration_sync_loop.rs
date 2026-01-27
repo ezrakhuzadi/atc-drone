@@ -25,8 +25,6 @@ struct AtcPlanEmbed {
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
-    drone_id: Option<String>,
-    #[serde(default)]
     waypoints: Vec<AtcWaypointEmbed>,
     #[serde(default)]
     trajectory_log: Vec<atc_core::models::TrajectoryPoint>,
@@ -360,8 +358,8 @@ fn extract_atc_plan_id(compliance: &Value) -> Option<String> {
 fn map_declaration_status(declaration: &Value) -> FlightStatus {
     let state_value = declaration.get("state").and_then(|v| v.as_i64());
     match state_value {
-        Some(2 | 3 | 4) => FlightStatus::Active,
-        Some(5 | 6 | 7 | 8) => FlightStatus::Completed,
+        Some(2..=4) => FlightStatus::Active,
+        Some(5..=8) => FlightStatus::Completed,
         Some(1) => FlightStatus::Approved,
         Some(0) => FlightStatus::Pending,
         _ => FlightStatus::Pending,
@@ -379,13 +377,11 @@ fn parse_datetime(value: Option<&Value>) -> Option<DateTime<Utc>> {
 }
 
 fn first_string(candidates: &[Option<&Value>]) -> Option<String> {
-    for candidate in candidates {
-        if let Some(value) = candidate {
-            if let Some(text) = value.as_str() {
-                let trimmed = text.trim();
-                if !trimmed.is_empty() {
-                    return Some(trimmed.to_string());
-                }
+    for value in candidates.iter().flatten() {
+        if let Some(text) = value.as_str() {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
             }
         }
     }

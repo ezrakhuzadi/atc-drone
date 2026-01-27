@@ -457,12 +457,11 @@ async fn plan_route_single(
                 let terrain = terrain.clone();
                 let lane_offsets = lane_offsets.clone();
                 let attempt_started_at = Instant::now();
-                let engine_config = {
-                    let mut engine_config = RouteEngineConfig::default();
-                    engine_config.safety_buffer_m = clearance_m;
-                    engine_config.wind_mps = wind_mps;
-                    engine_config.geofence_sample_step_m = spacing.clamp(5.0, 25.0);
-                    engine_config
+                let engine_config = RouteEngineConfig {
+                    safety_buffer_m: clearance_m,
+                    wind_mps,
+                    geofence_sample_step_m: spacing.clamp(5.0, 25.0),
+                    ..Default::default()
                 };
 
                 let handle = task::spawn_blocking(move || {
@@ -674,8 +673,6 @@ async fn plan_route_segmented(
             let client = client.clone();
             let config = config.clone();
             let segment = segment.clone();
-            let base_spacing = base_spacing;
-            let max_lane_radius = max_lane_radius;
             join_set.spawn(async move {
                 let _permit = permit;
                 let inputs = fetch_segment_inputs(
@@ -1024,6 +1021,7 @@ async fn fetch_segment_inputs(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn solve_airborne_segment(
     waypoints: &[Waypoint],
     lane_radius: f64,
@@ -1085,12 +1083,11 @@ async fn solve_airborne_segment(
                 let geofences = geofences.clone();
                 let terrain_for_task = terrain.clone();
                 let lane_offsets = lane_offsets.clone();
-                let engine_config = {
-                    let mut engine_config = RouteEngineConfig::default();
-                    engine_config.safety_buffer_m = safety_buffer_m;
-                    engine_config.wind_mps = wind_mps;
-                    engine_config.geofence_sample_step_m = spacing.clamp(5.0, 25.0);
-                    engine_config
+                let engine_config = RouteEngineConfig {
+                    safety_buffer_m,
+                    wind_mps,
+                    geofence_sample_step_m: spacing.clamp(5.0, 25.0),
+                    ..Default::default()
                 };
 
                 let attempt_started_at = Instant::now();
@@ -1314,11 +1311,13 @@ pub async fn plan_airborne_route(
                     terrain_ref.map(|grid| grid.sample(lat, lon)).unwrap_or(0.0)
                 });
 
-                let mut engine_config = RouteEngineConfig::default();
-                engine_config.safety_buffer_m = safety_buffer_m;
-                engine_config.faa_limit_agl = 500.0;
-                engine_config.wind_mps = config.route_planner_wind_mps.max(0.0);
-                engine_config.geofence_sample_step_m = spacing.clamp(5.0, 25.0);
+                let engine_config = RouteEngineConfig {
+                    safety_buffer_m,
+                    faa_limit_agl: 500.0,
+                    wind_mps: config.route_planner_wind_mps.max(0.0),
+                    geofence_sample_step_m: spacing.clamp(5.0, 25.0),
+                    ..Default::default()
+                };
 
                 let result = optimize_airborne_path(waypoints, &grid, &geofences, &engine_config);
                 if result.success && !result.waypoints.is_empty() {
@@ -1414,23 +1413,17 @@ fn resolve_max_lane_radius(
     base_radius: f64,
     override_radius: Option<f64>,
 ) -> f64 {
-    let mut radius = override_radius.unwrap_or_else(|| {
-        if route_distance_m > 12_000.0 {
-            1800.0
-        } else if route_distance_m > 8_000.0 {
-            1400.0
-        } else if route_distance_m > 4_000.0 {
-            1000.0
-        } else {
-            DEFAULT_MAX_LANE_RADIUS_M
-        }
-    });
-    if radius < base_radius {
-        radius = base_radius;
-    }
-    if radius < DEFAULT_MAX_LANE_RADIUS_M {
-        radius = DEFAULT_MAX_LANE_RADIUS_M;
-    }
+    let default_radius = if route_distance_m > 12_000.0 {
+        1800.0
+    } else if route_distance_m > 8_000.0 {
+        1400.0
+    } else if route_distance_m > 4_000.0 {
+        1000.0
+    } else {
+        DEFAULT_MAX_LANE_RADIUS_M
+    };
+    let mut radius = override_radius.unwrap_or(default_radius);
+    radius = radius.max(base_radius).max(DEFAULT_MAX_LANE_RADIUS_M);
     radius
 }
 
@@ -1528,9 +1521,7 @@ fn lane_radius_candidates(start: f64, max: f64, expansion_step: f64) -> Vec<f64>
         radius = next.min(max);
         guard += 1;
     }
-    if candidates.last().copied().unwrap_or(0.0) + f64::EPSILON < max {
-        candidates.push(max);
-    } else if candidates.is_empty() {
+    if candidates.is_empty() || candidates.last().copied().unwrap_or(0.0) + f64::EPSILON < max {
         candidates.push(max);
     }
     candidates

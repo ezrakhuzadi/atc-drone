@@ -335,7 +335,7 @@ fn parse_blender_geofence(
             .and_then(|geo| extract_geojson_time(geo, "end_time"))
     });
 
-    let mut active = !matches!(status, Some(4 | 5 | 6));
+    let mut active = !matches!(status, Some(4..=6));
     if let (Some(start), Some(end)) = (start_time, end_time) {
         if now < start || now > end {
             active = false;
