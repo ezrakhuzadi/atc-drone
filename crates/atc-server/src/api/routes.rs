@@ -31,16 +31,22 @@ pub fn create_router(config: &Config) -> Router<Arc<AppState>> {
         config.rate_limit_rps,
         config.rate_limit_enabled,
         config.trust_proxy,
+        config.rate_limit_max_tracked_ips,
+        std::time::Duration::from_secs(config.rate_limit_entry_ttl_s),
     );
     let registration_limiter = RateLimiter::new(
         config.registration_rate_limit_rps,
         config.rate_limit_enabled,
         config.trust_proxy,
+        config.rate_limit_max_tracked_ips,
+        std::time::Duration::from_secs(config.rate_limit_entry_ttl_s),
     );
     let expensive_limiter = RateLimiter::new(
         config.expensive_rate_limit_rps,
         config.rate_limit_enabled,
         config.trust_proxy,
+        config.rate_limit_max_tracked_ips,
+        std::time::Duration::from_secs(config.rate_limit_entry_ttl_s),
     );
     
     // Create admin token extractor

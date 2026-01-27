@@ -9,7 +9,11 @@ use axum::{
 };
 use axum::http::HeaderMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::state::AppState;
 
@@ -80,24 +84,40 @@ pub async fn require_admin(
 /// Simple rate limiter state (per-IP tracking).
 /// For production, consider tower-governor or similar.
 use dashmap::DashMap;
-use std::time::Instant;
+
+#[derive(Debug, Clone, Copy)]
+struct RateLimitEntry {
+    window_start_epoch_s: u64,
+    window_count: u32,
+    last_seen_epoch_s: u64,
+}
 
 #[derive(Clone)]
 pub struct RateLimiter {
-    requests: Arc<DashMap<String, Vec<Instant>>>,
-    last_cleanup: Arc<Mutex<Instant>>,
-    cleanup_interval: std::time::Duration,
+    requests: Arc<DashMap<String, RateLimitEntry>>,
+    last_cleanup_epoch_s: Arc<AtomicU64>,
+    cleanup_interval: Duration,
+    entry_ttl: Duration,
+    max_tracked_ips: usize,
     max_rps: u32,
     enabled: bool,
     trust_proxy: bool,
 }
 
 impl RateLimiter {
-    pub fn new(max_rps: u32, enabled: bool, trust_proxy: bool) -> Self {
+    pub fn new(
+        max_rps: u32,
+        enabled: bool,
+        trust_proxy: bool,
+        max_tracked_ips: usize,
+        entry_ttl: Duration,
+    ) -> Self {
         Self {
             requests: Arc::new(DashMap::new()),
-            last_cleanup: Arc::new(Mutex::new(Instant::now())),
-            cleanup_interval: std::time::Duration::from_secs(60),
+            last_cleanup_epoch_s: Arc::new(AtomicU64::new(0)),
+            cleanup_interval: Duration::from_secs(60),
+            entry_ttl,
+            max_tracked_ips,
             max_rps,
             enabled,
             trust_proxy,
@@ -109,48 +129,98 @@ impl RateLimiter {
         if !self.enabled {
             return true;
         }
-        
-        let now = Instant::now();
-        let window = std::time::Duration::from_secs(1);
-        let do_cleanup = {
-            let mut last_cleanup = self
-                .last_cleanup
-                .lock()
-                .expect("Rate limiter cleanup lock poisoned");
-            if now.duration_since(*last_cleanup) >= self.cleanup_interval {
-                *last_cleanup = now;
-                true
-            } else {
-                false
-            }
+
+        let now_epoch_s = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(value) => value.as_secs(),
+            Err(_) => 0,
         };
-        if do_cleanup {
-            self.purge_stale_entries(now, window);
+
+        self.maybe_cleanup(now_epoch_s);
+
+        if !self.ensure_capacity(ip, now_epoch_s) {
+            return false;
         }
-        
-        let mut entry = self.requests.entry(ip.to_string()).or_default();
-        let timestamps = entry.value_mut();
-        
-        // Remove old timestamps
-        timestamps.retain(|t| now.duration_since(*t) < window);
-        
-        if timestamps.len() < self.max_rps as usize {
-            timestamps.push(now);
-            true
-        } else {
-            false
+
+        let mut entry = self
+            .requests
+            .entry(ip.to_string())
+            .or_insert(RateLimitEntry {
+                window_start_epoch_s: now_epoch_s,
+                window_count: 0,
+                last_seen_epoch_s: now_epoch_s,
+            });
+
+        let state = entry.value_mut();
+        if state.window_start_epoch_s != now_epoch_s {
+            state.window_start_epoch_s = now_epoch_s;
+            state.window_count = 0;
         }
+        state.window_count = state.window_count.saturating_add(1);
+        state.last_seen_epoch_s = now_epoch_s;
+
+        state.window_count <= self.max_rps
     }
 
-    fn purge_stale_entries(&self, now: Instant, window: std::time::Duration) {
+    fn maybe_cleanup(&self, now_epoch_s: u64) {
+        if now_epoch_s == 0 {
+            return;
+        }
+        let last_cleanup = self.last_cleanup_epoch_s.load(Ordering::Relaxed);
+        if last_cleanup != 0
+            && now_epoch_s.saturating_sub(last_cleanup) < self.cleanup_interval.as_secs()
+        {
+            return;
+        }
+
+        if self
+            .last_cleanup_epoch_s
+            .compare_exchange(last_cleanup, now_epoch_s, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        self.purge_stale_entries(now_epoch_s);
+    }
+
+    fn ensure_capacity(&self, ip: &str, now_epoch_s: u64) -> bool {
+        if self.max_tracked_ips == 0 {
+            return true;
+        }
+        if self.requests.contains_key(ip) {
+            return true;
+        }
+        if self.requests.len() < self.max_tracked_ips {
+            return true;
+        }
+
+        self.purge_stale_entries(now_epoch_s);
+
+        if self.requests.contains_key(ip) {
+            return true;
+        }
+
+        self.requests.len() < self.max_tracked_ips
+    }
+
+    fn purge_stale_entries(&self, now_epoch_s: u64) {
+        if now_epoch_s == 0 {
+            return;
+        }
+        let ttl = self.entry_ttl.as_secs();
+        if ttl == 0 {
+            return;
+        }
+
         let stale: Vec<String> = self
             .requests
             .iter()
-            .filter(|entry| entry.value().iter().all(|t| now.duration_since(*t) >= window))
+            .filter(|entry| now_epoch_s.saturating_sub(entry.value().last_seen_epoch_s) >= ttl)
             .map(|entry| entry.key().clone())
             .collect();
-        for ip in stale {
-            self.requests.remove(&ip);
+
+        for key in stale {
+            self.requests.remove(&key);
         }
     }
 }

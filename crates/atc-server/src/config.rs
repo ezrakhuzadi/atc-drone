@@ -37,6 +37,10 @@ pub struct Config {
     pub registration_rate_limit_rps: u32,
     /// Max requests per second per IP for expensive endpoints (route planning, compliance evaluation).
     pub expensive_rate_limit_rps: u32,
+    /// Hard cap on unique IPs tracked by the rate limiter (DoS protection). Set to 0 to disable.
+    pub rate_limit_max_tracked_ips: usize,
+    /// How long to keep an IP entry after last request (seconds).
+    pub rate_limit_entry_ttl_s: u64,
     /// Hard cap for the number of drones tracked in memory (DoS protection).
     pub max_tracked_drones: usize,
     /// Hard cap for the number of external RID traffic tracks kept in memory (DoS protection).
@@ -228,6 +232,14 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(2),
+            rate_limit_max_tracked_ips: env::var("ATC_RATE_LIMIT_MAX_IPS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(50_000),
+            rate_limit_entry_ttl_s: env::var("ATC_RATE_LIMIT_ENTRY_TTL_S")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(600),
             max_tracked_drones: env::var("ATC_MAX_TRACKED_DRONES")
                 .ok()
                 .and_then(|s| s.parse().ok())
