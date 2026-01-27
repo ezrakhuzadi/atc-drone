@@ -16,6 +16,7 @@ use std::sync::{
     Arc,
     RwLock,
 };
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::altitude::altitude_to_amsl;
 use crate::config::Config;
@@ -75,6 +76,8 @@ pub struct AppState {
     daa_advisories: DashMap<String, DaaAdvisory>,
     /// Current RID viewport (min_lat,min_lon,max_lat,max_lon)
     rid_view_bbox: RwLock<String>,
+    /// Per-loop heartbeat timestamps (Unix seconds).
+    loop_heartbeats: DashMap<&'static str, u64>,
     /// SQLite database for persistence (optional for backwards compat)
     database: Option<Database>,
     /// Server configuration (for compliance lookups, etc.)
@@ -172,6 +175,7 @@ impl AppState {
             conformance: DashMap::new(),
             daa_advisories: DashMap::new(),
             rid_view_bbox: RwLock::new(String::new()),
+            loop_heartbeats: DashMap::new(),
             database: None,
             config,
         }
@@ -181,6 +185,17 @@ impl AppState {
     #[allow(dead_code)]
     pub fn database(&self) -> Option<&Database> {
         self.database.as_ref()
+    }
+
+    pub fn mark_loop_heartbeat(&self, name: &'static str) {
+        let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+            return;
+        };
+        self.loop_heartbeats.insert(name, now.as_secs());
+    }
+
+    pub fn loop_last_tick_secs(&self, name: &str) -> Option<u64> {
+        self.loop_heartbeats.get(name).map(|entry| *entry.value())
     }
 
     /// Take the telemetry receiver for the persistence loop.

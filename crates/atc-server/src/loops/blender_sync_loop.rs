@@ -24,6 +24,7 @@ pub async fn run_blender_loop(
     );
 
     let mut ticker = interval(Duration::from_millis(1000));
+    state.mark_loop_heartbeat("blender-sync");
 
     loop {
         tokio::select! {
@@ -32,6 +33,7 @@ pub async fn run_blender_loop(
                 break;
             }
             _ = ticker.tick() => {
+                state.mark_loop_heartbeat("blender-sync");
                 if let Err(err) = auth.apply(&mut client).await {
                     tracing::warn!("Blender sync auth refresh failed: {}", err);
                     continue;

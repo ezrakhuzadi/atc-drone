@@ -56,6 +56,7 @@ pub async fn run_flight_declaration_sync_loop(
     );
 
     let mut ticker = interval(Duration::from_secs(LOOP_INTERVAL_SECS));
+    state.mark_loop_heartbeat("flight-declaration-sync");
 
     loop {
         tokio::select! {
@@ -64,6 +65,7 @@ pub async fn run_flight_declaration_sync_loop(
                 break;
             }
             _ = ticker.tick() => {
+                state.mark_loop_heartbeat("flight-declaration-sync");
                 if let Err(err) = auth.apply(&mut blender).await {
                     tracing::warn!("Flight declaration sync Blender auth refresh failed: {}", err);
                     continue;

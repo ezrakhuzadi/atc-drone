@@ -24,6 +24,7 @@ pub async fn run_telemetry_persist_loop(
 ) {
     let mut ticker = interval(Duration::from_secs(TELEMETRY_FLUSH_SECS));
     let mut pending: HashMap<String, DroneState> = HashMap::new();
+    app_state.mark_loop_heartbeat("telemetry-persist");
 
     loop {
         tokio::select! {
@@ -34,6 +35,7 @@ pub async fn run_telemetry_persist_loop(
             maybe_state = rx.recv() => {
                 match maybe_state {
                     Some(state) => {
+                        app_state.mark_loop_heartbeat("telemetry-persist");
                         pending.insert(state.drone_id.clone(), state);
                         drain_queue(&mut pending, &mut rx);
                         merge_overflow(&app_state, &mut pending);
@@ -45,6 +47,7 @@ pub async fn run_telemetry_persist_loop(
                 }
             }
             _ = ticker.tick() => {
+                app_state.mark_loop_heartbeat("telemetry-persist");
                 merge_overflow(&app_state, &mut pending);
                 if let Err(err) = flush_pending(&db, &mut pending).await {
                     tracing::warn!("Telemetry persistence flush failed: {}", err);

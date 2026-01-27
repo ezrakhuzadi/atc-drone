@@ -43,6 +43,7 @@ pub async fn run_conflict_loop(
     mut shutdown: broadcast::Receiver<()>,
 ) {
     let mut ticker = interval(Duration::from_secs(1));
+    state.mark_loop_heartbeat("conflict");
 
     // Create Blender client for geofence sync
     let auth = BlenderAuthManager::new(&config);
@@ -63,6 +64,7 @@ pub async fn run_conflict_loop(
                 break;
             }
             _ = ticker.tick() => {
+                state.mark_loop_heartbeat("conflict");
                 if let Err(err) = auth.apply(&mut blender).await {
                     tracing::warn!("Conflict loop Blender auth refresh failed: {}", err);
                 }

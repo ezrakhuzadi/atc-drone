@@ -20,6 +20,7 @@ const ARRIVAL_ALTITUDE_M: f64 = 15.0;
 
 pub async fn run_mission_loop(state: Arc<AppState>, mut shutdown: broadcast::Receiver<()>) {
     let mut ticker = interval(Duration::from_secs(LOOP_INTERVAL_SECS));
+    state.mark_loop_heartbeat("mission");
 
     loop {
         tokio::select! {
@@ -28,6 +29,7 @@ pub async fn run_mission_loop(state: Arc<AppState>, mut shutdown: broadcast::Rec
                 break;
             }
             _ = ticker.tick() => {
+                state.mark_loop_heartbeat("mission");
                 let now = Utc::now();
 
                 for mut entry in state.flight_plans.iter_mut() {

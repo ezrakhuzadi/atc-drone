@@ -27,6 +27,7 @@ pub async fn run_operational_intent_expiry_loop(
 
     let pool = db.pool().clone();
     let mut ticker = interval(Duration::from_secs(LOOP_INTERVAL_SECS));
+    state.mark_loop_heartbeat("oi-expiry");
 
     'main: loop {
         tokio::select! {
@@ -35,6 +36,7 @@ pub async fn run_operational_intent_expiry_loop(
                 break;
             }
             _ = ticker.tick() => {
+                state.mark_loop_heartbeat("oi-expiry");
                 let now = Utc::now();
                 let mut tx = match pool.begin().await {
                     Ok(tx) => tx,

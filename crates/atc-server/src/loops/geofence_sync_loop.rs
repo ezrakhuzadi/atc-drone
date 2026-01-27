@@ -75,6 +75,7 @@ pub async fn run_geofence_sync_loop(
             }
         },
     };
+    state.mark_loop_heartbeat("geofence-sync");
 
     loop {
         tokio::select! {
@@ -83,6 +84,7 @@ pub async fn run_geofence_sync_loop(
                 break;
             }
             _ = ticker.tick() => {
+                state.mark_loop_heartbeat("geofence-sync");
                 if let Err(err) = auth.apply(&mut blender).await {
                     tracing::warn!("Geofence sync Blender auth refresh failed: {}", err);
                     continue;

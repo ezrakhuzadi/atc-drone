@@ -29,64 +29,117 @@ use tokio::sync::broadcast;
 use crate::state::AppState;
 	use crate::config::Config;
 	use std::sync::Arc;
-	use std::time::Instant;
+	use std::time::{Instant, SystemTime, UNIX_EPOCH};
+	
+	#[derive(Debug, Serialize)]
+	struct LoopStatus {
+	    name: &'static str,
+	    ok: bool,
+	    age_secs: u64,
+	    max_age_secs: u64,
+	    last_tick_secs: Option<u64>,
+	}
 	
 	#[derive(Debug, Serialize)]
 	struct ReadyResponse {
 	    ok: bool,
 	    db_ok: bool,
+	    loops_ok: bool,
 	    db_latency_ms: Option<u128>,
+	    loops: Vec<LoopStatus>,
 	    error: Option<String>,
 	}
 	
 	async fn ready_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-	    let Some(db) = state.database() else {
-	        return (
-	            StatusCode::OK,
-	            Json(ReadyResponse {
-	                ok: true,
-	                db_ok: true,
-	                db_latency_ms: None,
-	                error: None,
-	            }),
-	        );
+	    let now_secs = SystemTime::now()
+	        .duration_since(UNIX_EPOCH)
+	        .map(|d| d.as_secs())
+	        .unwrap_or(0);
+	
+	    let loop_limits: [(&'static str, u64); 9] = [
+	        ("conflict", 5),
+	        ("blender-sync", 5),
+	        ("telemetry-persist", 10),
+	        ("rid", 10),
+	        ("mission", 10),
+	        ("oi-expiry", 20),
+	        ("conformance", 45),
+	        ("geofence-sync", 60),
+	        ("flight-declaration-sync", 120),
+	    ];
+	
+	    let mut loops = Vec::with_capacity(loop_limits.len());
+	    let mut loops_ok = true;
+	    for (name, max_age_secs) in loop_limits {
+	        let last_tick_secs = state.loop_last_tick_secs(name);
+	        let (ok, age_secs) = match last_tick_secs {
+	            Some(last) => {
+	                let age = now_secs.saturating_sub(last);
+	                (age <= max_age_secs, age)
+	            }
+	            None => (false, u64::MAX),
+	        };
+	        if !ok {
+	            loops_ok = false;
+	        }
+	        loops.push(LoopStatus {
+	            name,
+	            ok,
+	            age_secs,
+	            max_age_secs,
+	            last_tick_secs,
+	        });
+	    }
+	
+	    let (db_ok, db_latency_ms, db_error) = match state.database() {
+	        Some(db) => {
+	            let started_at = Instant::now();
+	            let result = tokio::time::timeout(
+	                Duration::from_millis(750),
+	                sqlx::query("SELECT 1").execute(db.pool()),
+	            )
+	            .await;
+	            match result {
+	                Ok(Ok(_)) => (true, Some(started_at.elapsed().as_millis()), None),
+	                Ok(Err(err)) => (false, Some(started_at.elapsed().as_millis()), Some(err.to_string())),
+	                Err(_) => (false, Some(started_at.elapsed().as_millis()), Some("database ping timed out".to_string())),
+	            }
+	        }
+	        None => (true, None, None),
+	    };
+
+	    let ok = db_ok && loops_ok;
+	    let status = if ok {
+	        StatusCode::OK
+	    } else {
+	        StatusCode::SERVICE_UNAVAILABLE
 	    };
 	
-	    let started_at = Instant::now();
-	    let result = tokio::time::timeout(
-	        Duration::from_millis(750),
-	        sqlx::query("SELECT 1").execute(db.pool()),
+	    let error = if let Some(err) = db_error {
+	        Some(err)
+	    } else if !loops_ok {
+	        let stale = loops
+	            .iter()
+	            .filter(|entry| !entry.ok)
+	            .map(|entry| entry.name)
+	            .collect::<Vec<_>>()
+	            .join(",");
+	        Some(format!("stale loops: {}", stale))
+	    } else {
+	        None
+	    };
+	
+	    (
+	        status,
+	        Json(ReadyResponse {
+	            ok,
+	            db_ok,
+	            loops_ok,
+	            db_latency_ms,
+	            loops,
+	            error,
+	        }),
 	    )
-	    .await;
-	    match result {
-	        Ok(Ok(_)) => (
-	            StatusCode::OK,
-	            Json(ReadyResponse {
-	                ok: true,
-	                db_ok: true,
-	                db_latency_ms: Some(started_at.elapsed().as_millis()),
-	                error: None,
-	            }),
-	        ),
-	        Ok(Err(err)) => (
-	            StatusCode::SERVICE_UNAVAILABLE,
-	            Json(ReadyResponse {
-	                ok: false,
-	                db_ok: false,
-	                db_latency_ms: Some(started_at.elapsed().as_millis()),
-	                error: Some(err.to_string()),
-	            }),
-	        ),
-	        Err(_) => (
-	            StatusCode::SERVICE_UNAVAILABLE,
-	            Json(ReadyResponse {
-	                ok: false,
-	                db_ok: false,
-	                db_latency_ms: Some(started_at.elapsed().as_millis()),
-	                error: Some("database ping timed out".to_string()),
-	            }),
-	        ),
-	    }
 	}
 	
 	#[tokio::main]

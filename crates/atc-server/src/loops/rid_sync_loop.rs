@@ -43,6 +43,7 @@ pub async fn run_rid_loop(
     let mut subscription_backoff_secs: u64 = RID_POLL_SECS;
     let mut next_subscription_attempt = Instant::now();
     let mut last_view = state.get_rid_view_bbox();
+    state.mark_loop_heartbeat("rid");
 
     loop {
         tokio::select! {
@@ -51,6 +52,7 @@ pub async fn run_rid_loop(
                 break;
             }
             _ = ticker.tick() => {
+                state.mark_loop_heartbeat("rid");
                 if let Err(err) = auth.apply(&mut blender).await {
                     tracing::warn!("RID sync Blender auth refresh failed: {}", err);
                     continue;

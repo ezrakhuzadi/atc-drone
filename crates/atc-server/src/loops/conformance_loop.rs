@@ -48,6 +48,7 @@ pub async fn run_conformance_loop(
 
     let mut ticker = interval(Duration::from_secs(CONFORMANCE_POLL_SECS));
     let mut last_status: HashMap<String, String> = HashMap::new();
+    state.mark_loop_heartbeat("conformance");
 
     loop {
         tokio::select! {
@@ -56,6 +57,7 @@ pub async fn run_conformance_loop(
                 break;
             }
             _ = ticker.tick() => {
+                state.mark_loop_heartbeat("conformance");
                 if let Err(err) = auth.apply(&mut blender).await {
                     tracing::warn!("Conformance loop Blender auth refresh failed: {}", err);
                     continue;
