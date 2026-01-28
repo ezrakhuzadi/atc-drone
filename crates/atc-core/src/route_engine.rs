@@ -565,10 +565,21 @@ pub fn optimize_airborne_path(
     grid: &RouteGrid,
     geofences: &[Geofence],
     config: &RouteEngineConfig,
+    start_altitude_override: Option<f64>,
 ) -> RouteEngineResult {
-    // Treat input waypoint altitude as a "desired" altitude, but don't allow starting below terrain.
-    // `compute_path_nodes` will clamp start altitude to at least the terrain height when override is None.
-    let result = match compute_path_nodes(waypoints, grid, geofences, config, None) {
+    // When routing an airborne path (including segmented route planning), the start of the segment is
+    // already in-flight. Ensure we start above terrain/obstacles by at least the safety buffer.
+    let center_lane_idx = grid.lanes.len() / 2;
+    let start_point = &grid.lanes[center_lane_idx][0];
+    let min_safe_start = start_point
+        .obstacle_height_m
+        .max(start_point.terrain_height_m)
+        + config.safety_buffer_m;
+    let start_override = start_altitude_override
+        .unwrap_or(start_point.altitude_m)
+        .max(min_safe_start);
+
+    let result = match compute_path_nodes(waypoints, grid, geofences, config, Some(start_override)) {
         Ok(result) => result,
         Err(errors) => {
             return RouteEngineResult {
@@ -1022,7 +1033,8 @@ mod tests {
             waypoint_indices: vec![0, 1],
         };
 
-        let result = optimize_airborne_path(&waypoints, &grid, &[], &RouteEngineConfig::default());
+        let result =
+            optimize_airborne_path(&waypoints, &grid, &[], &RouteEngineConfig::default(), None);
         assert!(
             result.success,
             "expected path to be feasible: {:?}",
@@ -1030,5 +1042,52 @@ mod tests {
         );
         assert_eq!(result.waypoints.len(), 2);
         assert!(result.waypoints[0].altitude_m > result.waypoints[1].altitude_m);
+    }
+
+    #[test]
+    fn airborne_path_starts_above_terrain_plus_buffer() {
+        let waypoints = vec![
+            Waypoint {
+                lat: 33.0,
+                lon: -117.0,
+                altitude_m: 0.0,
+                speed_mps: None,
+            },
+            Waypoint {
+                lat: 33.0,
+                lon: -117.0001,
+                altitude_m: 0.0,
+                speed_mps: None,
+            },
+        ];
+
+        let grid = RouteGrid {
+            lanes: vec![vec![
+                RouteGridPoint {
+                    lat: 33.0,
+                    lon: -117.0,
+                    altitude_m: 0.0,
+                    terrain_height_m: 100.0,
+                    obstacle_height_m: 100.0,
+                },
+                RouteGridPoint {
+                    lat: 33.0,
+                    lon: -117.0001,
+                    altitude_m: 0.0,
+                    terrain_height_m: 100.0,
+                    obstacle_height_m: 100.0,
+                },
+            ]],
+            waypoint_indices: vec![0, 1],
+        };
+
+        let config = RouteEngineConfig {
+            safety_buffer_m: 20.0,
+            ..Default::default()
+        };
+        let result = optimize_airborne_path(&waypoints, &grid, &[], &config, None);
+        assert!(result.success, "expected path to be feasible: {:?}", result.errors);
+        assert_eq!(result.waypoints.len(), 2);
+        assert!(result.waypoints[0].altitude_m >= 120.0);
     }
 }

@@ -640,6 +640,7 @@ async fn plan_route_segmented(
         let mut start_terrain: Option<Arc<TerrainGrid>> = None;
         let mut end_terrain: Option<Arc<TerrainGrid>> = None;
         let mut truncated = false;
+        let mut start_altitude_override: Option<f64> = None;
 
         let semaphore = Arc::new(Semaphore::new(SEGMENT_PREFETCH_CONCURRENCY.max(1)));
         let mut join_set = task::JoinSet::new();
@@ -774,6 +775,7 @@ async fn plan_route_segmented(
                 expansion_step,
                 clearance_m,
                 wind_mps,
+                start_altitude_override,
                 inputs,
                 geofences.clone(),
             )
@@ -859,6 +861,8 @@ async fn plan_route_segmented(
             if idx + 1 == segment_count {
                 end_terrain = plan.terrain.clone();
             }
+
+            start_altitude_override = plan.waypoints.last().map(|wp| wp.altitude_m);
 
             for hazard in &plan.hazards {
                 if hazards_seen.insert(hazard.id.clone()) {
@@ -1054,6 +1058,7 @@ async fn solve_airborne_segment(
     expansion_step: f64,
     safety_buffer_m: f64,
     wind_mps: f64,
+    start_altitude_override: Option<f64>,
     inputs: SegmentInputs,
     geofences: Arc<Vec<Geofence>>,
 ) -> Result<SegmentPlan, SegmentError> {
@@ -1106,6 +1111,7 @@ async fn solve_airborne_segment(
                 let geofences = geofences.clone();
                 let terrain_for_task = terrain.clone();
                 let lane_offsets = lane_offsets.clone();
+                let start_altitude_override = start_altitude_override;
                 let engine_config = RouteEngineConfig {
                     safety_buffer_m,
                     wind_mps,
@@ -1136,8 +1142,13 @@ async fn solve_airborne_segment(
                             .map(|grid| grid.sample(lat, lon))
                             .unwrap_or(0.0)
                     });
-                    let result =
-                        optimize_airborne_path(&waypoints, &grid, &geofences, &engine_config);
+                    let result = optimize_airborne_path(
+                        &waypoints,
+                        &grid,
+                        &geofences,
+                        &engine_config,
+                        start_altitude_override,
+                    );
                     Ok((result, sample_points))
                 });
 
@@ -1342,7 +1353,8 @@ pub async fn plan_airborne_route(
                     ..Default::default()
                 };
 
-                let result = optimize_airborne_path(waypoints, &grid, &geofences, &engine_config);
+                let result =
+                    optimize_airborne_path(waypoints, &grid, &geofences, &engine_config, None);
                 if result.success && !result.waypoints.is_empty() {
                     best_result = Some(result);
                     break;
