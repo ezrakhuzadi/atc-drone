@@ -185,6 +185,22 @@ async fn main() -> Result<()> {
     if !config.allow_dummy_blender_auth && config.admin_token == "change-me-admin" {
         bail!("ATC_ADMIN_TOKEN is still set to the insecure default 'change-me-admin'");
     }
+    if !config.allow_dummy_blender_auth {
+        if let Some(token) = config.registration_token.as_deref() {
+            if token == "change-me-registration-token" {
+                bail!("ATC_REGISTRATION_TOKEN is still set to the insecure default 'change-me-registration-token'");
+            }
+        }
+
+        if config.require_ws_token && config.ws_token.is_none() {
+            bail!("ATC_WS_TOKEN must be set when ATC_REQUIRE_WS_TOKEN is enabled");
+        }
+        if let Some(token) = config.ws_token.as_deref() {
+            if token == "change-me-ws-token" {
+                bail!("ATC_WS_TOKEN is still set to the insecure default 'change-me-ws-token'");
+            }
+        }
+    }
 
     // Initialize database
     tracing::info!("Initializing database: {}", config.database_path);
