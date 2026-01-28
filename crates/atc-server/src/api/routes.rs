@@ -64,18 +64,14 @@ pub fn create_router(config: &Config) -> Router<Arc<AppState>> {
         .route("/v1/conformance", get(list_conformance))
         .route("/v1/daa", get(daa::list_daa))
         .route("/v1/compliance/limits", get(get_compliance_limits))
-        .route("/v1/rid/view", post(update_rid_view))
         .route("/v1/flights", get(flights::get_flight_plans))
         // Command polling routes
         .route("/v1/commands/next", get(commands::get_next_command))
         .route("/v1/commands/ack", post(commands::ack_command))
         .route("/v1/commands/ws", get(commands::command_stream_ws))
         // Geofence routes
-        .route("/v1/geofences", post(geofences::create_geofence))
         .route("/v1/geofences", get(geofences::list_geofences))
         .route("/v1/geofences/:id", get(geofences::get_geofence))
-        .route("/v1/geofences/:id", put(geofences::update_geofence))
-        .route("/v1/geofences/:id", delete(geofences::delete_geofence))
         .route("/v1/geofences/check", get(geofences::check_point))
         .route("/v1/geofences/check-route", post(geofences::check_route))
         // WebSocket streaming
@@ -140,6 +136,18 @@ pub fn create_router(config: &Config) -> Router<Arc<AppState>> {
             auth::require_admin,
         ));
 
+    let admin_state_mutation_routes = Router::new()
+        // RID view controls the server's external RID ingest viewport and mutates global state.
+        .route("/v1/rid/view", post(update_rid_view))
+        // Geofence CRUD mutates shared airspace state.
+        .route("/v1/geofences", post(geofences::create_geofence))
+        .route("/v1/geofences/:id", put(geofences::update_geofence))
+        .route("/v1/geofences/:id", delete(geofences::delete_geofence))
+        .layer(middleware::from_fn_with_state(
+            admin_token.clone(),
+            auth::require_admin,
+        ));
+
     // Admin routes (preferred: /v1/admin/... prefix)
     let admin_prefixed_routes = Router::new()
         .route("/reset", post(admin_reset))
@@ -172,6 +180,7 @@ pub fn create_router(config: &Config) -> Router<Arc<AppState>> {
         .merge(registration_routes)
         .merge(telemetry_route)
         .merge(expensive_routes)
+        .merge(admin_state_mutation_routes)
         .merge(admin_command_routes)
         .merge(admin_flight_routes)
         .nest("/v1/admin", admin_prefixed_routes)

@@ -483,6 +483,11 @@ impl Config {
                     if trimmed.is_empty() { None } else { Some(trimmed) }
                 }),
             require_tls: env::var("ATC_REQUIRE_TLS")
+                .ok()
+                .and_then(|v| {
+                    let trimmed = v.trim().to_string();
+                    if trimmed.is_empty() { None } else { Some(trimmed) }
+                })
                 .map(|v| v != "0" && v.to_lowercase() != "false")
                 .unwrap_or(!is_dev),
             strategic_scheduling_enabled: env::var("ATC_STRATEGIC_SCHEDULING")

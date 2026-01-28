@@ -103,6 +103,7 @@ async fn create_geofence_and_check_route() {
         .method("POST")
         .uri("/v1/geofences")
         .header("content-type", "application/json")
+        .header("authorization", "Bearer test-admin-token")
         .body(Body::from(
             json!({
                 "name": "Test Zone",
