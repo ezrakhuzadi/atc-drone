@@ -4,6 +4,10 @@
 
 A Rust-based strategic conflict detection and resolution system for drone traffic management. This project serves as the "brain" of a micro-UTM (Unmanned Traffic Management) system, providing real-time conflict detection, automatic avoidance routing, and command dispatch to drones.
 
+## About
+
+`atc-drone` is the core ATC backend for the stack. It exposes HTTP and WebSocket APIs for registration, telemetry, conflict detection, geofences, and command dispatch, and ships with a Rust SDK plus CLI simulators for demos and testing. It can run standalone for development or as part of the unified `atc-stack` Docker Compose environment.
+
 ## Architecture
 
 ```
