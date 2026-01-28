@@ -892,18 +892,13 @@ fn smooth_path(
 fn is_line_of_sight_clear(
     start: &Node,
     end: &Node,
-    all_nodes: &[Node],
+    _all_nodes: &[Node],
     start_idx: usize,
     end_idx: usize,
     grid: &RouteGrid,
     geofences: &[&Geofence],
     config: &RouteEngineConfig,
 ) -> bool {
-    let mut max_alt = start.alt.max(end.alt);
-    for node in &all_nodes[start_idx..=end_idx] {
-        max_alt = max_alt.max(node.alt);
-    }
-
     let num_lanes = grid.lanes.len();
     let num_steps = grid.lanes[0].len();
     let num_samples = (end_idx as i32 - start_idx as i32).max(1) as usize * 2;
@@ -923,30 +918,36 @@ fn is_line_of_sight_clear(
             return false;
         }
         let grid_point = &grid.lanes[mid_lane as usize][mid_step as usize];
+        let sample_alt = start.alt + t * (end.alt - start.alt);
         let obstacle_height = grid_point
             .obstacle_height_m
             .max(grid_point.terrain_height_m);
         let min_safe_alt = obstacle_height + config.safety_buffer_m;
-        if !geofences.is_empty() {
-            let sample_alt = start.alt + t * (end.alt - start.alt);
-            if geofence_blocks_point(geofences, grid_point.lat, grid_point.lon, sample_alt) {
-                return false;
-            }
+        let faa_ceiling = grid_point.terrain_height_m + config.faa_limit_agl;
+
+        if sample_alt < min_safe_alt || sample_alt > faa_ceiling {
+            return false;
         }
-        if min_safe_alt > max_alt {
+        if !geofences.is_empty()
+            && geofence_blocks_point(geofences, grid_point.lat, grid_point.lon, sample_alt)
+        {
             return false;
         }
         if mid_lane > 0 {
             let left = &grid.lanes[mid_lane as usize - 1][mid_step as usize];
             let left_height = left.obstacle_height_m.max(left.terrain_height_m);
-            if left_height + config.safety_buffer_m > max_alt {
+            let left_min_safe = left_height + config.safety_buffer_m;
+            let left_ceiling = left.terrain_height_m + config.faa_limit_agl;
+            if sample_alt < left_min_safe || sample_alt > left_ceiling {
                 return false;
             }
         }
         if (mid_lane as usize) + 1 < num_lanes {
             let right = &grid.lanes[mid_lane as usize + 1][mid_step as usize];
             let right_height = right.obstacle_height_m.max(right.terrain_height_m);
-            if right_height + config.safety_buffer_m > max_alt {
+            let right_min_safe = right_height + config.safety_buffer_m;
+            let right_ceiling = right.terrain_height_m + config.faa_limit_agl;
+            if sample_alt < right_min_safe || sample_alt > right_ceiling {
                 return false;
             }
         }
