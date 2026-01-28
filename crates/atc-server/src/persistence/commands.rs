@@ -48,7 +48,7 @@ pub async fn load_all_pending_commands(pool: &SqlitePool) -> Result<Vec<Command>
         SELECT command_id, drone_id, command_type, issued_at, expires_at, acknowledged
         FROM commands
         WHERE acknowledged = 0
-        AND (expires_at IS NULL OR expires_at > datetime('now'))
+        AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
         ORDER BY drone_id, issued_at ASC
         "#,
     )
@@ -61,12 +61,68 @@ pub async fn load_all_pending_commands(pool: &SqlitePool) -> Result<Vec<Command>
 /// Delete expired commands.
 pub async fn delete_expired_commands(pool: &SqlitePool) -> Result<u64> {
     let result = sqlx::query(
-        "DELETE FROM commands WHERE expires_at IS NOT NULL AND expires_at < datetime('now')",
+        "DELETE FROM commands WHERE expires_at IS NOT NULL AND (datetime(expires_at) < datetime('now') OR datetime(expires_at) IS NULL)",
     )
     .execute(pool)
     .await?;
 
     Ok(result.rows_affected())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::persistence::init_database;
+    use crate::persistence::drones as drones_db;
+    use atc_core::models::CommandType;
+    use atc_core::models::{DroneState, DroneStatus};
+    use chrono::Duration;
+
+    #[tokio::test]
+    async fn expired_commands_are_not_loaded_or_retained() {
+        let db = init_database(":memory:", 1).await.expect("init db");
+        let pool = db.pool();
+
+        let now = Utc::now();
+        let drone = DroneState {
+            drone_id: "DRONE1".to_string(),
+            owner_id: None,
+            lat: 0.0,
+            lon: 0.0,
+            altitude_m: 0.0,
+            heading_deg: 0.0,
+            speed_mps: 0.0,
+            velocity_x: 0.0,
+            velocity_y: 0.0,
+            velocity_z: 0.0,
+            last_update: now,
+            status: DroneStatus::Inactive,
+        };
+        drones_db::upsert_drone(pool, &drone)
+            .await
+            .expect("insert drone");
+
+        let expired = Command {
+            command_id: "CMD-EXPIRED".to_string(),
+            drone_id: "DRONE1".to_string(),
+            command_type: CommandType::Hold { duration_secs: 10 },
+            issued_at: now - Duration::seconds(30),
+            expires_at: Some(now - Duration::seconds(1)),
+            acknowledged: false,
+        };
+
+        insert_command(pool, &expired).await.expect("insert command");
+
+        let pending = load_all_pending_commands(pool)
+            .await
+            .expect("load pending");
+        assert!(pending.is_empty(), "expired command should not be pending");
+
+        let deleted = delete_expired_commands(pool)
+            .await
+            .expect("delete expired");
+        assert_eq!(deleted, 1, "expired command should be deleted");
+    }
 }
 
 /// Delete commands that never received an acknowledgement within the timeout.
