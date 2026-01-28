@@ -713,19 +713,8 @@ async fn plan_route_segmented(
             }
         }
 
-        let mut previous_altitude: Option<f64> = None;
         for idx in 0..segment_count {
-            let mut segment = segments[idx].clone();
-            if let Some(prev_alt) = previous_altitude {
-                if let Some(first) = segment.first_mut() {
-                    first.altitude_m = prev_alt;
-                }
-                if idx + 1 < segment_count {
-                    if let Some(last) = segment.last_mut() {
-                        last.altitude_m = prev_alt;
-                    }
-                }
-            }
+            let segment = segments[idx].clone();
 
             let (base_spacing, max_lane_radius) = segment_params[idx];
             let inputs = match prefetched
@@ -804,6 +793,41 @@ async fn plan_route_segmented(
                     };
                 }
                 Err(SegmentError::Path(errors)) => {
+                    let (start, end) = match (segment.first(), segment.last()) {
+                        (Some(start), Some(end)) => (start, end),
+                        _ => {
+                            tracing::warn!(
+                                segment_index = idx,
+                                errors = ?errors,
+                                "RoutePlan segment failed (missing start/end waypoint)"
+                            );
+                            return RoutePlanResponse {
+                                ok: false,
+                                waypoints: Vec::new(),
+                                stats: None,
+                                nodes_visited: 0,
+                                optimized_points: 0,
+                                sample_points: 0,
+                                hazards: Vec::new(),
+                                errors,
+                            };
+                        }
+                    };
+                    tracing::warn!(
+                        segment_index = idx,
+                        segment_count,
+                        start_lat = start.lat,
+                        start_lon = start.lon,
+                        end_lat = end.lat,
+                        end_lon = end.lon,
+                        lane_radius_m = lane_radius,
+                        max_lane_radius_m = max_lane_radius,
+                        lane_spacing_m = lane_spacing,
+                        grid_base_spacing_m = base_spacing,
+                        safety_buffer_m = clearance_m,
+                        errors = ?errors,
+                        "RoutePlan segment failed"
+                    );
                     return RoutePlanResponse {
                         ok: false,
                         waypoints: Vec::new(),
@@ -848,7 +872,6 @@ async fn plan_route_segmented(
             stats = merge_stats(stats, plan.stats.clone());
 
             append_segment_waypoints(&mut combined_waypoints, plan.waypoints);
-            previous_altitude = combined_waypoints.last().map(|wp| wp.altitude_m);
         }
 
         if truncated {

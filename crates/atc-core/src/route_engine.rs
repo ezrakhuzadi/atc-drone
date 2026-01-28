@@ -566,8 +566,9 @@ pub fn optimize_airborne_path(
     geofences: &[Geofence],
     config: &RouteEngineConfig,
 ) -> RouteEngineResult {
-    let start_altitude = waypoints.first().map(|wp| wp.altitude_m);
-    let result = match compute_path_nodes(waypoints, grid, geofences, config, start_altitude) {
+    // Treat input waypoint altitude as a "desired" altitude, but don't allow starting below terrain.
+    // `compute_path_nodes` will clamp start altitude to at least the terrain height when override is None.
+    let result = match compute_path_nodes(waypoints, grid, geofences, config, None) {
         Ok(result) => result,
         Err(errors) => {
             return RouteEngineResult {
@@ -713,9 +714,16 @@ fn compute_path_nodes(
             let feature_height = next_point
                 .obstacle_height_m
                 .max(next_point.terrain_height_m);
-            let min_safe_alt = (feature_height + config.safety_buffer_m).max(next_point.altitude_m);
-            let faa_ceiling = next_point.terrain_height_m + config.faa_limit_agl;
-            if min_safe_alt > faa_ceiling {
+            let target_alt = (feature_height + config.safety_buffer_m).max(next_point.altitude_m);
+            let current_alt = current.alt;
+
+            // FAA 400ft AGL constraint: ensure the altitude at each grid point is within the local ceiling.
+            //
+            // Note: we allow descending between points even if current_alt is above next ceiling, because the
+            // model assumes a smooth transition between points and `target_alt` will be within the next ceiling.
+            let faa_ceiling_curr = curr_point.terrain_height_m + config.faa_limit_agl;
+            let faa_ceiling_next = next_point.terrain_height_m + config.faa_limit_agl;
+            if current_alt > faa_ceiling_curr || target_alt > faa_ceiling_next {
                 continue;
             }
 
@@ -727,8 +735,6 @@ fn compute_path_nodes(
             );
             let time_to_travel = dist / effective_speed;
 
-            let target_alt = min_safe_alt;
-            let current_alt = current.alt;
             let mut alt_cost = 0.0;
             if current_alt < target_alt {
                 let alt_change = target_alt - current_alt;
@@ -742,7 +748,7 @@ fn compute_path_nodes(
                     curr_point,
                     next_point,
                     current_alt,
-                    cruise_alt,
+                    target_alt,
                     config.geofence_sample_step_m,
                 )
             {
@@ -792,7 +798,9 @@ fn compute_path_nodes(
                 );
                 let h_score = dist_to_end / effective_speed;
 
-                let new_alt = current.alt.max(target_alt);
+                // Allow altitude to decrease when it is safe to do so (e.g. when terrain drops).
+                // This keeps paths feasible under an AGL ceiling without requiring "segment reset" tricks.
+                let new_alt = target_alt;
                 open_set.push(Reverse(OpenNode {
                     step: next_step,
                     lane: next_lane,
@@ -969,4 +977,58 @@ fn geofence_blocks_segment(
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn airborne_path_allows_descent_under_agl_ceiling() {
+        // Synthetic 2-point path where terrain drops sharply. The planner should be allowed
+        // to descend so long as each point's altitude is within its local AGL ceiling.
+        let waypoints = vec![
+            Waypoint {
+                lat: 33.0,
+                lon: -117.0,
+                altitude_m: 0.0,
+                speed_mps: None,
+            },
+            Waypoint {
+                lat: 33.0,
+                lon: -117.0001,
+                altitude_m: 0.0,
+                speed_mps: None,
+            },
+        ];
+
+        let grid = RouteGrid {
+            lanes: vec![vec![
+                RouteGridPoint {
+                    lat: 33.0,
+                    lon: -117.0,
+                    altitude_m: 0.0,
+                    terrain_height_m: 200.0,
+                    obstacle_height_m: 200.0,
+                },
+                RouteGridPoint {
+                    lat: 33.0,
+                    lon: -117.0001,
+                    altitude_m: 0.0,
+                    terrain_height_m: 0.0,
+                    obstacle_height_m: 0.0,
+                },
+            ]],
+            waypoint_indices: vec![0, 1],
+        };
+
+        let result = optimize_airborne_path(&waypoints, &grid, &[], &RouteEngineConfig::default());
+        assert!(
+            result.success,
+            "expected path to be feasible: {:?}",
+            result.errors
+        );
+        assert_eq!(result.waypoints.len(), 2);
+        assert!(result.waypoints[0].altitude_m > result.waypoints[1].altitude_m);
+    }
 }
