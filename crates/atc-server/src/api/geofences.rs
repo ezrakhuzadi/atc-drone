@@ -245,8 +245,54 @@ pub struct GeofenceConflict {
 pub async fn check_route(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RouteCheckRequest>,
-) -> Json<RouteCheckResponse> {
+) -> Result<Json<RouteCheckResponse>, (StatusCode, Json<serde_json::Value>)> {
     let config = state.config();
+    let max_waypoints = config.route_planner_max_waypoints.max(2);
+
+    if req.waypoints.len() < 2 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "At least 2 waypoints are required",
+                "min_waypoints": 2
+            })),
+        ));
+    }
+
+    if req.waypoints.len() > max_waypoints {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Too many waypoints",
+                "max_waypoints": max_waypoints,
+                "received_waypoints": req.waypoints.len(),
+            })),
+        ));
+    }
+
+    for (idx, wp) in req.waypoints.iter().enumerate() {
+        if !wp.lat.is_finite() || !wp.lon.is_finite() || !wp.altitude_m.is_finite() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "Waypoint fields must be finite numbers",
+                    "point_index": idx,
+                })),
+            ));
+        }
+        if !(-90.0..=90.0).contains(&wp.lat) || !(-180.0..=180.0).contains(&wp.lon) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "Waypoint latitude/longitude out of range",
+                    "point_index": idx,
+                    "lat": wp.lat,
+                    "lon": wp.lon,
+                })),
+            ));
+        }
+    }
+
     let waypoints: Vec<atc_core::Waypoint> = req
         .waypoints
         .into_iter()
@@ -288,8 +334,8 @@ pub async fn check_route(
         }
     }
 
-    Json(RouteCheckResponse {
+    Ok(Json(RouteCheckResponse {
         conflicts: !conflicts.is_empty(),
         conflicting_geofences: conflicts,
-    })
+    }))
 }

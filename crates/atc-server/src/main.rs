@@ -17,7 +17,7 @@ use anyhow::{bail, Result};
 use axum::http::StatusCode;
 use axum::http::{HeaderValue, Method};
 use axum::response::IntoResponse;
-use axum::{extract::State, routing::get, Json};
+use axum::{extract::DefaultBodyLimit, extract::State, routing::get, Json};
 use axum_server::tls_rustls::RustlsConfig;
 use serde::Serialize;
 use std::future::Future;
@@ -149,6 +149,8 @@ async fn ready_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse 
         }),
     )
 }
+
+const MAX_REQUEST_BODY_BYTES: usize = 1 * 1024 * 1024; // 1 MiB
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -320,7 +322,8 @@ async fn main() -> Result<()> {
     let app = api::routes(&config)
         .route("/health", get(|| async { "OK" }))
         .route("/ready", get(ready_handler))
-        .with_state(state);
+        .with_state(state)
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES));
 
     let app = if config.allowed_origins.is_empty() {
         tracing::warn!("No CORS origins configured - CORS disabled (same-origin only)");

@@ -65,8 +65,7 @@ pub fn create_router(config: &Config) -> Router<Arc<AppState>> {
         // Geofence routes
         .route("/v1/geofences", get(geofences::list_geofences))
         .route("/v1/geofences/:id", get(geofences::get_geofence))
-        .route("/v1/geofences/check", get(geofences::check_point))
-        .route("/v1/geofences/check-route", post(geofences::check_route));
+        .route("/v1/geofences/check", get(geofences::check_point));
 
     let admin_read_routes = Router::new()
         .route("/v1/drones", get(list_drones))
@@ -131,6 +130,7 @@ pub fn create_router(config: &Config) -> Router<Arc<AppState>> {
 
     let expensive_routes = Router::new()
         .route("/v1/compliance/evaluate", post(evaluate_compliance))
+        .route("/v1/geofences/check-route", post(geofences::check_route))
         .route("/v1/routes/plan", post(plan_route_handler))
         .layer(middleware::from_fn_with_state(
             expensive_limiter,

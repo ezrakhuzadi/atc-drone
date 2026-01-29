@@ -72,8 +72,8 @@ pub async fn delete_expired_commands(pool: &SqlitePool) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::persistence::init_database;
     use crate::persistence::drones as drones_db;
+    use crate::persistence::init_database;
     use atc_core::models::CommandType;
     use atc_core::models::{DroneState, DroneStatus};
     use chrono::Duration;
@@ -111,16 +111,14 @@ mod tests {
             acknowledged: false,
         };
 
-        insert_command(pool, &expired).await.expect("insert command");
-
-        let pending = load_all_pending_commands(pool)
+        insert_command(pool, &expired)
             .await
-            .expect("load pending");
+            .expect("insert command");
+
+        let pending = load_all_pending_commands(pool).await.expect("load pending");
         assert!(pending.is_empty(), "expired command should not be pending");
 
-        let deleted = delete_expired_commands(pool)
-            .await
-            .expect("delete expired");
+        let deleted = delete_expired_commands(pool).await.expect("delete expired");
         assert_eq!(deleted, 1, "expired command should be deleted");
     }
 }
