@@ -647,11 +647,18 @@ impl AppState {
             self.config.geoid_offset_m,
         );
 
-        if telemetry.owner_id.is_none() {
-            if let Some(owner_id) = self.drone_owners.get(&drone_id) {
-                telemetry.owner_id = Some(owner_id.value().clone());
-            }
-        }
+        // Treat owner_id as control-plane identity (set at registration / DB load), not telemetry
+        // data. Telemetry is not allowed to change ownership.
+        let cached_owner = self
+            .drone_owners
+            .get(&drone_id)
+            .map(|owner_id| owner_id.value().clone());
+        let state_owner = self
+            .drones
+            .get(&drone_id)
+            .and_then(|entry| entry.value().owner_id.clone());
+
+        telemetry.owner_id = cached_owner.or(state_owner);
 
         if let Some(owner_id) = telemetry.owner_id.clone() {
             self.drone_owners.insert(drone_id.clone(), owner_id);
