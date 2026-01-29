@@ -478,10 +478,12 @@ async fn receive_telemetry(
     }
     let mut telemetry = telemetry;
     let now = Utc::now();
-    normalize_telemetry_timestamp(&mut telemetry, state.config(), now);
     if let Err(response) = validate_telemetry(&telemetry, state.config(), now) {
         return response;
     }
+    // Persist/propagate server receipt time as the "last update" timestamp so timeout logic does not
+    // trust client clocks. Validation above still uses the original client-provided timestamp.
+    telemetry.timestamp = now;
     state.update_telemetry(telemetry).await;
     (StatusCode::ACCEPTED, Json(serde_json::json!({})))
 }
@@ -666,19 +668,6 @@ fn validate_telemetry(
     }
 
     Ok(())
-}
-
-fn normalize_telemetry_timestamp(telemetry: &mut Telemetry, config: &Config, now: DateTime<Utc>) {
-    let max_future = Duration::seconds(config.telemetry_max_future_s);
-    let max_age = Duration::seconds(config.telemetry_max_age_s);
-    if telemetry.timestamp > now + max_future || telemetry.timestamp < now - max_age {
-        tracing::warn!(
-            "Telemetry timestamp out of bounds for {} ({}); normalizing to server time",
-            telemetry.drone_id,
-            telemetry.timestamp
-        );
-        telemetry.timestamp = now;
-    }
 }
 
 fn external_to_traffic(external: ExternalTraffic) -> TrafficState {
