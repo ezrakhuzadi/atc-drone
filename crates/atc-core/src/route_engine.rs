@@ -595,8 +595,10 @@ pub fn optimize_airborne_path(
         }
     };
 
+    let smoothed_path = smooth_airborne_altitudes(&result.smoothed_path, grid, config);
+
     let mut waypoints_out = Vec::new();
-    for node in &result.smoothed_path {
+    for node in &smoothed_path {
         let point = &grid.lanes[node.lane][node.step];
         waypoints_out.push(RouteEngineWaypoint {
             lat: point.lat,
@@ -606,10 +608,25 @@ pub fn optimize_airborne_path(
         });
     }
 
+    let mut max_altitude = 0.0_f64;
+    let mut max_agl = 0.0_f64;
+    let mut sum_agl = 0.0_f64;
+    let mut count = 0.0_f64;
+    for node in &smoothed_path {
+        let point = &grid.lanes[node.lane][node.step];
+        let alt = node.alt;
+        max_altitude = max_altitude.max(alt);
+        let agl = (alt - point.terrain_height_m).max(0.0);
+        max_agl = max_agl.max(agl);
+        sum_agl += agl;
+        count += 1.0;
+    }
+    let avg_agl = if count > 0.0 { sum_agl / count } else { 0.0 };
+
     let stats = RouteEngineStats {
-        avg_agl: result.max_cruise_alt,
-        max_agl: result.max_cruise_alt,
-        max_altitude: result.max_cruise_alt,
+        avg_agl,
+        max_agl,
+        max_altitude,
     };
 
     RouteEngineResult {
@@ -620,6 +637,100 @@ pub fn optimize_airborne_path(
         stats: Some(stats),
         errors: Vec::new(),
     }
+}
+
+fn smooth_airborne_altitudes(nodes: &[Node], grid: &RouteGrid, config: &RouteEngineConfig) -> Vec<Node> {
+    if nodes.len() < 2 {
+        return nodes.to_vec();
+    }
+
+    let effective_speed = (config.cruise_speed_mps - config.wind_mps).max(1.0);
+
+    let mut min_safe: Vec<f64> = Vec::with_capacity(nodes.len());
+    let mut ceiling: Vec<f64> = Vec::with_capacity(nodes.len());
+    let mut lats: Vec<f64> = Vec::with_capacity(nodes.len());
+    let mut lons: Vec<f64> = Vec::with_capacity(nodes.len());
+    let mut alts: Vec<f64> = Vec::with_capacity(nodes.len());
+
+    for node in nodes {
+        let pt = &grid.lanes[node.lane][node.step];
+        let obstacle_height = pt.obstacle_height_m.max(pt.terrain_height_m);
+        let min_alt = obstacle_height + config.safety_buffer_m;
+        let max_alt = pt.terrain_height_m + config.faa_limit_agl;
+        min_safe.push(min_alt);
+        ceiling.push(max_alt);
+        lats.push(pt.lat);
+        lons.push(pt.lon);
+        alts.push(node.alt.clamp(min_alt, max_alt));
+    }
+
+    // Smooth out high-frequency terrain sampling noise in the altitude profile while preserving
+    // hard safety constraints (min_safe/ceiling).
+    if alts.len() >= 5 {
+        let original = alts.clone();
+        for i in 0..alts.len() {
+            let start = i.saturating_sub(2);
+            let end = (i + 3).min(original.len());
+            let mut sum = 0.0_f64;
+            let mut count = 0.0_f64;
+            for alt in &original[start..end] {
+                sum += *alt;
+                count += 1.0;
+            }
+            if count > 0.0 {
+                alts[i] = sum / count;
+            }
+            alts[i] = alts[i].clamp(min_safe[i], ceiling[i]);
+        }
+    }
+
+    // Rate-limit altitude deltas to reduce jagged vertical motion between consecutive points.
+    let mut max_up: Vec<f64> = vec![0.0; nodes.len()];
+    let mut max_down: Vec<f64> = vec![0.0; nodes.len()];
+    for i in 1..nodes.len() {
+        let dist = haversine_distance(lats[i - 1], lons[i - 1], lats[i], lons[i]).max(0.0);
+        let time_s = dist / effective_speed;
+        max_up[i] = config.climb_speed_mps.max(0.0) * time_s;
+        max_down[i] = config.descent_speed_mps.max(0.0) * time_s;
+    }
+
+    for _ in 0..2 {
+        for i in 1..alts.len() {
+            let up = max_up[i];
+            let down = max_down[i];
+            let prev = alts[i - 1];
+            if alts[i] > prev + up {
+                alts[i] = prev + up;
+            }
+            if alts[i] < prev - down {
+                alts[i] = prev - down;
+            }
+            alts[i] = alts[i].clamp(min_safe[i], ceiling[i]);
+        }
+
+        for i in (0..alts.len() - 1).rev() {
+            let up = max_up[i + 1];
+            let down = max_down[i + 1];
+            let next = alts[i + 1];
+            // alt[i] must be within [next - up, next + down]
+            if alts[i] > next + down {
+                alts[i] = next + down;
+            }
+            if alts[i] < next - up {
+                alts[i] = next - up;
+            }
+            alts[i] = alts[i].clamp(min_safe[i], ceiling[i]);
+        }
+    }
+
+    nodes
+        .iter()
+        .zip(alts.into_iter())
+        .map(|(node, alt)| Node {
+            alt,
+            ..node.clone()
+        })
+        .collect()
 }
 
 fn compute_path_nodes(
@@ -934,24 +1045,6 @@ fn is_line_of_sight_clear(
             && geofence_blocks_point(geofences, grid_point.lat, grid_point.lon, sample_alt)
         {
             return false;
-        }
-        if mid_lane > 0 {
-            let left = &grid.lanes[mid_lane as usize - 1][mid_step as usize];
-            let left_height = left.obstacle_height_m.max(left.terrain_height_m);
-            let left_min_safe = left_height + config.safety_buffer_m;
-            let left_ceiling = left.terrain_height_m + config.faa_limit_agl;
-            if sample_alt < left_min_safe || sample_alt > left_ceiling {
-                return false;
-            }
-        }
-        if (mid_lane as usize) + 1 < num_lanes {
-            let right = &grid.lanes[mid_lane as usize + 1][mid_step as usize];
-            let right_height = right.obstacle_height_m.max(right.terrain_height_m);
-            let right_min_safe = right_height + config.safety_buffer_m;
-            let right_ceiling = right.terrain_height_m + config.faa_limit_agl;
-            if sample_alt < right_min_safe || sample_alt > right_ceiling {
-                return false;
-            }
         }
     }
 
