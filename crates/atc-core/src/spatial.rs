@@ -257,6 +257,31 @@ fn segment_to_segment_distance(
     b2_lat: f64,
     b2_lon: f64,
 ) -> f64 {
+    // Detect true crossings (including touches/overlaps); endpoint-only distance checks can miss X-crossings.
+    let ref_lat = (a1_lat + a2_lat + b1_lat + b2_lat) / 4.0;
+    let ref_lon = (a1_lon + a2_lon + b1_lon + b2_lon) / 4.0;
+
+    let a1_xy = (
+        lon_to_meters(a1_lon - ref_lon, ref_lat),
+        lat_to_meters(a1_lat - ref_lat, ref_lat),
+    );
+    let a2_xy = (
+        lon_to_meters(a2_lon - ref_lon, ref_lat),
+        lat_to_meters(a2_lat - ref_lat, ref_lat),
+    );
+    let b1_xy = (
+        lon_to_meters(b1_lon - ref_lon, ref_lat),
+        lat_to_meters(b1_lat - ref_lat, ref_lat),
+    );
+    let b2_xy = (
+        lon_to_meters(b2_lon - ref_lon, ref_lat),
+        lat_to_meters(b2_lat - ref_lat, ref_lat),
+    );
+
+    if segments_intersect_2d(a1_xy, a2_xy, b1_xy, b2_xy) {
+        return 0.0;
+    }
+
     // Check distance from A's endpoints to segment B
     let d1 = distance_to_segment_m(a1_lat, a1_lon, b1_lat, b1_lon, b2_lat, b2_lon);
     let d2 = distance_to_segment_m(a2_lat, a2_lon, b1_lat, b1_lon, b2_lat, b2_lon);
@@ -266,6 +291,53 @@ fn segment_to_segment_distance(
     let d4 = distance_to_segment_m(b2_lat, b2_lon, a1_lat, a1_lon, a2_lat, a2_lon);
 
     d1.min(d2).min(d3).min(d4)
+}
+
+pub(crate) fn segments_intersect_2d(
+    a1: (f64, f64),
+    a2: (f64, f64),
+    b1: (f64, f64),
+    b2: (f64, f64),
+) -> bool {
+    // Epsilon in meters. This function is used on locally-projected coordinates; the chosen tolerance
+    // is meant to absorb floating-point error from projection and arithmetic.
+    const EPS_M: f64 = 1e-6;
+
+    fn orient(p: (f64, f64), q: (f64, f64), r: (f64, f64)) -> f64 {
+        (q.0 - p.0) * (r.1 - p.1) - (q.1 - p.1) * (r.0 - p.0)
+    }
+
+    fn within(a: f64, b: f64, value: f64) -> bool {
+        let min = a.min(b) - EPS_M;
+        let max = a.max(b) + EPS_M;
+        value >= min && value <= max
+    }
+
+    fn on_segment(p: (f64, f64), q: (f64, f64), r: (f64, f64)) -> bool {
+        within(p.0, q.0, r.0) && within(p.1, q.1, r.1)
+    }
+
+    let o1 = orient(a1, a2, b1);
+    let o2 = orient(a1, a2, b2);
+    let o3 = orient(b1, b2, a1);
+    let o4 = orient(b1, b2, a2);
+
+    if o1.abs() <= EPS_M && on_segment(a1, a2, b1) {
+        return true;
+    }
+    if o2.abs() <= EPS_M && on_segment(a1, a2, b2) {
+        return true;
+    }
+    if o3.abs() <= EPS_M && on_segment(b1, b2, a1) {
+        return true;
+    }
+    if o4.abs() <= EPS_M && on_segment(b1, b2, a2) {
+        return true;
+    }
+
+    let a_crosses = (o1 > EPS_M && o2 < -EPS_M) || (o1 < -EPS_M && o2 > EPS_M);
+    let b_crosses = (o3 > EPS_M && o4 < -EPS_M) || (o3 < -EPS_M && o4 > EPS_M);
+    a_crosses && b_crosses
 }
 
 /// Calculate distance between two points in meters using Haversine formula.
@@ -463,6 +535,32 @@ mod tests {
     fn test_haversine_same_point() {
         let dist = haversine_distance(33.6846, -117.8265, 33.6846, -117.8265);
         assert!(dist < 0.001);
+    }
+
+    #[test]
+    fn segment_to_segment_distance_detects_crossing_segments() {
+        // Two segments that cross like an "X" should have minimum distance 0.
+        let base_lat = 33.0;
+        let base_lon = -117.0;
+        let delta = meters_to_lat(100.0, base_lat);
+
+        let a1_lat = base_lat;
+        let a1_lon = base_lon;
+        let a2_lat = base_lat + delta;
+        let a2_lon = base_lon + delta;
+
+        let b1_lat = base_lat + delta;
+        let b1_lon = base_lon;
+        let b2_lat = base_lat;
+        let b2_lon = base_lon + delta;
+
+        let dist = segment_to_segment_distance(
+            a1_lat, a1_lon, a2_lat, a2_lon, b1_lat, b1_lon, b2_lat, b2_lon,
+        );
+        assert!(
+            dist < 0.001,
+            "expected crossing segments distance 0, got {dist}"
+        );
     }
 
     #[test]

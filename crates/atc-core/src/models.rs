@@ -357,14 +357,7 @@ pub struct UpdateGeofenceRequest {
 }
 
 impl Geofence {
-    /// Check if a point is inside this geofence's polygon.
-    /// Uses ray casting algorithm.
-    pub fn contains_point(&self, lat: f64, lon: f64, altitude_m: f64) -> bool {
-        // Check altitude bounds first
-        if altitude_m < self.lower_altitude_m || altitude_m > self.upper_altitude_m {
-            return false;
-        }
-
+    fn contains_point_2d(&self, lat: f64, lon: f64) -> bool {
         // Ray casting: count intersections with polygon edges
         let mut inside = false;
         let n = self.polygon.len();
@@ -386,6 +379,17 @@ impl Geofence {
         }
 
         inside
+    }
+
+    /// Check if a point is inside this geofence's polygon.
+    /// Uses ray casting algorithm.
+    pub fn contains_point(&self, lat: f64, lon: f64, altitude_m: f64) -> bool {
+        // Check altitude bounds first
+        if altitude_m < self.lower_altitude_m || altitude_m > self.upper_altitude_m {
+            return false;
+        }
+
+        self.contains_point_2d(lat, lon)
     }
 
     /// Validate geofence configuration.
@@ -440,21 +444,159 @@ impl Geofence {
         lon2: f64,
         alt2: f64,
     ) -> bool {
-        let distance_m = crate::spatial::haversine_distance(lat1, lon1, lat2, lon2);
-        let step_m = 25.0_f64;
-        let steps = ((distance_m / step_m).ceil() as usize).clamp(1, 200);
+        if self.polygon.len() < 3 {
+            return false;
+        }
 
-        // Sample points along the segment based on distance
-        for i in 0..=steps {
-            let t = i as f64 / steps as f64;
-            let lat = lat1 + t * (lat2 - lat1);
-            let lon = lon1 + t * (lon2 - lon1);
-            let alt = alt1 + t * (alt2 - alt1);
+        let alt_min = self.lower_altitude_m.min(self.upper_altitude_m);
+        let alt_max = self.lower_altitude_m.max(self.upper_altitude_m);
 
-            if self.contains_point(lat, lon, alt) {
+        // Restrict the segment to the portion where altitude overlaps the geofence altitude band.
+        let (t_start, t_end) = if (alt2 - alt1).abs() <= f64::EPSILON {
+            if alt1 < alt_min || alt1 > alt_max {
+                return false;
+            }
+            (0.0, 1.0)
+        } else {
+            let t0 = (alt_min - alt1) / (alt2 - alt1);
+            let t1 = (alt_max - alt1) / (alt2 - alt1);
+            let enter = t0.min(t1).max(0.0);
+            let exit = t0.max(t1).min(1.0);
+            if enter > exit {
+                return false;
+            }
+            (enter, exit)
+        };
+
+        let seg_lat1 = lat1 + t_start * (lat2 - lat1);
+        let seg_lon1 = lon1 + t_start * (lon2 - lon1);
+        let seg_lat2 = lat1 + t_end * (lat2 - lat1);
+        let seg_lon2 = lon1 + t_end * (lon2 - lon1);
+
+        // Endpoint-in-polygon checks cover:
+        // - segment fully inside the polygon
+        // - degenerate segments (start==end)
+        if self.contains_point_2d(seg_lat1, seg_lon1) || self.contains_point_2d(seg_lat2, seg_lon2)
+        {
+            return true;
+        }
+
+        // Segment–polygon edge intersection (local planar ENU approximation).
+        let (sum_lat, sum_lon) = self
+            .polygon
+            .iter()
+            .fold((0.0_f64, 0.0_f64), |(acc_lat, acc_lon), point| {
+                (acc_lat + point[0], acc_lon + point[1])
+            });
+        let poly_len = self.polygon.len() as f64;
+        let poly_avg_lat = sum_lat / poly_len;
+        let poly_avg_lon = sum_lon / poly_len;
+
+        let ref_lat = (seg_lat1 + seg_lat2 + poly_avg_lat) / 3.0;
+        let ref_lon = (seg_lon1 + seg_lon2 + poly_avg_lon) / 3.0;
+
+        let seg_start_xy = (
+            crate::spatial::lon_to_meters(seg_lon1 - ref_lon, ref_lat),
+            crate::spatial::lat_to_meters(seg_lat1 - ref_lat, ref_lat),
+        );
+        let seg_end_xy = (
+            crate::spatial::lon_to_meters(seg_lon2 - ref_lon, ref_lat),
+            crate::spatial::lat_to_meters(seg_lat2 - ref_lat, ref_lat),
+        );
+
+        for idx in 0..self.polygon.len() {
+            let next_idx = (idx + 1) % self.polygon.len();
+            let edge_lat1 = self.polygon[idx][0];
+            let edge_lon1 = self.polygon[idx][1];
+            let edge_lat2 = self.polygon[next_idx][0];
+            let edge_lon2 = self.polygon[next_idx][1];
+
+            let edge_start_xy = (
+                crate::spatial::lon_to_meters(edge_lon1 - ref_lon, ref_lat),
+                crate::spatial::lat_to_meters(edge_lat1 - ref_lat, ref_lat),
+            );
+            let edge_end_xy = (
+                crate::spatial::lon_to_meters(edge_lon2 - ref_lon, ref_lat),
+                crate::spatial::lat_to_meters(edge_lat2 - ref_lat, ref_lat),
+            );
+
+            // Skip zero-length edges.
+            if (edge_start_xy.0 - edge_end_xy.0).abs() <= f64::EPSILON
+                && (edge_start_xy.1 - edge_end_xy.1).abs() <= f64::EPSILON
+            {
+                continue;
+            }
+
+            if crate::spatial::segments_intersect_2d(
+                seg_start_xy,
+                seg_end_xy,
+                edge_start_xy,
+                edge_end_xy,
+            ) {
                 return true;
             }
         }
+
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn geofence_intersects_segment_detects_crossing_between_samples() {
+        // Long segment + small fence: the old sampling implementation could miss if the fence fell between samples.
+        let fence_center_lat = 0.0;
+        let fence_center_lon = 0.0075;
+        let d = 0.0002;
+
+        let geofence = Geofence {
+            id: "g1".to_string(),
+            name: "test".to_string(),
+            geofence_type: GeofenceType::NoFlyZone,
+            polygon: vec![
+                [fence_center_lat - d, fence_center_lon - d],
+                [fence_center_lat - d, fence_center_lon + d],
+                [fence_center_lat + d, fence_center_lon + d],
+                [fence_center_lat + d, fence_center_lon - d],
+                [fence_center_lat - d, fence_center_lon - d],
+            ],
+            lower_altitude_m: 0.0,
+            upper_altitude_m: 100.0,
+            active: true,
+            created_at: chrono::Utc::now(),
+        };
+
+        assert!(geofence.intersects_segment(0.0, 0.0, 50.0, 0.0, 1.0, 50.0));
+    }
+
+    #[test]
+    fn geofence_intersects_segment_requires_horizontal_and_altitude_overlap_at_same_time() {
+        // The full segment crosses the fence horizontally, and the segment has altitude overlap somewhere,
+        // but the altitude overlap occurs in a different part of the segment; this should not count as an intersection.
+        let fence_center_lat = 0.0;
+        let fence_center_lon = 0.1;
+        let d = 0.0002;
+
+        let geofence = Geofence {
+            id: "g2".to_string(),
+            name: "altitude_test".to_string(),
+            geofence_type: GeofenceType::NoFlyZone,
+            polygon: vec![
+                [fence_center_lat - d, fence_center_lon - d],
+                [fence_center_lat - d, fence_center_lon + d],
+                [fence_center_lat + d, fence_center_lon + d],
+                [fence_center_lat + d, fence_center_lon - d],
+                [fence_center_lat - d, fence_center_lon - d],
+            ],
+            lower_altitude_m: 100.0,
+            upper_altitude_m: 150.0,
+            active: true,
+            created_at: chrono::Utc::now(),
+        };
+
+        assert!(!geofence.intersects_segment(0.0, 0.0, 0.0, 0.0, 1.0, 200.0));
     }
 }
