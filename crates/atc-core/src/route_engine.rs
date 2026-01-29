@@ -35,7 +35,9 @@ impl Default for RouteEngineConfig {
             descent_speed_mps: 3.0,
             wind_mps: 0.0,
             cost_time_weight: 1.0,
-            cost_climb_penalty: 15.0,
+            // Penalize climb roughly in terms of time (seconds per meter). Keeping this low avoids
+            // “lane zig-zag” routes that prefer lateral weaving over modest climbs.
+            cost_climb_penalty: 0.5,
             cost_lane_change: 50.0,
             cost_proximity_penalty: 100.0,
             geofence_sample_step_m: 25.0,
