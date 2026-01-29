@@ -11,10 +11,12 @@ use tokio::time::interval;
 
 use atc_core::models::DroneState;
 
+use crate::backoff::Backoff;
 use crate::persistence::{drones as drones_db, Database};
 use crate::state::AppState;
 
 const TELEMETRY_FLUSH_SECS: u64 = 1;
+const TELEMETRY_DB_BACKOFF_MAX_SECS: u64 = 30;
 
 pub async fn run_telemetry_persist_loop(
     db: Database,
@@ -23,6 +25,10 @@ pub async fn run_telemetry_persist_loop(
     mut shutdown: broadcast::Receiver<()>,
 ) {
     let mut ticker = interval(Duration::from_secs(TELEMETRY_FLUSH_SECS));
+    let mut backoff = Backoff::new(
+        Duration::from_secs(TELEMETRY_FLUSH_SECS),
+        Duration::from_secs(TELEMETRY_DB_BACKOFF_MAX_SECS),
+    );
     let mut pending: HashMap<String, DroneState> = HashMap::new();
     app_state.mark_loop_heartbeat("telemetry-persist");
 
@@ -49,8 +55,18 @@ pub async fn run_telemetry_persist_loop(
             _ = ticker.tick() => {
                 app_state.mark_loop_heartbeat("telemetry-persist");
                 merge_overflow(&app_state, &mut pending);
+                if !backoff.ready() {
+                    continue;
+                }
                 if let Err(err) = flush_pending(&db, &mut pending).await {
-                    tracing::warn!("Telemetry persistence flush failed: {}", err);
+                    let delay = backoff.fail();
+                    tracing::warn!(
+                        "Telemetry persistence flush failed: {} (backing off {:?})",
+                        err,
+                        delay
+                    );
+                } else {
+                    backoff.reset();
                 }
             }
         }

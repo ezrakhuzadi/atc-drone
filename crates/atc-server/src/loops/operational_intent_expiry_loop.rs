@@ -11,10 +11,12 @@ use tokio::time::interval;
 
 use atc_core::models::FlightStatus;
 
+use crate::backoff::Backoff;
 use crate::persistence::flight_plans as flight_plans_db;
 use crate::state::AppState;
 
 const LOOP_INTERVAL_SECS: u64 = 5;
+const DB_BACKOFF_MAX_SECS: u64 = 60;
 
 pub async fn run_operational_intent_expiry_loop(
     state: Arc<AppState>,
@@ -27,6 +29,10 @@ pub async fn run_operational_intent_expiry_loop(
 
     let pool = db.pool().clone();
     let mut ticker = interval(Duration::from_secs(LOOP_INTERVAL_SECS));
+    let mut backoff = Backoff::new(
+        Duration::from_secs(LOOP_INTERVAL_SECS),
+        Duration::from_secs(DB_BACKOFF_MAX_SECS),
+    );
     state.mark_loop_heartbeat("oi-expiry");
 
     'main: loop {
@@ -37,17 +43,30 @@ pub async fn run_operational_intent_expiry_loop(
             }
             _ = ticker.tick() => {
                 state.mark_loop_heartbeat("oi-expiry");
+                if !backoff.ready() {
+                    continue;
+                }
                 let now = Utc::now();
                 let mut tx = match pool.begin().await {
                     Ok(tx) => tx,
                     Err(err) => {
-                        tracing::warn!("Operational intent expiry begin tx failed: {}", err);
+                        let delay = backoff.fail();
+                        tracing::warn!(
+                            "Operational intent expiry begin tx failed: {} (backing off {:?})",
+                            err,
+                            delay
+                        );
                         continue;
                     }
                 };
 
                 if let Err(err) = flight_plans_db::lock_scheduler(&mut tx).await {
-                    tracing::warn!("Operational intent expiry lock failed: {}", err);
+                    let delay = backoff.fail();
+                    tracing::warn!(
+                        "Operational intent expiry lock failed: {} (backing off {:?})",
+                        err,
+                        delay
+                    );
                     tx.rollback().await.ok();
                     continue;
                 }
@@ -55,7 +74,12 @@ pub async fn run_operational_intent_expiry_loop(
                 let plans = match flight_plans_db::load_all_flight_plans_tx(&mut tx).await {
                     Ok(plans) => plans,
                     Err(err) => {
-                        tracing::warn!("Operational intent expiry load failed: {}", err);
+                        let delay = backoff.fail();
+                        tracing::warn!(
+                            "Operational intent expiry load failed: {} (backing off {:?})",
+                            err,
+                            delay
+                        );
                         tx.rollback().await.ok();
                         continue;
                     }
@@ -76,22 +100,34 @@ pub async fn run_operational_intent_expiry_loop(
 
                 if expired.is_empty() {
                     tx.rollback().await.ok();
+                    backoff.reset();
                     continue 'main;
                 }
 
                 for plan in &expired {
                     if let Err(err) = flight_plans_db::upsert_flight_plan_tx(&mut tx, plan).await {
-                        tracing::warn!("Operational intent expiry persist failed: {}", err);
+                        let delay = backoff.fail();
+                        tracing::warn!(
+                            "Operational intent expiry persist failed: {} (backing off {:?})",
+                            err,
+                            delay
+                        );
                         tx.rollback().await.ok();
                         continue 'main;
                     }
                 }
 
                 if let Err(err) = tx.commit().await {
-                    tracing::warn!("Operational intent expiry commit failed: {}", err);
+                    let delay = backoff.fail();
+                    tracing::warn!(
+                        "Operational intent expiry commit failed: {} (backing off {:?})",
+                        err,
+                        delay
+                    );
                     continue 'main;
                 }
 
+                backoff.reset();
                 for plan in expired {
                     state.flight_plans.insert(plan.flight_id.clone(), plan);
                 }
