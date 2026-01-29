@@ -96,6 +96,95 @@ async fn register_and_send_telemetry() {
 }
 
 #[tokio::test]
+async fn rotating_drone_token_invalidates_old_token() {
+    let (app, _state) = setup_app().await;
+
+    let register_req = Request::builder()
+        .method("POST")
+        .uri("/v1/drones/register")
+        .header("content-type", "application/json")
+        .header("X-Registration-Token", "test-registration-token")
+        .body(Body::from(
+            json!({
+                "drone_id": "DRONE_ROTATE",
+                "owner_id": "owner-1"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let register_res = app.clone().oneshot(register_req).await.unwrap();
+    assert_eq!(register_res.status(), StatusCode::CREATED);
+    let register_body = read_json(register_res).await;
+    let old_token = register_body["session_token"]
+        .as_str()
+        .expect("session token")
+        .to_string();
+
+    let rotate_req = Request::builder()
+        .method("POST")
+        .uri("/v1/admin/drones/DRONE_ROTATE/token/rotate")
+        .header("authorization", "Bearer test-admin-token")
+        .body(Body::empty())
+        .unwrap();
+
+    let rotate_res = app.clone().oneshot(rotate_req).await.unwrap();
+    assert_eq!(rotate_res.status(), StatusCode::OK);
+    let rotate_body = read_json(rotate_res).await;
+    let new_token = rotate_body["session_token"]
+        .as_str()
+        .expect("new session token")
+        .to_string();
+    assert_ne!(old_token, new_token);
+
+    let telemetry_req_old = Request::builder()
+        .method("POST")
+        .uri("/v1/telemetry")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {}", old_token))
+        .body(Body::from(
+            json!({
+                "drone_id": "DRONE_ROTATE",
+                "owner_id": "owner-1",
+                "lat": 33.6846,
+                "lon": -117.8265,
+                "altitude_m": 90.0,
+                "heading_deg": 180.0,
+                "speed_mps": 12.0,
+                "timestamp": Utc::now().to_rfc3339()
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let telemetry_res_old = app.clone().oneshot(telemetry_req_old).await.unwrap();
+    assert_eq!(telemetry_res_old.status(), StatusCode::FORBIDDEN);
+
+    let telemetry_req_new = Request::builder()
+        .method("POST")
+        .uri("/v1/telemetry")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {}", new_token))
+        .body(Body::from(
+            json!({
+                "drone_id": "DRONE_ROTATE",
+                "owner_id": "owner-1",
+                "lat": 33.6846,
+                "lon": -117.8265,
+                "altitude_m": 90.0,
+                "heading_deg": 180.0,
+                "speed_mps": 12.0,
+                "timestamp": Utc::now().to_rfc3339()
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let telemetry_res_new = app.clone().oneshot(telemetry_req_new).await.unwrap();
+    assert_eq!(telemetry_res_new.status(), StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
 async fn create_geofence_and_check_route() {
     let (app, _state) = setup_app().await;
 

@@ -101,6 +101,32 @@ impl AtcClient {
         self.admin_token = token;
     }
 
+    /// Rotate the session token for a registered drone using an admin token.
+    ///
+    /// If the rotated drone matches this client's current `drone_id`, the client's cached
+    /// `session_token` is updated to the new value.
+    pub async fn rotate_drone_token_admin(&mut self, drone_id: &str) -> Result<RegisterResponse> {
+        let admin_token = self
+            .admin_token
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Admin token not set"))?;
+        let url = format!(
+            "{}/v1/admin/drones/{}/token/rotate",
+            self.base_url, drone_id
+        );
+
+        let builder = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", admin_token));
+
+        let response: RegisterResponse = parse_json_or_error(builder.send().await?).await?;
+        if self.drone_id.as_deref() == Some(&response.drone_id) {
+            self.session_token = Some(response.session_token.clone());
+        }
+        Ok(response)
+    }
+
     /// Register this drone with the ATC server.
     pub async fn register(&mut self, drone_id: Option<&str>) -> Result<RegisterResponse> {
         self.register_with_owner(drone_id, None).await

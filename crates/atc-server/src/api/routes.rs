@@ -151,6 +151,10 @@ pub fn create_router(config: &Config) -> Router<Arc<AppState>> {
     // Admin routes (preferred: /v1/admin/... prefix)
     let admin_prefixed_routes = Router::new()
         .route("/reset", post(admin_reset))
+        .route(
+            "/drones/:drone_id/token/rotate",
+            post(admin_rotate_drone_token),
+        )
         .route("/commands", post(commands::issue_command))
         .route("/commands", get(commands::get_all_commands))
         .route("/flights/plan", post(flights::create_flight_plan))
@@ -416,6 +420,46 @@ async fn register_drone(
             "session_token": session_token,
         })),
     )
+}
+
+async fn admin_rotate_drone_token(
+    State(state): State<Arc<AppState>>,
+    Path(drone_id): Path<String>,
+) -> impl IntoResponse {
+    if state.get_drone(&drone_id).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "Drone not found",
+                "drone_id": drone_id,
+            })),
+        );
+    }
+
+    let session_token = uuid::Uuid::new_v4().to_string();
+    match state.set_drone_token(&drone_id, session_token.clone()).await {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "drone_id": drone_id,
+                "session_token": session_token,
+            })),
+        ),
+        Err(err) => {
+            tracing::error!(
+                "Failed to rotate session token for drone {}: {}",
+                drone_id,
+                err
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "Failed to rotate session token",
+                    "drone_id": drone_id,
+                })),
+            )
+        }
+    }
 }
 
 async fn receive_telemetry(

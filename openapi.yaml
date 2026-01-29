@@ -532,6 +532,37 @@ paths:
       responses:
         "200":
           description: Reset complete
+  /v1/admin/drones/{drone_id}/token/rotate:
+    post:
+      tags: [Admin]
+      summary: Rotate a drone session token
+      description: Generates a new session token for a registered drone and invalidates the old token.
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: drone_id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Token rotated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegisterResponse"
+        "404":
+          description: Drone not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  drone_id:
+                    type: string
 components:
   securitySchemes:
     bearerAuth:
