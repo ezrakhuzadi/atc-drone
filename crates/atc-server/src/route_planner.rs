@@ -1347,7 +1347,7 @@ pub async fn plan_airborne_route(
 
                 let engine_config = RouteEngineConfig {
                     safety_buffer_m,
-                    faa_limit_agl: 500.0,
+                    faa_limit_agl: state.rules().max_altitude_m.max(0.0),
                     wind_mps: config.route_planner_wind_mps.max(0.0),
                     geofence_sample_step_m: spacing.clamp(5.0, 25.0),
                     ..Default::default()

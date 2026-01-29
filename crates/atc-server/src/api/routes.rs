@@ -437,7 +437,10 @@ async fn admin_rotate_drone_token(
     }
 
     let session_token = uuid::Uuid::new_v4().to_string();
-    match state.set_drone_token(&drone_id, session_token.clone()).await {
+    match state
+        .set_drone_token(&drone_id, session_token.clone())
+        .await
+    {
         Ok(_) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -793,7 +796,6 @@ async fn evaluate_compliance(
         });
     }
 
-    let rules = state.rules();
     for (idx, point) in points.iter().enumerate() {
         if !point.lat.is_finite() || !point.lon.is_finite() {
             violations.push(json!({
@@ -825,35 +827,9 @@ async fn evaluate_compliance(
             }));
             continue;
         }
-
-        if point.altitude_m > rules.max_altitude_m {
-            violations.push(json!({
-                "type": "altitude",
-                "point_index": idx,
-                "altitude_m": point.altitude_m,
-                "max_m": rules.max_altitude_m,
-                "message": format!(
-                    "Altitude {:.1}m exceeds max altitude {:.1}m",
-                    point.altitude_m,
-                    rules.max_altitude_m
-                )
-            }));
-        }
-
-        if point.altitude_m < rules.min_altitude_m {
-            violations.push(json!({
-                "type": "altitude",
-                "point_index": idx,
-                "altitude_m": point.altitude_m,
-                "min_m": rules.min_altitude_m,
-                "message": format!(
-                    "Altitude {:.1}m is below min altitude {:.1}m",
-                    point.altitude_m,
-                    rules.min_altitude_m
-                )
-            }));
-        }
     }
+
+    super::altitude_validation::validate_route_altitudes(&state, &points, &mut violations).await;
 
     let geofences = state.get_geofences();
     for i in 0..points.len().saturating_sub(1) {

@@ -1,5 +1,6 @@
 //! API routes for the ATC server.
 
+mod altitude_validation;
 pub mod auth;
 pub mod commands;
 pub mod daa;
