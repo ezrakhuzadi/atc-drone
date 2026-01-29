@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const METERS_PER_DEG_LAT: f64 = 111_320.0;
+const CPA_EPS: f64 = 1e-9;
 
 /// Severity levels for detected conflicts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,52 +209,63 @@ impl ConflictDetector {
         warning_horizontal_m: f64,
         warning_vertical_m: f64,
     ) -> Option<(ConflictSeverity, f64, f64, f64, f64, f64)> {
-        let mut best_critical: Option<ClosestApproach> = None;
-        let mut best_warning: Option<ClosestApproach> = None;
-
-        for t in 0..=(self.lookahead_seconds as i32) {
-            let t = t as f64;
-            let pos1 = Self::predict_position(drone1, t);
-            let pos2 = Self::predict_position(drone2, t);
-            let (h_dist, v_dist) = Self::check_separation(pos1, pos2);
-            let distance = (h_dist.powi(2) + v_dist.powi(2)).sqrt();
-
-            if h_dist < self.separation_horizontal_m && v_dist < self.separation_vertical_m {
-                let replace = best_critical
-                    .as_ref()
-                    .map(|best| distance < best.distance_m)
-                    .unwrap_or(true);
-                if replace {
-                    best_critical = Some(ClosestApproach {
-                        distance_m: distance,
-                        time_s: t,
-                        pos1,
-                        pos2,
-                    });
-                }
-            } else if h_dist < warning_horizontal_m && v_dist < warning_vertical_m {
-                let replace = best_warning
-                    .as_ref()
-                    .map(|best| distance < best.distance_m)
-                    .unwrap_or(true);
-                if replace {
-                    best_warning = Some(ClosestApproach {
-                        distance_m: distance,
-                        time_s: t,
-                        pos1,
-                        pos2,
-                    });
-                }
-            }
+        let lookahead = self.lookahead_seconds.max(0.0);
+        if lookahead <= 0.0 {
+            return None;
         }
 
-        let (severity, best) = if let Some(best) = best_critical {
-            (ConflictSeverity::Critical, best)
-        } else if let Some(best) = best_warning {
-            (ConflictSeverity::Warning, best)
+        let ref_lat = (drone1.lat + drone2.lat) / 2.0;
+        let ref_lon = (drone1.lon + drone2.lon) / 2.0;
+
+        let (d1_x, d1_y) = project_xy(drone1.lat, drone1.lon, ref_lat, ref_lon);
+        let (d2_x, d2_y) = project_xy(drone2.lat, drone2.lon, ref_lat, ref_lon);
+
+        let (v1_x, v1_y) = velocity_xy(drone1);
+        let (v2_x, v2_y) = velocity_xy(drone2);
+
+        let rel_pos_x = d2_x - d1_x;
+        let rel_pos_y = d2_y - d1_y;
+        let rel_pos_z = drone2.altitude_m - drone1.altitude_m;
+
+        let rel_vel_x = v2_x - v1_x;
+        let rel_vel_y = v2_y - v1_y;
+        let rel_vel_z = drone2.velocity_z - drone1.velocity_z;
+
+        let best = if let Some(window) = conflict_time_window(
+            rel_pos_x,
+            rel_pos_y,
+            rel_vel_x,
+            rel_vel_y,
+            rel_pos_z,
+            rel_vel_z,
+            self.separation_horizontal_m,
+            self.separation_vertical_m,
+            lookahead,
+        ) {
+            (
+                ConflictSeverity::Critical,
+                best_approach_in_window(drone1, drone2, window),
+            )
+        } else if let Some(window) = conflict_time_window(
+            rel_pos_x,
+            rel_pos_y,
+            rel_vel_x,
+            rel_vel_y,
+            rel_pos_z,
+            rel_vel_z,
+            warning_horizontal_m,
+            warning_vertical_m,
+            lookahead,
+        ) {
+            (
+                ConflictSeverity::Warning,
+                best_approach_in_window(drone1, drone2, window),
+            )
         } else {
             return None;
         };
+
+        let (severity, best) = best;
 
         let cpa_lat = (best.pos1.0 + best.pos2.0) / 2.0;
         let cpa_lon = (best.pos1.1 + best.pos2.1) / 2.0;
@@ -414,6 +426,181 @@ impl ConflictDetector {
     }
 }
 
+fn velocity_xy(drone: &DronePosition) -> (f64, f64) {
+    if drone.speed_mps.abs() <= CPA_EPS {
+        return (0.0, 0.0);
+    }
+    let heading_rad = drone.heading_deg.to_radians();
+
+    // Local ENU: x = east, y = north; heading is 0=north, 90=east.
+    let vel_x = drone.speed_mps * heading_rad.sin();
+    let vel_y = drone.speed_mps * heading_rad.cos();
+    (vel_x, vel_y)
+}
+
+fn conflict_time_window(
+    rel_pos_x: f64,
+    rel_pos_y: f64,
+    rel_vel_x: f64,
+    rel_vel_y: f64,
+    rel_pos_z: f64,
+    rel_vel_z: f64,
+    horiz_threshold_m: f64,
+    vert_threshold_m: f64,
+    lookahead_s: f64,
+) -> Option<(f64, f64)> {
+    let (h_start, h_end) = horizontal_time_window(
+        rel_pos_x,
+        rel_pos_y,
+        rel_vel_x,
+        rel_vel_y,
+        horiz_threshold_m,
+        lookahead_s,
+    )?;
+    let (v_start, v_end) =
+        vertical_time_window(rel_pos_z, rel_vel_z, vert_threshold_m, lookahead_s)?;
+
+    let start = h_start.max(v_start);
+    let end = h_end.min(v_end);
+
+    if start <= end {
+        Some((start, end))
+    } else {
+        None
+    }
+}
+
+fn horizontal_time_window(
+    rel_pos_x: f64,
+    rel_pos_y: f64,
+    rel_vel_x: f64,
+    rel_vel_y: f64,
+    threshold_m: f64,
+    lookahead_s: f64,
+) -> Option<(f64, f64)> {
+    let a = rel_vel_x * rel_vel_x + rel_vel_y * rel_vel_y;
+    let b = 2.0 * (rel_pos_x * rel_vel_x + rel_pos_y * rel_vel_y);
+    let c = rel_pos_x * rel_pos_x + rel_pos_y * rel_pos_y - threshold_m * threshold_m;
+
+    if a.abs() <= CPA_EPS {
+        return if c <= 0.0 {
+            Some((0.0, lookahead_s))
+        } else {
+            None
+        };
+    }
+
+    let disc = b * b - 4.0 * a * c;
+    if disc < 0.0 {
+        return None;
+    }
+
+    let sqrt_disc = disc.sqrt();
+    let t_low = (-b - sqrt_disc) / (2.0 * a);
+    let t_high = (-b + sqrt_disc) / (2.0 * a);
+
+    let start = t_low.min(t_high).max(0.0);
+    let end = t_low.max(t_high).min(lookahead_s);
+
+    if start <= end {
+        Some((start, end))
+    } else {
+        None
+    }
+}
+
+fn vertical_time_window(
+    rel_pos_z: f64,
+    rel_vel_z: f64,
+    threshold_m: f64,
+    lookahead_s: f64,
+) -> Option<(f64, f64)> {
+    if rel_vel_z.abs() <= CPA_EPS {
+        return if rel_pos_z.abs() <= threshold_m {
+            Some((0.0, lookahead_s))
+        } else {
+            None
+        };
+    }
+
+    let t1 = (-threshold_m - rel_pos_z) / rel_vel_z;
+    let t2 = (threshold_m - rel_pos_z) / rel_vel_z;
+
+    let start = t1.min(t2).max(0.0);
+    let end = t1.max(t2).min(lookahead_s);
+
+    if start <= end {
+        Some((start, end))
+    } else {
+        None
+    }
+}
+
+fn best_approach_in_window(
+    drone1: &DronePosition,
+    drone2: &DronePosition,
+    window_s: (f64, f64),
+) -> ClosestApproach {
+    let (start_s, end_s) = window_s;
+    let start_s = start_s.max(0.0);
+    let end_s = end_s.max(start_s);
+
+    let ref_lat = (drone1.lat + drone2.lat) / 2.0;
+    let ref_lon = (drone1.lon + drone2.lon) / 2.0;
+
+    let (d1_x, d1_y) = project_xy(drone1.lat, drone1.lon, ref_lat, ref_lon);
+    let (d2_x, d2_y) = project_xy(drone2.lat, drone2.lon, ref_lat, ref_lon);
+
+    let (v1_x, v1_y) = velocity_xy(drone1);
+    let (v2_x, v2_y) = velocity_xy(drone2);
+
+    let rel_pos_x = d2_x - d1_x;
+    let rel_pos_y = d2_y - d1_y;
+    let rel_pos_z = drone2.altitude_m - drone1.altitude_m;
+
+    let rel_vel_x = v2_x - v1_x;
+    let rel_vel_y = v2_y - v1_y;
+    let rel_vel_z = drone2.velocity_z - drone1.velocity_z;
+
+    let rel_speed_sq = rel_vel_x * rel_vel_x + rel_vel_y * rel_vel_y + rel_vel_z * rel_vel_z;
+    let t_star = if rel_speed_sq.abs() <= CPA_EPS {
+        start_s
+    } else {
+        let dot = rel_pos_x * rel_vel_x + rel_pos_y * rel_vel_y + rel_pos_z * rel_vel_z;
+        (-dot / rel_speed_sq).clamp(start_s, end_s)
+    };
+
+    let candidates = [start_s, t_star, end_s];
+    let mut best: Option<ClosestApproach> = None;
+
+    for &t in &candidates {
+        let distance_m = {
+            let dx = rel_pos_x + rel_vel_x * t;
+            let dy = rel_pos_y + rel_vel_y * t;
+            let dz = rel_pos_z + rel_vel_z * t;
+            (dx * dx + dy * dy + dz * dz).sqrt()
+        };
+
+        let pos1 = ConflictDetector::predict_position(drone1, t);
+        let pos2 = ConflictDetector::predict_position(drone2, t);
+
+        let replace = best
+            .as_ref()
+            .map(|current| distance_m < current.distance_m)
+            .unwrap_or(true);
+        if replace {
+            best = Some(ClosestApproach {
+                distance_m,
+                time_s: t,
+                pos1,
+                pos2,
+            });
+        }
+    }
+
+    best.expect("candidates always yields a best")
+}
+
 fn average_lat_lon(drones: &[DronePosition]) -> (f64, f64) {
     let count = drones.len() as f64;
     let (sum_lat, sum_lon) = drones.iter().fold((0.0, 0.0), |acc, drone| {
@@ -480,5 +667,41 @@ mod tests {
         let conflicts = detector.detect_conflicts();
         assert!(!conflicts.is_empty());
         assert_eq!(conflicts[0].severity, ConflictSeverity::Critical);
+    }
+
+    #[test]
+    fn detects_near_miss_between_whole_seconds() {
+        let mut detector = ConflictDetector::default();
+
+        let base_lat = 0.0;
+        let base_lon = 0.0;
+
+        // Drones pass within the critical horizontal separation only between integer seconds.
+        // At t=0 and t=1, the separation is > 50m; at t=0.5 it is < 50m.
+        let d_lon = crate::spatial::meters_to_lon(10.0, base_lat);
+        let d_lat = crate::spatial::meters_to_lat(49.0, base_lat);
+
+        detector.update_position(
+            DronePosition::new("A", base_lat, base_lon - d_lon, 50.0)
+                .with_velocity(90.0, 20.0, 0.0),
+        );
+        detector.update_position(
+            DronePosition::new("B", base_lat + d_lat, base_lon + d_lon, 50.0)
+                .with_velocity(270.0, 20.0, 0.0),
+        );
+
+        let conflicts = detector.detect_conflicts();
+        assert_eq!(conflicts.len(), 1, "expected conflict between A and B");
+        assert_eq!(conflicts[0].severity, ConflictSeverity::Critical);
+        assert!(
+            (conflicts[0].time_to_closest - 0.5).abs() < 0.01,
+            "expected CPA at t=0.5, got {}",
+            conflicts[0].time_to_closest
+        );
+        assert!(
+            (conflicts[0].closest_distance_m - 49.0).abs() < 0.5,
+            "expected closest distance near 49m, got {}",
+            conflicts[0].closest_distance_m
+        );
     }
 }
