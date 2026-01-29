@@ -57,14 +57,7 @@ pub fn create_router(config: &Config) -> Router<Arc<AppState>> {
 
     // Public routes (no auth required)
     let public_routes = Router::new()
-        .route("/v1/drones", get(list_drones))
-        .route("/v1/drones/:drone_id", get(get_drone))
-        .route("/v1/traffic", get(list_traffic))
-        .route("/v1/conflicts", get(list_conflicts))
-        .route("/v1/conformance", get(list_conformance))
-        .route("/v1/daa", get(daa::list_daa))
         .route("/v1/compliance/limits", get(get_compliance_limits))
-        .route("/v1/flights", get(flights::get_flight_plans))
         // Command polling routes
         .route("/v1/commands/next", get(commands::get_next_command))
         .route("/v1/commands/ack", post(commands::ack_command))
@@ -73,9 +66,21 @@ pub fn create_router(config: &Config) -> Router<Arc<AppState>> {
         .route("/v1/geofences", get(geofences::list_geofences))
         .route("/v1/geofences/:id", get(geofences::get_geofence))
         .route("/v1/geofences/check", get(geofences::check_point))
-        .route("/v1/geofences/check-route", post(geofences::check_route))
-        // WebSocket streaming
-        .route("/v1/ws", get(ws::ws_handler));
+        .route("/v1/geofences/check-route", post(geofences::check_route));
+
+    let admin_read_routes = Router::new()
+        .route("/v1/drones", get(list_drones))
+        .route("/v1/drones/:drone_id", get(get_drone))
+        .route("/v1/traffic", get(list_traffic))
+        .route("/v1/conflicts", get(list_conflicts))
+        .route("/v1/conformance", get(list_conformance))
+        .route("/v1/daa", get(daa::list_daa))
+        .route("/v1/flights", get(flights::get_flight_plans))
+        .route("/v1/ws", get(ws::ws_handler))
+        .layer(middleware::from_fn_with_state(
+            admin_token.clone(),
+            auth::require_admin,
+        ));
 
     let registration_routes = Router::new()
         .route("/v1/drones/register", post(register_drone))
@@ -183,6 +188,7 @@ pub fn create_router(config: &Config) -> Router<Arc<AppState>> {
     public_routes
         .merge(registration_routes)
         .merge(telemetry_route)
+        .merge(admin_read_routes)
         .merge(expensive_routes)
         .merge(admin_state_mutation_routes)
         .merge(admin_command_routes)

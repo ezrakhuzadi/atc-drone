@@ -20,15 +20,16 @@ pub async fn ws_handler(
 ) -> axum::response::Response {
     let config = state.config();
     let provided = params.token.clone().or_else(|| extract_bearer(&headers));
+    let admin_token = config.admin_token.as_str();
 
     if config.require_ws_token {
         let expected = config.ws_token.as_deref().unwrap_or_default();
-        if provided.as_deref() != Some(expected) {
+        if provided.as_deref() != Some(expected) && provided.as_deref() != Some(admin_token) {
             return StatusCode::UNAUTHORIZED.into_response();
         }
     } else if let Some(expected) = config.ws_token.as_deref() {
         if let Some(token) = provided.as_deref() {
-            if token != expected {
+            if token != expected && token != admin_token {
                 return StatusCode::UNAUTHORIZED.into_response();
             }
         }
